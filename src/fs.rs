@@ -5,7 +5,8 @@ use std::ffi::OsStr;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
+use std::thread;
 use std::time::{Duration, SystemTime};
 
 use fuser::{
@@ -79,10 +80,16 @@ pub(crate) struct FsInner {
     /// Inodes whose in-memory content has been persisted by flush() but not yet
     /// removed from open_files. release() can skip the redundant re-encrypt.
     flushed_inodes: Mutex<HashSet<u64>>,
+    /// Set by metadata-mutating ops; cleared by the debounce thread after flushing.
+    index_dirty: AtomicBool,
+    /// Signals the debounce thread to wake up (dirty flag set) or shut down (stop flag).
+    debounce_notify: Condvar,
+    debounce_mutex: Mutex<bool>, // value = stop requested
 }
 
 pub struct ZeroTrustFs {
     pub(crate) inner: Arc<FsInner>,
+    debounce_thread: Option<thread::JoinHandle<()>>,
 }
 
 impl ZeroTrustFs {
@@ -93,7 +100,13 @@ impl ZeroTrustFs {
         let index_path = base_path.join("_index.age");
         let state = if index_path.exists() {
             let ciphertext = fs::read(&index_path).expect("failed to read index");
-            let json = decrypt_bytes(&key, &ciphertext).expect("failed to decrypt index");
+            let json = match decrypt_bytes(&key, &ciphertext) {
+                Ok(j) => j,
+                Err(_) => {
+                    eprintln!("zerotrust-drive: error: wrong passphrase — failed to decrypt {}", index_path.display());
+                    std::process::exit(1);
+                }
+            };
             serde_json::from_slice(&json).expect("failed to parse index")
         } else {
             let uid = unsafe { libc::getuid() };
@@ -112,16 +125,41 @@ impl ZeroTrustFs {
         };
 
         let json = serde_json::to_vec(&state).expect("failed to serialize index");
-        let inner = FsInner {
+        let inner = Arc::new(FsInner {
             base_path, key: RwLock::new(key),
             state: RwLock::new(state), open_files: RwLock::new(HashMap::new()),
             index_mtime: Mutex::new(None),
             read_only: AtomicBool::new(false),
             flushed_inodes: Mutex::new(HashSet::new()),
-        };
-        let zfs = Self {
-            inner: Arc::new(inner),
-        };
+            index_dirty: AtomicBool::new(false),
+            debounce_notify: Condvar::new(),
+            debounce_mutex: Mutex::new(false),
+        });
+
+        // Spawn debounce thread that coalesces frequent index writes
+        let debounce_inner = Arc::clone(&inner);
+        let debounce_thread = thread::spawn(move || {
+            const DEBOUNCE_INTERVAL: Duration = Duration::from_secs(5);
+            loop {
+                // Wait until notified or timeout
+                let guard = debounce_inner.debounce_mutex.lock().unwrap();
+                let (guard, _) = debounce_inner.debounce_notify
+                    .wait_timeout(guard, DEBOUNCE_INTERVAL)
+                    .unwrap();
+                // Check if we should shut down
+                if *guard {
+                    break;
+                }
+                drop(guard);
+                // If dirty, flush and clear the flag
+                if debounce_inner.index_dirty.swap(false, Ordering::AcqRel) {
+                    let zfs = ZeroTrustFs { inner: Arc::clone(&debounce_inner), debounce_thread: None };
+                    zfs.flush_state();
+                }
+            }
+        });
+
+        let zfs = Self { inner, debounce_thread: Some(debounce_thread) };
         zfs.persist_index(&json);
         zfs
     }
@@ -180,6 +218,13 @@ impl ZeroTrustFs {
         decrypt_bytes(&*self.inner.key.read().unwrap(), &ciphertext).expect("failed to decrypt file")
     }
 
+    /// Mark the index as dirty so the debounce thread will flush it soon.
+    /// Used by metadata-mutating ops instead of calling flush_state() directly.
+    fn mark_dirty(&self) {
+        self.inner.index_dirty.store(true, Ordering::Release);
+        self.inner.debounce_notify.notify_one();
+    }
+
     /// Lock state, serialize, drop lock, encrypt+write. Safe to call without any locks held.
     /// Detects external modifications to _index.age (e.g. by Google Drive sync) and warns.
     pub(crate) fn flush_state(&self) {
@@ -213,6 +258,16 @@ impl Filesystem for ZeroTrustFs {
     }
 
     fn destroy(&mut self) {
+        // Stop the debounce thread first
+        {
+            let mut stop = self.inner.debounce_mutex.lock().unwrap();
+            *stop = true;
+            self.inner.debounce_notify.notify_one();
+        }
+        if let Some(handle) = self.debounce_thread.take() {
+            let _ = handle.join();
+        }
+
         // Lock ordering: state before open_files (consistent with all other operations)
         let state = self.inner.state.read().unwrap();
         let open = self.inner.open_files.read().unwrap();
@@ -300,7 +355,7 @@ impl Filesystem for ZeroTrustFs {
             }
         }
         reply.attr(&TTL, &attr);
-        self.flush_state();
+        self.mark_dirty();
     }
 
     fn open(&self, _req: &Request, ino: INodeNo, _flags: fuser::OpenFlags, reply: ReplyOpen) {
@@ -483,7 +538,7 @@ impl Filesystem for ZeroTrustFs {
             (ino, attr)
         };
         reply.entry(&TTL, &attr, Generation(0));
-        self.flush_state();
+        self.mark_dirty();
         trace!("FUSE: mknod replied ino={}", ino);
     }
 
@@ -531,7 +586,7 @@ impl Filesystem for ZeroTrustFs {
         };
         self.inner.open_files.write().unwrap().insert(ino, Vec::new());
         reply.created(&TTL, &attr, Generation(0), FileHandle(ino), FopenFlags::empty());
-        self.flush_state();
+        self.mark_dirty();
         trace!("FUSE: create replied ino={} fh={}", ino, ino);
     }
 
@@ -578,7 +633,7 @@ impl Filesystem for ZeroTrustFs {
             attr
         };
         reply.entry(&TTL, &attr, Generation(0));
-        self.flush_state();
+        self.mark_dirty();
     }
 
     fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
@@ -606,7 +661,7 @@ impl Filesystem for ZeroTrustFs {
         self.inner.open_files.write().unwrap().remove(&ino);
         self.inner.flushed_inodes.lock().unwrap().remove(&ino);
         reply.ok();
-        self.flush_state();
+        self.mark_dirty();
         if !disk_filename.is_empty() {
             let _ = fs::remove_file(self.inner.base_path.join(&disk_filename));
         }
@@ -641,7 +696,7 @@ impl Filesystem for ZeroTrustFs {
             if let Some(p) = state.inodes.get_mut(&parent.0) { p.nlink = p.nlink.saturating_sub(1); }
         };
         reply.ok();
-        self.flush_state();
+        self.mark_dirty();
     }
 
     fn rename(
@@ -688,7 +743,7 @@ impl Filesystem for ZeroTrustFs {
             to_remove
         };
         reply.ok();
-        self.flush_state();
+        self.mark_dirty();
         if let Some(f) = disk_file_to_remove {
             let _ = fs::remove_file(self.inner.base_path.join(&f));
         }

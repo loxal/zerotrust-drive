@@ -13,7 +13,7 @@ use fuser::{Config, MountOption};
 #[command(name = "zerotrust-drive", about = "FUSE-based encrypted overlay filesystem")]
 struct Cli {
     /// Directory for encrypted .age files (storage backend, auto-managed — do not modify directly)
-    #[arg(long, default_value = "~/gdrive/.zerotrust.drive.encrypted")]
+    #[arg(long, default_value = "~/g.drive/.zero-trust.drive.encrypted")]
     encrypted_dir: PathBuf,
 
     /// FUSE mount point showing decrypted files

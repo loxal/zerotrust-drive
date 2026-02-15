@@ -6,8 +6,13 @@ file extension is a naming convention — not the age crate).
 
 Google Drive never sees plaintext file names or content. The encrypted storage directory
 contains only opaque files (`000001.age`, `000002.age`, ...) and an encrypted index
-(`_index.age`) that maps them to their real names. Point `--encrypted-dir` at a Google Drive
-sync folder and Google Drive handles upload/sync of the ciphertext automatically.
+(`_index.age`). The index stores the full directory tree — filenames, permissions, sizes,
+timestamps, and the mapping from each real filename to its opaque `.age` counterpart. It is
+encrypted with the same passphrase and re-written on every metadata change. Without the
+correct passphrase, the index (and therefore the entire directory structure) is unreadable.
+
+Point `--encrypted-dir` at a Google Drive sync folder and Google Drive handles upload/sync
+of the ciphertext automatically.
 
 This is an in-memory filesystem — all file content is held in RAM while open.
 Not recommended for files larger than available memory.
@@ -26,7 +31,7 @@ A FUSE implementation is required. Install the one for your OS:
 
 ### Directory Layout
 
-    ~/gdrive/.zerotrust.drive.encrypted/    encrypted storage — synced by Google Drive (ciphertext only)
+    ~/g.drive/.zero-trust.drive.encrypted/    encrypted storage — synced by Google Drive (ciphertext only)
     ~/z.drive/                              FUSE mount point — local, NOT synced (you work here)
 
 The encrypted directory is auto-managed by zerotrust-drive. Do not modify its contents directly.
@@ -44,8 +49,9 @@ Both paths are overridable via justfile variables or CLI flags `--encrypted-dir`
 
 ### Passphrase
 
-Set the encryption passphrase via env var or CLI flag. If neither is set, a default
-demo passphrase is used and a warning is shown at mount.
+Set the encryption passphrase via env var or CLI flag. If neither is set, the default
+passphrase `zerotrust-demo-passphrase` is used and a warning is shown at mount.
+Do not rely on this for real data.
 
     ZEROTRUST_PASSPHRASE="my-secret" just mount         # via env var (recommended)
     cargo run -- --passphrase "my-secret"                # via CLI flag
@@ -118,6 +124,11 @@ the resume is rejected with a clear error. No passphrase is ever stored on disk.
 Filenames are limited to **255 bytes** — the standard maximum shared by ext4, APFS, and
 NTFS. Operations that exceed this limit (create, mkdir, rename) return `ENAMETOOLONG`.
 
+Disk filenames use a 6-digit hex counter (`000001.age` through `ffffff.age`), supporting
+up to **16,777,215 files**. The counter increases monotonically and is never reused, even
+after deletions. If the counter exceeds 6 digits the filenames simply grow longer — there
+is no hard cap.
+
 ### Encryption
 
 zerotrust-drive uses ChaCha20-Poly1305, an AEAD (Authenticated Encryption with Associated
@@ -131,3 +142,24 @@ Android disk encryption. It is a 256-bit cipher considered equally secure to AES
 Apple FileVault uses AES-XTS, which is designed for fixed-size disk sectors and does not
 provide authentication. ChaCha20-Poly1305 is a better fit for file-level encryption with
 cloud sync because its built-in authentication detects corruption or tampering automatically.
+
+### Building
+
+Build an optimized release binary and install it as `zdrive`:
+
+    just release                                        # build + install to ~/.cargo/bin/zdrive
+    just mount-release                                  # mount using the installed zdrive binary
+
+#### Cross-compilation
+
+Build release binaries for all platforms (requires [cross](https://github.com/cross-rs/cross)):
+
+    just release-macos                                  # aarch64-apple-darwin   -> target/dist/zdrive-macos-aarch64
+    just release-linux                                  # x86_64-unknown-linux   -> target/dist/zdrive-linux-x86_64
+    just release-windows                                # x86_64-pc-windows-gnu  -> target/dist/zdrive-windows-x86_64.exe
+    just release-all                                    # all three platforms
+
+The Linux and Windows targets use `cross`, which handles toolchains and sysroot
+dependencies via Docker. Install it with `cargo install cross`. Note that while the
+Windows binary compiles, runtime support requires replacing `fuser` with a WinFSP-based
+FUSE crate.
