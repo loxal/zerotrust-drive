@@ -1,4 +1,4 @@
-encrypted_dir := "~/g.drive/.zero-trust.drive.encrypted"
+encrypted_dir := "~/g.drive/.zerotrust.drive.encrypted"
 decrypted_dir := "~/z.drive"
 passphrase := env("ZEROTRUST_PASSPHRASE", "")
 

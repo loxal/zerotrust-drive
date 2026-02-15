@@ -31,7 +31,7 @@ A FUSE implementation is required. Install the one for your OS:
 
 ### Directory Layout
 
-    ~/g.drive/.zero-trust.drive.encrypted/    encrypted storage — synced by Google Drive (ciphertext only)
+    ~/g.drive/.zerotrust.drive.encrypted/    encrypted storage — synced by Google Drive (ciphertext only)
     ~/z.drive/                              FUSE mount point — local, NOT synced (you work here)
 
 The encrypted directory is auto-managed by zerotrust-drive. Do not modify its contents directly.
