@@ -12,16 +12,20 @@ use fuser::{Config, MountOption};
 #[command(name = "zerotrust-drive", about = "FUSE-based encrypted overlay filesystem")]
 struct Cli {
     /// Directory for encrypted .age files (storage backend, auto-managed — do not modify directly)
-    #[arg(long, default_value = "target/.encrypted.disk")]
+    #[arg(long, default_value = "~/gdrive/.zerotrust.drive.encrypted")]
     encrypted_dir: PathBuf,
 
     /// FUSE mount point showing decrypted files
-    #[arg(long, default_value = "target/decrypted.disk")]
+    #[arg(long, default_value = "~/zerotrust.drive")]
     decrypted_dir: PathBuf,
 
     /// Encryption passphrase (can also be set via ZEROTRUST_PASSPHRASE env var)
     #[arg(long)]
     passphrase: Option<String>,
+
+    /// Re-encrypt all files with a new passphrase, then exit (offline operation — does not mount)
+    #[arg(long)]
+    new_passphrase: Option<String>,
 }
 
 fn main() {
@@ -36,6 +40,63 @@ fn main() {
     let mountpoint = cli.decrypted_dir;
 
     std::fs::create_dir_all(&base_path).unwrap();
+
+    // Recover from any interrupted rekey before doing anything else
+    fs::recover_interrupted_rekey(&base_path);
+
+    // Handle --new-passphrase (online rekey: mount read-only, re-encrypt in background)
+    if let Some(new_passphrase) = cli.new_passphrase {
+        if new_passphrase == passphrase {
+            eprintln!("zerotrust-drive: error: new passphrase is the same as the current one");
+            std::process::exit(1);
+        }
+        let index_path = base_path.join("_index.age");
+        if !index_path.exists() {
+            eprintln!(
+                "zerotrust-drive: error: no _index.age found in {}",
+                base_path.display()
+            );
+            std::process::exit(1);
+        }
+
+        std::fs::create_dir_all(&mountpoint).unwrap();
+
+        let ztfs = fs::ZeroTrustFs::new(&passphrase, base_path.clone());
+        let inner = ztfs.inner.clone();
+
+        let rekey_base = base_path.clone();
+        let old_pw = passphrase.clone();
+        std::thread::spawn(move || {
+            // Let FUSE mount establish before starting rekey
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            fs::rekey_online(&old_pw, &new_passphrase, &rekey_base, &inner);
+        });
+
+        eprintln!("zerotrust-drive: mounting at {} (read-only during passphrase rotation)", mountpoint.display());
+        eprintln!("zerotrust-drive: encrypted storage at {}", base_path.display());
+        eprintln!("zerotrust-drive: press Ctrl+C to unmount");
+
+        let mut config = Config::default();
+        config.mount_options = vec![
+            MountOption::RW,
+            MountOption::FSName("zerotrust-drive".to_string()),
+        ];
+
+        fuser::mount2(ztfs, &mountpoint, &config).expect("failed to mount filesystem");
+        return;
+    }
+
+    // Refuse to mount if a rekey is in progress
+    let rekey_lock = base_path.join("_rekey.lock");
+    if rekey_lock.exists() {
+        eprintln!("zerotrust-drive: error: _rekey.lock exists — a rekey operation may be in progress");
+        eprintln!(
+            "zerotrust-drive: if you are sure no rekey is running, delete {} manually",
+            rekey_lock.display()
+        );
+        std::process::exit(1);
+    }
+
     std::fs::create_dir_all(&mountpoint).unwrap();
 
     eprintln!("zerotrust-drive: mounting at {}", mountpoint.display());

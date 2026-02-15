@@ -17,6 +17,9 @@ umount:
 run passphrase=passphrase: build
     cargo run -- --encrypted-dir {{encrypted_dir}} --decrypted-dir {{decrypted_dir}}{{ if passphrase != "" { " --passphrase " + passphrase } else { "" } }}
 
+rekey new_passphrase passphrase=passphrase: build
+    cargo run -- --encrypted-dir {{encrypted_dir}} --new-passphrase {{new_passphrase}}{{ if passphrase != "" { " --passphrase " + passphrase } else { "" } }}
+
 populate:
     #!/usr/bin/env bash
     set -euo pipefail
