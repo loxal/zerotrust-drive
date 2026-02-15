@@ -1,5 +1,5 @@
-encrypted_dir := "~/Drive/.zerotrust.drive.encrypted"
-decrypted_dir := "~/zerotrust.drive"
+encrypted_dir := "~/gdrive/.zerotrust.drive.encrypted"
+decrypted_dir := "~/z.drive"
 passphrase := env("ZEROTRUST_PASSPHRASE", "")
 
 default: build

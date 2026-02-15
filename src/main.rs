@@ -23,7 +23,7 @@ struct Cli {
     #[arg(long)]
     passphrase: Option<String>,
 
-    /// Re-encrypt all files with a new passphrase, then exit (offline operation — does not mount)
+    /// Re-encrypt all files with a new passphrase (mounts read-only during rotation)
     #[arg(long)]
     new_passphrase: Option<String>,
 }
@@ -72,9 +72,10 @@ fn main() {
             fs::rekey_online(&old_pw, &new_passphrase, &rekey_base, &inner);
         });
 
-        eprintln!("zerotrust-drive: mounting at {} (read-only during passphrase rotation)", mountpoint.display());
+        eprintln!("zerotrust-drive: rotating passphrase — files will be read-only until re-encryption finishes");
+        eprintln!("zerotrust-drive: mounting at {}", mountpoint.display());
         eprintln!("zerotrust-drive: encrypted storage at {}", base_path.display());
-        eprintln!("zerotrust-drive: press Ctrl+C to unmount");
+        eprintln!("zerotrust-drive: the filesystem will unmount automatically when complete");
 
         let mut config = Config::default();
         config.mount_options = vec![

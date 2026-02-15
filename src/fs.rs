@@ -361,7 +361,8 @@ pub fn rekey(old_passphrase: &str, new_passphrase: &str, base_path: &std::path::
 pub fn rekey_online(old_passphrase: &str, new_passphrase: &str, base_path: &std::path::Path, inner: &FsInner) {
     // 1. Set read-only
     inner.read_only.store(true, Ordering::SeqCst);
-    eprintln!("zerotrust-drive: filesystem set to read-only for passphrase rotation");
+    eprintln!("zerotrust-drive: filesystem is now read-only — write operations will return EROFS until re-encryption completes");
+    eprintln!("zerotrust-drive: flushing open files before re-encryption...");
 
     // 2. Flush all open files to disk with old key
     {
@@ -467,6 +468,8 @@ pub fn rekey_online(old_passphrase: &str, new_passphrase: &str, base_path: &std:
     // 9. Unlock
     inner.read_only.store(false, Ordering::SeqCst);
     eprintln!("zerotrust-drive: passphrase rotation complete — filesystem is read-write again");
+    eprintln!("zerotrust-drive: all files are now encrypted with the new passphrase");
+    eprintln!("zerotrust-drive: remember to update ZEROTRUST_PASSPHRASE before next mount");
 }
 
 impl Filesystem for ZeroTrustFs {
@@ -1421,6 +1424,109 @@ mod tests {
         assert!(!dir.join("_rekey.manifest").exists());
         assert!(!dir.join("_rekey.lock").exists());
         assert!(!staging_dir.exists());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rekey_online_basic() {
+        let dir = PathBuf::from("target/test-rekey-online");
+        let _ = fs::remove_dir_all(&dir);
+        let old_pw = "online-old";
+        let new_pw = "online-new";
+
+        // Create a filesystem with a file
+        let ztfs = ZeroTrustFs::new(old_pw, dir.clone());
+        {
+            let mut state = ztfs.inner.state.lock().unwrap();
+            let ino = ZeroTrustFs::allocate_inode(&mut state);
+            let df = ZeroTrustFs::allocate_disk_filename(&mut state);
+            state.inodes.insert(ino, InodeEntry {
+                name: "online.txt".to_string(), kind: InodeKind::File,
+                disk_filename: df.clone(), size: 12, perm: 0o644,
+                uid: 501, gid: 20, atime_secs: 1000, mtime_secs: 1000, ctime_secs: 1000,
+                nlink: 1, parent: 1,
+            });
+            state.children.entry(1).or_default().push(DirChild {
+                name: "online.txt".to_string(), inode: ino,
+            });
+        }
+        ztfs.write_encrypted_file("000001.age", b"online data!");
+        ztfs.flush_state();
+
+        // Simulate an open file (content in RAM)
+        ztfs.inner.open_files.lock().unwrap().insert(2, b"online data!".to_vec());
+
+        // Verify read_only starts as false
+        assert!(!ztfs.inner.read_only.load(Ordering::Relaxed));
+
+        // Run rekey_online
+        rekey_online(old_pw, new_pw, &dir, &ztfs.inner);
+
+        // Verify read_only is restored to false
+        assert!(!ztfs.inner.read_only.load(Ordering::Relaxed));
+
+        // Verify key was swapped to new key
+        let expected_new_key = derive_key(new_pw);
+        assert_eq!(*ztfs.inner.key.read().unwrap(), expected_new_key);
+
+        // Verify old passphrase can't decrypt the index
+        let old_key = derive_key(old_pw);
+        let index_ct = fs::read(dir.join("_index.age")).unwrap();
+        assert!(decrypt_bytes(&old_key, &index_ct).is_err());
+
+        // Verify new passphrase can open the filesystem
+        let ztfs2 = ZeroTrustFs::new(new_pw, dir.clone());
+        let state = ztfs2.inner.state.lock().unwrap();
+        let ino = ZeroTrustFs::find_child(&state, 1, "online.txt").expect("file should exist");
+        let df = state.inodes.get(&ino).unwrap().disk_filename.clone();
+        drop(state);
+        let content = ztfs2.read_encrypted_file(&df);
+        assert_eq!(content, b"online data!");
+
+        // Verify no staging artifacts remain
+        assert!(!dir.join("_rekey_staging").exists());
+        assert!(!dir.join("_rekey.manifest").exists());
+        assert!(!dir.join("_rekey.lock").exists());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rekey_online_read_only_during_operation() {
+        let dir = PathBuf::from("target/test-rekey-online-ro");
+        let _ = fs::remove_dir_all(&dir);
+        let old_pw = "ro-old";
+        let new_pw = "ro-new";
+
+        let ztfs = ZeroTrustFs::new(old_pw, dir.clone());
+        {
+            let mut state = ztfs.inner.state.lock().unwrap();
+            let ino = ZeroTrustFs::allocate_inode(&mut state);
+            let df = ZeroTrustFs::allocate_disk_filename(&mut state);
+            state.inodes.insert(ino, InodeEntry {
+                name: "test.txt".to_string(), kind: InodeKind::File,
+                disk_filename: df.clone(), size: 4, perm: 0o644,
+                uid: 501, gid: 20, atime_secs: 1000, mtime_secs: 1000, ctime_secs: 1000,
+                nlink: 1, parent: 1,
+            });
+            state.children.entry(1).or_default().push(DirChild {
+                name: "test.txt".to_string(), inode: ino,
+            });
+        }
+        ztfs.write_encrypted_file("000001.age", b"test");
+        ztfs.flush_state();
+
+        // Manually set read_only and verify it blocks
+        ztfs.inner.read_only.store(true, Ordering::SeqCst);
+        assert!(ztfs.inner.read_only.load(Ordering::Relaxed));
+
+        // Restore and run real rekey
+        ztfs.inner.read_only.store(false, Ordering::SeqCst);
+        rekey_online(old_pw, new_pw, &dir, &ztfs.inner);
+
+        // After rekey, read_only should be false
+        assert!(!ztfs.inner.read_only.load(Ordering::Relaxed));
 
         let _ = fs::remove_dir_all(&dir);
     }

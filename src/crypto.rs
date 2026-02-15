@@ -1,10 +1,9 @@
 // Copyright 2026 Alexander Orlov <alexander.orlov@loxal.net>
 
 use chacha20poly1305::{
-    aead::{Aead, KeyInit, OsRng},
+    aead::{rand_core::RngCore, Aead, KeyInit, OsRng},
     ChaCha20Poly1305, Nonce,
 };
-use rand::RngCore;
 
 pub fn derive_key(passphrase: &str) -> [u8; 32] {
     // Simple key derivation: iterative hashing (not as strong as scrypt/argon2
