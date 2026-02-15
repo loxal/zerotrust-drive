@@ -66,19 +66,52 @@ Or directly:
 During rotation the filesystem mounts read-only — existing files are readable but writes
 return EROFS. Once re-encryption finishes the filesystem becomes read-write again.
 
-**Cancel & resume**: The operation can be interrupted at any time (Ctrl+C, crash, power loss).
-No files are ever lost. Re-encrypted files are staged in a hidden `.rekey_staging/` directory
-and only swapped into place after all files are ready, so the originals are never modified
-in place.
+#### How rekey works
 
-If interrupted during the rename phase, recovery is automatic on next startup. If interrupted
-during the staging phase, a fresh `--new-passphrase` wipes the partial staging and starts over
-(safe — originals are untouched). To resume staging instead:
+The rekey process has two phases. Originals are never modified in place — the design
+guarantees that no data is lost regardless of when or how the process is interrupted.
+
+**Phase 1 — Staging**: Each file is decrypted with the old passphrase, re-encrypted with
+the new passphrase, and written into a hidden `.rekey_staging/` directory. The original
+files remain untouched throughout this phase.
+
+**Phase 2 — Rename pass**: Once every file has been staged, a `_rekey.manifest` is written
+(the commit point). Each staged file is then atomically renamed over its original via a
+single `rename()` syscall. After each successful rename the manifest is updated on disk,
+so the exact progress is always known. The encrypted index (`_index.age`) is always renamed
+last — until that final rename, the old passphrase can still open the drive.
+
+After all renames complete, `.rekey_staging/`, `_rekey.manifest`, and `_rekey.lock` are
+removed.
+
+#### Failure handling
+
+| Scenario | What happens | Recovery |
+|---|---|---|
+| **Ctrl+C / crash during Phase 1** (staging) | Originals untouched. `.rekey_staging/` contains partial re-encrypted files. | Next `--new-passphrase` wipes the partial staging and starts fresh. Use `--continue-rekey` to resume instead (see below). |
+| **Ctrl+C / crash during Phase 2** (rename pass) | Some files already renamed, manifest tracks which. | **Automatic** — on next startup `recover_interrupted_rekey()` reads the manifest and completes the remaining renames. No user action needed. |
+| **Wrong old passphrase** | Decryption of `_index.age` fails immediately. | Lock file removed, clear error shown. No files modified. |
+| **Disk full during staging** | Write fails, no manifest written. | `.rekey_staging/` cleaned up on next run. Originals intact. |
+| **Lock file exists** (`_rekey.lock`) | Another rekey may be in progress. | Refuses to start. If no other process is running, delete the lock file manually. |
+| **New passphrase same as old** | Rejected before any work begins. | — |
+
+#### Resuming an interrupted rekey
+
+By default, if a `.rekey_staging/` directory exists from a previous cancelled run, a fresh
+`--new-passphrase` invocation **wipes it and starts over**. This prevents mixed-key
+corruption if you changed your mind about the new passphrase.
+
+To resume where you left off (skipping already-staged files), use `--continue-rekey`:
 
     just rekey-resume "same-passphrase"                 # resume interrupted staging
 
-The passphrase is cryptographically verified against the already-staged files — if you
-provide a different passphrase, the resume is rejected to prevent mixed-key corruption.
+Or directly:
+
+    cargo run -- --new-passphrase "same-passphrase" --continue-rekey
+
+Before resuming, the passphrase is **cryptographically verified** — one file from the
+staging directory is test-decrypted with the provided new passphrase. If decryption fails,
+the resume is rejected with a clear error. No passphrase is ever stored on disk.
 
 ### Encryption
 
