@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install FUSE
+        run: sudo apt-get update && sudo apt-get install -y libfuse3-dev fuse3
+      - name: Run tests
+        run: cargo test
+
+  release-linux:
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install FUSE
+        run: sudo apt-get update && sudo apt-get install -y libfuse3-dev fuse3
+      - name: Build release
+        run: cargo build --release
+      - name: Prepare artifact
+        run: cp target/release/zerotrust-drive zdrive-linux-x86_64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zdrive-linux-x86_64
+          path: zdrive-linux-x86_64
+
+  release-macos:
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install macFUSE
+        run: brew install macfuse
+      - name: Build release
+        run: cargo build --release
+      - name: Prepare artifact
+        run: cp target/release/zerotrust-drive zdrive-macos-aarch64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zdrive-macos-aarch64
+          path: zdrive-macos-aarch64
+
+  publish-release:
+    needs: [release-linux, release-macos]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: zdrive-linux-x86_64
+      - uses: actions/download-artifact@v4
+        with:
+          name: zdrive-macos-aarch64
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            zdrive-linux-x86_64
+            zdrive-macos-aarch64
