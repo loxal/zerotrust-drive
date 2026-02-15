@@ -229,8 +229,8 @@ pub fn rekey_online(old_passphrase: &str, new_passphrase: &str, base_path: &std:
     // 2. Flush all open files to disk with old key
     {
         let key = inner.key.read().unwrap();
-        let open = inner.open_files.lock().unwrap();
-        let state = inner.state.lock().unwrap();
+        let state = inner.state.read().unwrap();
+        let open = inner.open_files.read().unwrap();
         for (&ino, content) in open.iter() {
             if let Some(entry) = state.inodes.get(&ino) {
                 if !entry.disk_filename.is_empty() {
@@ -339,8 +339,8 @@ pub fn rekey_online(old_passphrase: &str, new_passphrase: &str, base_path: &std:
     // 9. Re-flush open files with new key
     {
         let key = inner.key.read().unwrap();
-        let open = inner.open_files.lock().unwrap();
-        let state = inner.state.lock().unwrap();
+        let state = inner.state.read().unwrap();
+        let open = inner.open_files.read().unwrap();
         for (&ino, content) in open.iter() {
             if let Some(entry) = state.inodes.get(&ino) {
                 if !entry.disk_filename.is_empty() {
@@ -384,7 +384,7 @@ mod tests {
 
         {
             let ztfs = ZeroTrustFs::new(old_pw, dir.clone());
-            let mut state = ztfs.inner.state.lock().unwrap();
+            let mut state = ztfs.inner.state.write().unwrap();
             let ino = ZeroTrustFs::allocate_inode(&mut state);
             let df = ZeroTrustFs::allocate_disk_filename(&mut state);
             state.inodes.insert(ino, InodeEntry {
@@ -408,7 +408,7 @@ mod tests {
         assert!(decrypt_bytes(&old_key, &index_ct).is_err());
 
         let ztfs = ZeroTrustFs::new(new_pw, dir.clone());
-        let state = ztfs.inner.state.lock().unwrap();
+        let state = ztfs.inner.state.read().unwrap();
         let ino = ZeroTrustFs::find_child(&state, 1, "secret.txt").expect("file should exist");
         let df = state.inodes.get(&ino).unwrap().disk_filename.clone();
         drop(state);
@@ -435,7 +435,7 @@ mod tests {
             let ztfs = ZeroTrustFs::new(old_pw, dir.clone());
             for (name, content) in &files_data {
                 let df = {
-                    let mut state = ztfs.inner.state.lock().unwrap();
+                    let mut state = ztfs.inner.state.write().unwrap();
                     let ino = ZeroTrustFs::allocate_inode(&mut state);
                     let df = ZeroTrustFs::allocate_disk_filename(&mut state);
                     state.inodes.insert(ino, InodeEntry {
@@ -457,7 +457,7 @@ mod tests {
         rekey(old_pw, new_pw, &dir, false);
 
         let ztfs = ZeroTrustFs::new(new_pw, dir.clone());
-        let state = ztfs.inner.state.lock().unwrap();
+        let state = ztfs.inner.state.write().unwrap();
         for (name, expected) in &files_data {
             let ino = ZeroTrustFs::find_child(&state, 1, name).expect("file should exist");
             let df = state.inodes.get(&ino).unwrap().disk_filename.clone();
@@ -537,7 +537,7 @@ mod tests {
 
         let ztfs = ZeroTrustFs::new(old_pw, dir.clone());
         {
-            let mut state = ztfs.inner.state.lock().unwrap();
+            let mut state = ztfs.inner.state.write().unwrap();
             let ino = ZeroTrustFs::allocate_inode(&mut state);
             let df = ZeroTrustFs::allocate_disk_filename(&mut state);
             state.inodes.insert(ino, InodeEntry {
@@ -553,7 +553,7 @@ mod tests {
         ztfs.write_encrypted_file("000001.age", b"online data!");
         ztfs.flush_state();
 
-        ztfs.inner.open_files.lock().unwrap().insert(2, b"online data!".to_vec());
+        ztfs.inner.open_files.write().unwrap().insert(2, b"online data!".to_vec());
 
         assert!(!ztfs.inner.read_only.load(Ordering::Relaxed));
 
@@ -569,7 +569,7 @@ mod tests {
         assert!(decrypt_bytes(&old_key, &index_ct).is_err());
 
         let ztfs2 = ZeroTrustFs::new(new_pw, dir.clone());
-        let state = ztfs2.inner.state.lock().unwrap();
+        let state = ztfs2.inner.state.write().unwrap();
         let ino = ZeroTrustFs::find_child(&state, 1, "online.txt").expect("file should exist");
         let df = state.inodes.get(&ino).unwrap().disk_filename.clone();
         drop(state);
@@ -592,7 +592,7 @@ mod tests {
 
         let ztfs = ZeroTrustFs::new(old_pw, dir.clone());
         {
-            let mut state = ztfs.inner.state.lock().unwrap();
+            let mut state = ztfs.inner.state.write().unwrap();
             let ino = ZeroTrustFs::allocate_inode(&mut state);
             let df = ZeroTrustFs::allocate_disk_filename(&mut state);
             state.inodes.insert(ino, InodeEntry {
@@ -628,7 +628,7 @@ mod tests {
 
         let ztfs = ZeroTrustFs::new(old_pw, dir.clone());
         {
-            let mut state = ztfs.inner.state.lock().unwrap();
+            let mut state = ztfs.inner.state.write().unwrap();
             for i in 1..=3 {
                 let ino = ZeroTrustFs::allocate_inode(&mut state);
                 let df = ZeroTrustFs::allocate_disk_filename(&mut state);
@@ -664,7 +664,7 @@ mod tests {
         rekey(old_pw, new_pw, &dir, true);
 
         let ztfs2 = ZeroTrustFs::new(new_pw, dir.clone());
-        let state = ztfs2.inner.state.lock().unwrap();
+        let state = ztfs2.inner.state.write().unwrap();
         for filename in &["000001.age", "000002.age", "000003.age"] {
             let content = ztfs2.read_encrypted_file(filename);
             assert!(!content.is_empty(), "{filename} should be readable with new key");
@@ -711,7 +711,7 @@ mod tests {
 
         let ztfs = ZeroTrustFs::new(old_pw, dir.clone());
         {
-            let mut state = ztfs.inner.state.lock().unwrap();
+            let mut state = ztfs.inner.state.write().unwrap();
             let ino = ZeroTrustFs::allocate_inode(&mut state);
             let df = ZeroTrustFs::allocate_disk_filename(&mut state);
             state.inodes.insert(ino, InodeEntry {
