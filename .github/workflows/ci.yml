@@ -71,6 +71,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
+          prerelease: true
           files: |
             zdrive-linux-x86_64
             zdrive-macos-aarch64
