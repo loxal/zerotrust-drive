@@ -16,7 +16,7 @@ struct Cli {
     encrypted_dir: PathBuf,
 
     /// FUSE mount point showing decrypted files
-    #[arg(long, default_value = "~/zerotrust.drive")]
+    #[arg(long, default_value = "~/z.drive")]
     decrypted_dir: PathBuf,
 
     /// Encryption passphrase (can also be set via ZEROTRUST_PASSPHRASE env var)

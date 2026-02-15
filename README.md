@@ -26,8 +26,8 @@ A FUSE implementation is required. Install the one for your OS:
 
 ### Directory Layout
 
-    ~/Drive/.zerotrust.drive.encrypted/     encrypted storage — synced by Google Drive (ciphertext only)
-    ~/zerotrust.drive/                      FUSE mount point — local, NOT synced (you work here)
+    ~/gdrive/.zerotrust.drive.encrypted/    encrypted storage — synced by Google Drive (ciphertext only)
+    ~/z.drive/                              FUSE mount point — local, NOT synced (you work here)
 
 The encrypted directory is auto-managed by zerotrust-drive. Do not modify its contents directly.
 Both paths are overridable via justfile variables or CLI flags `--encrypted-dir` / `--decrypted-dir`.
@@ -51,6 +51,25 @@ demo passphrase is used and a warning is shown at mount.
     cargo run -- --passphrase "my-secret"                # via CLI flag
 
 The env var takes precedence if both are provided.
+
+### Passphrase Rotation (Rekey)
+
+Change the encryption passphrase for all files:
+
+    just rekey "new-secret"                             # re-encrypt with new passphrase
+    ZEROTRUST_PASSPHRASE="new-secret" just mount        # mount with new passphrase
+
+Or directly:
+
+    cargo run -- --new-passphrase "new-secret"
+
+During rotation the filesystem mounts read-only — existing files are readable but writes
+return EROFS. Once re-encryption finishes the filesystem becomes read-write again.
+
+**Cancel & resume**: The operation can be interrupted at any time (Ctrl+C, crash, power loss).
+No files are ever lost. On next startup, interrupted rekeys are automatically detected and
+completed. Re-encrypted files are staged in a hidden `_rekey_staging/` directory and only
+swapped into place after all files are ready, so the originals are never modified in place.
 
 ### Encryption
 

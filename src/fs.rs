@@ -67,6 +67,12 @@ pub(crate) struct DiskIndex {
     pub children: HashMap<u64, Vec<DirChild>>,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct ManifestEntry {
+    filename: String,
+    renamed: bool,
+}
+
 // --- FUSE filesystem ---
 
 pub(crate) struct FsInner {
@@ -225,15 +231,21 @@ pub fn recover_interrupted_rekey(base_path: &std::path::Path) -> bool {
     }
     eprintln!("zerotrust-drive: detected interrupted rekey — completing...");
     let manifest_json = std::fs::read(&manifest_path).expect("failed to read rekey manifest");
-    let filenames: Vec<String> =
+    let mut entries: Vec<ManifestEntry> =
         serde_json::from_slice(&manifest_json).expect("failed to parse rekey manifest");
     let staging_dir = base_path.join("_rekey_staging");
-    for filename in &filenames {
-        let staged = staging_dir.join(filename);
+    for i in 0..entries.len() {
+        if entries[i].renamed {
+            continue;
+        }
+        let staged = staging_dir.join(&entries[i].filename);
         if staged.exists() {
-            let original = base_path.join(filename);
+            let original = base_path.join(&entries[i].filename);
             std::fs::rename(&staged, &original)
-                .unwrap_or_else(|_| panic!("failed to rename staging/{filename} -> {filename}"));
+                .unwrap_or_else(|_| panic!("failed to rename staging/{} -> {}", entries[i].filename, entries[i].filename));
+            entries[i].renamed = true;
+            let updated = serde_json::to_vec(&entries).expect("failed to serialize manifest");
+            std::fs::write(&manifest_path, &updated).expect("failed to update manifest");
         }
     }
     let _ = std::fs::remove_dir_all(&staging_dir);
@@ -332,21 +344,26 @@ pub fn rekey(old_passphrase: &str, new_passphrase: &str, base_path: &std::path::
     eprintln!("zerotrust-drive: [{total}/{total}] re-encrypted _index.age");
 
     // Phase 2: Write manifest (commit point)
-    let manifest: Vec<String> = disk_files
+    let mut manifest: Vec<ManifestEntry> = disk_files
         .iter()
         .cloned()
         .chain(std::iter::once("_index.age".to_string()))
+        .map(|f| ManifestEntry { filename: f, renamed: false })
         .collect();
+    let manifest_path = base_path.join("_rekey.manifest");
     let manifest_json = serde_json::to_vec(&manifest).expect("failed to serialize manifest");
-    std::fs::write(base_path.join("_rekey.manifest"), &manifest_json)
+    std::fs::write(&manifest_path, &manifest_json)
         .expect("failed to write rekey manifest");
 
     // Phase 3: Rename pass — swap staged files over originals
-    for filename in &manifest {
-        let original = base_path.join(filename);
-        let staged = staging_dir.join(filename);
+    for i in 0..manifest.len() {
+        let original = base_path.join(&manifest[i].filename);
+        let staged = staging_dir.join(&manifest[i].filename);
         std::fs::rename(&staged, &original)
-            .unwrap_or_else(|_| panic!("failed to rename staging/{filename} -> {filename}"));
+            .unwrap_or_else(|_| panic!("failed to rename staging/{} -> {}", manifest[i].filename, manifest[i].filename));
+        manifest[i].renamed = true;
+        let updated = serde_json::to_vec(&manifest).expect("failed to serialize manifest");
+        std::fs::write(&manifest_path, &updated).expect("failed to update manifest");
     }
 
     // Cleanup
@@ -420,20 +437,25 @@ pub fn rekey_online(old_passphrase: &str, new_passphrase: &str, base_path: &std:
     eprintln!("zerotrust-drive: [{total}/{total}] re-encrypted _index.age");
 
     // 5. Write manifest (commit point)
-    let manifest: Vec<String> = disk_files.iter().cloned()
+    let mut manifest: Vec<ManifestEntry> = disk_files.iter().cloned()
         .chain(std::iter::once("_index.age".to_string()))
+        .map(|f| ManifestEntry { filename: f, renamed: false })
         .collect();
+    let manifest_path = base_path.join("_rekey.manifest");
     let manifest_json = serde_json::to_vec(&manifest).expect("failed to serialize manifest");
-    std::fs::write(base_path.join("_rekey.manifest"), &manifest_json).expect("failed to write manifest");
+    std::fs::write(&manifest_path, &manifest_json).expect("failed to write manifest");
 
     // 6. Rename pass
-    for filename in &manifest {
-        std::fs::rename(staging_dir.join(filename), base_path.join(filename))
-            .unwrap_or_else(|_| panic!("failed to rename staging/{filename} -> {filename}"));
+    for i in 0..manifest.len() {
+        std::fs::rename(staging_dir.join(&manifest[i].filename), base_path.join(&manifest[i].filename))
+            .unwrap_or_else(|_| panic!("failed to rename staging/{} -> {}", manifest[i].filename, manifest[i].filename));
+        manifest[i].renamed = true;
+        let updated = serde_json::to_vec(&manifest).expect("failed to serialize manifest");
+        std::fs::write(&manifest_path, &updated).expect("failed to update manifest");
     }
 
     let _ = std::fs::remove_dir_all(&staging_dir);
-    let _ = std::fs::remove_file(base_path.join("_rekey.manifest"));
+    let _ = std::fs::remove_file(&manifest_path);
     let _ = std::fs::remove_file(&lock_path);
 
     // 7. Swap key
@@ -1400,9 +1422,9 @@ mod tests {
         fs::write(staging_dir.join("_index.age"), b"new-index").unwrap();
 
         let manifest = vec![
-            "000001.age".to_string(),
-            "000002.age".to_string(),
-            "_index.age".to_string(),
+            ManifestEntry { filename: "000001.age".to_string(), renamed: true },
+            ManifestEntry { filename: "000002.age".to_string(), renamed: false },
+            ManifestEntry { filename: "_index.age".to_string(), renamed: false },
         ];
         fs::write(
             dir.join("_rekey.manifest"),
