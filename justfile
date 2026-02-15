@@ -1,20 +1,21 @@
 encrypted_dir := "~/Drive/.zerotrust.drive.encrypted"
 decrypted_dir := "~/zerotrust.drive"
+passphrase := env("ZEROTRUST_PASSPHRASE", "")
 
 default: build
 
 build:
     cargo build
 
-mount: build
+mount passphrase=passphrase: build
     mkdir -p {{decrypted_dir}}
-    cargo run -- --encrypted-dir {{encrypted_dir}} --decrypted-dir {{decrypted_dir}}
+    cargo run -- --encrypted-dir {{encrypted_dir}} --decrypted-dir {{decrypted_dir}}{{ if passphrase != "" { " --passphrase " + passphrase } else { "" } }}
 
 umount:
     umount {{decrypted_dir}} || diskutil unmount {{decrypted_dir}}
 
-run: build
-    cargo run -- --encrypted-dir {{encrypted_dir}} --decrypted-dir {{decrypted_dir}}
+run passphrase=passphrase: build
+    cargo run -- --encrypted-dir {{encrypted_dir}} --decrypted-dir {{decrypted_dir}}{{ if passphrase != "" { " --passphrase " + passphrase } else { "" } }}
 
 populate:
     #!/usr/bin/env bash
