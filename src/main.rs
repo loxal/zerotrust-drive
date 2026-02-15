@@ -2,6 +2,7 @@
 
 mod crypto;
 mod fs;
+mod rekey;
 
 use std::path::PathBuf;
 
@@ -46,7 +47,7 @@ fn main() {
     std::fs::create_dir_all(&base_path).unwrap();
 
     // Recover from any interrupted rekey before doing anything else
-    fs::recover_interrupted_rekey(&base_path);
+    rekey::recover_interrupted_rekey(&base_path);
 
     // Validate --continue-rekey requires --new-passphrase
     let resume = cli.continue_rekey;
@@ -80,7 +81,7 @@ fn main() {
         std::thread::spawn(move || {
             // Let FUSE mount establish before starting rekey
             std::thread::sleep(std::time::Duration::from_millis(500));
-            fs::rekey_online(&old_pw, &new_passphrase, &rekey_base, &inner, resume);
+            rekey::rekey_online(&old_pw, &new_passphrase, &rekey_base, &inner, resume);
         });
 
         eprintln!("zerotrust-drive: rotating passphrase — files will be read-only until re-encryption finishes");
