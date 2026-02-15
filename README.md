@@ -67,9 +67,18 @@ During rotation the filesystem mounts read-only — existing files are readable 
 return EROFS. Once re-encryption finishes the filesystem becomes read-write again.
 
 **Cancel & resume**: The operation can be interrupted at any time (Ctrl+C, crash, power loss).
-No files are ever lost. On next startup, interrupted rekeys are automatically detected and
-completed. Re-encrypted files are staged in a hidden `_rekey_staging/` directory and only
-swapped into place after all files are ready, so the originals are never modified in place.
+No files are ever lost. Re-encrypted files are staged in a hidden `.rekey_staging/` directory
+and only swapped into place after all files are ready, so the originals are never modified
+in place.
+
+If interrupted during the rename phase, recovery is automatic on next startup. If interrupted
+during the staging phase, a fresh `--new-passphrase` wipes the partial staging and starts over
+(safe — originals are untouched). To resume staging instead:
+
+    just rekey-resume "same-passphrase"                 # resume interrupted staging
+
+The passphrase is cryptographically verified against the already-staged files — if you
+provide a different passphrase, the resume is rejected to prevent mixed-key corruption.
 
 ### Encryption
 

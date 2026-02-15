@@ -26,6 +26,10 @@ struct Cli {
     /// Re-encrypt all files with a new passphrase (mounts read-only during rotation)
     #[arg(long)]
     new_passphrase: Option<String>,
+
+    /// Resume an interrupted rekey instead of starting over (requires --new-passphrase)
+    #[arg(long)]
+    continue_rekey: bool,
 }
 
 fn main() {
@@ -43,6 +47,13 @@ fn main() {
 
     // Recover from any interrupted rekey before doing anything else
     fs::recover_interrupted_rekey(&base_path);
+
+    // Validate --continue-rekey requires --new-passphrase
+    let resume = cli.continue_rekey;
+    if resume && cli.new_passphrase.is_none() {
+        eprintln!("zerotrust-drive: error: --continue-rekey requires --new-passphrase");
+        std::process::exit(1);
+    }
 
     // Handle --new-passphrase (online rekey: mount read-only, re-encrypt in background)
     if let Some(new_passphrase) = cli.new_passphrase {
@@ -69,7 +80,7 @@ fn main() {
         std::thread::spawn(move || {
             // Let FUSE mount establish before starting rekey
             std::thread::sleep(std::time::Duration::from_millis(500));
-            fs::rekey_online(&old_pw, &new_passphrase, &rekey_base, &inner);
+            fs::rekey_online(&old_pw, &new_passphrase, &rekey_base, &inner, resume);
         });
 
         eprintln!("zerotrust-drive: rotating passphrase — files will be read-only until re-encryption finishes");

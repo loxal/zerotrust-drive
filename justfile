@@ -20,6 +20,9 @@ run passphrase=passphrase: build
 rekey new_passphrase passphrase=passphrase: build
     cargo run -- --encrypted-dir {{encrypted_dir}} --new-passphrase {{new_passphrase}}{{ if passphrase != "" { " --passphrase " + passphrase } else { "" } }}
 
+rekey-resume new_passphrase passphrase=passphrase: build
+    cargo run -- --encrypted-dir {{encrypted_dir}} --new-passphrase {{new_passphrase}} --continue-rekey{{ if passphrase != "" { " --passphrase " + passphrase } else { "" } }}
+
 populate:
     #!/usr/bin/env bash
     set -euo pipefail
