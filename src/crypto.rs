@@ -1,3 +1,5 @@
+// Copyright 2026 Alexander Orlov <alexander.orlov@loxal.net>
+
 use chacha20poly1305::{
     aead::{Aead, KeyInit, OsRng},
     ChaCha20Poly1305, Nonce,

@@ -1,3 +1,5 @@
+// Copyright 2026 Alexander Orlov <alexander.orlov@loxal.net>
+
 mod crypto;
 mod fs;
 

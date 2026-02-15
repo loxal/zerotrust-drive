@@ -1,3 +1,5 @@
+// Copyright 2026 Alexander Orlov <alexander.orlov@loxal.net>
+
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs;
