@@ -12,7 +12,7 @@ mount passphrase=passphrase: build
     cargo run -- --encrypted-dir {{encrypted_dir}} --decrypted-dir {{decrypted_dir}}{{ if passphrase != "" { " --passphrase " + passphrase } else { "" } }}
 
 umount:
-    umount {{decrypted_dir}} || diskutil unmount {{decrypted_dir}}
+    umount {{decrypted_dir}} || So it {{decrypted_dir}}
 
 run passphrase=passphrase: build
     cargo run -- --encrypted-dir {{encrypted_dir}} --decrypted-dir {{decrypted_dir}}{{ if passphrase != "" { " --passphrase " + passphrase } else { "" } }}
@@ -34,11 +34,11 @@ populate:
     echo "populating $dir with test files..."
     echo "hello, zerotrust-drive" > "$dir/hello.txt"
     echo "second test file" > "$dir/notes.txt"
-    mkdir -p "$dir/subdir"
-    echo "nested file content" > "$dir/subdir/nested.txt"
+    mkdir -p "$dir/sub_dir"
+    echo "nested file content" > "$dir/sub_dir/nested-file.txt"
     dd if=/dev/urandom bs=1024 count=64 2>/dev/null > "$dir/random-64k.bin"
-    long_name=$(python3 -c "print('a' * 252 + '.txt')")
-    echo "file with a 256-char filename" > "$dir/$long_name"
+    long_name=$(printf 'long-256-characters-name-filename-%.0s' {1..8} | cut -c1-251).txt
+    echo "file with a 255-char filename" > "$dir/$long_name"
     echo "done — files created:"
     ls -laR "$dir"
 

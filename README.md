@@ -113,6 +113,11 @@ Before resuming, the passphrase is **cryptographically verified** — one file f
 staging directory is test-decrypted with the provided new passphrase. If decryption fails,
 the resume is rejected with a clear error. No passphrase is ever stored on disk.
 
+### Limits
+
+Filenames are limited to **255 bytes** — the standard maximum shared by ext4, APFS, and
+NTFS. Operations that exceed this limit (create, mkdir, rename) return `ENAMETOOLONG`.
+
 ### Encryption
 
 zerotrust-drive uses ChaCha20-Poly1305, an AEAD (Authenticated Encryption with Associated

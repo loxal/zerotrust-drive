@@ -28,6 +28,7 @@ macro_rules! trace {
 
 const TTL: Duration = Duration::from_secs(1);
 const BLKSIZE: u32 = 4096;
+const NAME_MAX: usize = 255;
 
 // --- Persistent index ---
 
@@ -436,6 +437,9 @@ impl Filesystem for ZeroTrustFs {
             Some(s) => s,
             None => { reply.error(fuser::Errno::EINVAL); return; }
         };
+        if name_str.len() > NAME_MAX {
+            reply.error(fuser::Errno::ENAMETOOLONG); return;
+        }
         let (ino, attr) = {
             let mut state = self.inner.state.lock().unwrap();
             match state.inodes.get(&parent.0) {
@@ -478,6 +482,9 @@ impl Filesystem for ZeroTrustFs {
             Some(s) => s,
             None => { reply.error(fuser::Errno::EINVAL); return; }
         };
+        if name_str.len() > NAME_MAX {
+            reply.error(fuser::Errno::ENAMETOOLONG); return;
+        }
 
         let (ino, attr, _disk_filename) = {
             let mut state = self.inner.state.lock().unwrap();
@@ -521,6 +528,9 @@ impl Filesystem for ZeroTrustFs {
             Some(s) => s,
             None => { reply.error(fuser::Errno::EINVAL); return; }
         };
+        if name_str.len() > NAME_MAX {
+            reply.error(fuser::Errno::ENAMETOOLONG); return;
+        }
 
         let attr = {
             let mut state = self.inner.state.lock().unwrap();
@@ -627,6 +637,9 @@ impl Filesystem for ZeroTrustFs {
         let newname_str = match newname.to_str() {
             Some(s) => s, None => { reply.error(fuser::Errno::EINVAL); return; }
         };
+        if newname_str.len() > NAME_MAX {
+            reply.error(fuser::Errno::ENAMETOOLONG); return;
+        }
 
         let disk_file_to_remove = {
             let mut state = self.inner.state.lock().unwrap();
@@ -694,7 +707,7 @@ impl Filesystem for ZeroTrustFs {
     fn statfs(&self, _req: &Request, _ino: INodeNo, reply: ReplyStatfs) {
         let state = self.inner.state.lock().unwrap();
         let files = state.inodes.len() as u64;
-        reply.statfs(1_000_000, 900_000, 900_000, files, 1_000_000 - files, BLKSIZE, 255, 0);
+        reply.statfs(1_000_000, 900_000, 900_000, files, 1_000_000 - files, BLKSIZE, NAME_MAX as u32, 0);
     }
 
     fn access(&self, _req: &Request, ino: INodeNo, _mask: fuser::AccessFlags, reply: ReplyEmpty) {
@@ -995,6 +1008,15 @@ mod tests {
         }
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn name_max_is_255() {
+        assert_eq!(NAME_MAX, 255);
+        let exactly_255 = "a".repeat(255);
+        assert_eq!(exactly_255.len(), NAME_MAX);
+        let too_long = "a".repeat(256);
+        assert!(too_long.len() > NAME_MAX);
     }
 
     #[test]
