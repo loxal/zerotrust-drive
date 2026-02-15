@@ -11,8 +11,12 @@ mount passphrase=passphrase: build
     mkdir -p {{decrypted_dir}}
     cargo run -- --encrypted-dir {{encrypted_dir}} --decrypted-dir {{decrypted_dir}}{{ if passphrase != "" { " --passphrase " + passphrase } else { "" } }}
 
+mount-release passphrase=passphrase:
+    mkdir -p {{decrypted_dir}}
+    zdrive --encrypted-dir {{encrypted_dir}} --decrypted-dir {{decrypted_dir}}{{ if passphrase != "" { " --passphrase " + passphrase } else { "" } }}
+
 umount:
-    umount {{decrypted_dir}} || So it {{decrypted_dir}}
+    umount {{decrypted_dir}} 2>/dev/null || true
 
 run passphrase=passphrase: build
     cargo run -- --encrypted-dir {{encrypted_dir}} --decrypted-dir {{decrypted_dir}}{{ if passphrase != "" { " --passphrase " + passphrase } else { "" } }}
@@ -47,6 +51,30 @@ test:
 
 release:
     cargo build --release
+    @cp target/release/zerotrust-drive ~/.cargo/bin/zdrive
+    @echo "installed: ~/.cargo/bin/zdrive"
+
+release-macos:
+    cargo build --release --target aarch64-apple-darwin
+    @mkdir -p target/dist
+    @cp target/aarch64-apple-darwin/release/zerotrust-drive target/dist/zdrive-macos-aarch64
+    @echo "built: target/dist/zdrive-macos-aarch64"
+
+release-linux:
+    cross build --release --target x86_64-unknown-linux-gnu
+    @mkdir -p target/dist
+    @cp target/x86_64-unknown-linux-gnu/release/zerotrust-drive target/dist/zdrive-linux-x86_64
+    @echo "built: target/dist/zdrive-linux-x86_64"
+
+release-windows:
+    cross build --release --target x86_64-pc-windows-gnu
+    @mkdir -p target/dist
+    @cp target/x86_64-pc-windows-gnu/release/zerotrust-drive.exe target/dist/zdrive-windows-x86_64.exe
+    @echo "built: target/dist/zdrive-windows-x86_64.exe"
+
+release-all: release-macos release-linux release-windows
+    @echo "all platforms built in target/dist/"
+    @ls -lh target/dist/zdrive-*
 
 clean:
     cargo clean
