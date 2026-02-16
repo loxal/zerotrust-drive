@@ -94,7 +94,6 @@ fn main() {
             MountOption::RW,
             MountOption::FSName("zerotrust-drive".to_string()),
         ];
-
         fuser::mount2(ztfs, &mountpoint, &config).expect("failed to mount filesystem");
         return;
     }
@@ -126,7 +125,6 @@ fn main() {
         MountOption::RW,
         MountOption::FSName("zerotrust-drive".to_string()),
     ];
-
     let ztfs = fs::ZeroTrustFs::new(&passphrase, base_path);
     fuser::mount2(ztfs, &mountpoint, &config).expect("failed to mount filesystem");
 }

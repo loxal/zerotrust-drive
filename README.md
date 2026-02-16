@@ -29,6 +29,16 @@ A FUSE implementation is required. Install the one for your OS:
 - **Linux** — `libfuse-dev` (Debian/Ubuntu: `sudo apt install libfuse-dev`, Fedora: `sudo dnf install fuse-devel`)
 - **Windows** — not supported (would require [WinFSP](https://winfsp.dev/) and a different FUSE crate)
 
+#### macOS: Full Disk Access required
+
+On macOS, the system's privacy framework (TCC) restricts which applications can access FUSE
+mounts. If `ls`, `du`, or other commands return "Operation not permitted" or "Permission
+denied" on the mount point, the terminal application you are using does not have Full Disk
+Access.
+
+To fix this, go to **System Settings > Privacy & Security > Full Disk Access** and enable
+it for your terminal application (e.g. Terminal.app, iTerm2, Alacritty).
+
 ### Directory Layout
 
     ~/g.drive/.zerotrust.drive.encrypted/    encrypted storage — synced by Google Drive (ciphertext only)
