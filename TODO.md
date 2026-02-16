@@ -1,0 +1,1 @@
+* daemon mode - run in backgroundd as a long-lived service
