@@ -264,7 +264,8 @@ impl ZeroTrustFs {
 
         let json = {
             let state = self.inner.state.read().unwrap();
-            serde_json::to_vec(&*state).expect("failed to serialize index")
+            serde_json::to_vec(&*state)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?
         };
         // Lock is dropped here — safe to do slow encryption
         self.persist_index(&json)
@@ -959,6 +960,21 @@ mod tests {
     }
 
     #[test]
+    fn different_length_passphrases_produce_different_keys() {
+        // "a" vs "aa" must produce different keys (length is folded into state)
+        let k1 = derive_key("a");
+        let k2 = derive_key("aa");
+        assert_ne!(k1, k2);
+    }
+
+    #[test]
+    fn empty_passphrase_produces_valid_key() {
+        let k = derive_key("");
+        // Should not be all zeros
+        assert!(k.iter().any(|&b| b != 0));
+    }
+
+    #[test]
     fn encrypted_file_persistence() {
         use std::sync::atomic::{AtomicU32, Ordering};
         static CTR: AtomicU32 = AtomicU32::new(0);
@@ -968,7 +984,7 @@ mod tests {
 
         let ztfs = ZeroTrustFs::new("test-pw", dir.clone());
         ztfs.write_encrypted_file("test.age", b"hello world").unwrap();
-        let content = ztfs.read_encrypted_file("test.age");
+        let content = ztfs.read_encrypted_file("test.age").unwrap();
         assert_eq!(content, b"hello world");
         let raw = fs::read(dir.join("test.age")).unwrap();
         assert_ne!(raw.as_slice(), b"hello world");
@@ -1000,7 +1016,7 @@ mod tests {
         ztfs.write_encrypted_file(&disk_filename, b"hello, world!").unwrap();
         ztfs.flush_state().unwrap();
 
-        let content = ztfs.read_encrypted_file(&disk_filename);
+        let content = ztfs.read_encrypted_file(&disk_filename).unwrap();
         assert_eq!(content, b"hello, world!");
 
         let updated = b"updated content for note";
@@ -1012,7 +1028,7 @@ mod tests {
         }
         ztfs.flush_state().unwrap();
 
-        let content = ztfs.read_encrypted_file(&disk_filename);
+        let content = ztfs.read_encrypted_file(&disk_filename).unwrap();
         assert_eq!(content, updated);
 
         {
@@ -1067,7 +1083,7 @@ mod tests {
         ztfs.flush_state().unwrap();
 
         for (i, (_name, expected)) in files.iter().enumerate() {
-            let content = ztfs.read_encrypted_file(&disk_filenames[i]);
+            let content = ztfs.read_encrypted_file(&disk_filenames[i]).unwrap();
             assert_eq!(content, *expected);
         }
 
@@ -1093,10 +1109,10 @@ mod tests {
         assert!(ZeroTrustFs::find_child(&state, 1, "alpha.txt").is_none());
 
         drop(state);
-        let content = ztfs.read_encrypted_file(&disk_filenames[1]);
+        let content = ztfs.read_encrypted_file(&disk_filenames[1]).unwrap();
         assert_eq!(content, updated_beta);
 
-        let content = ztfs.read_encrypted_file(&disk_filenames[2]);
+        let content = ztfs.read_encrypted_file(&disk_filenames[2]).unwrap();
         assert_eq!(content, b"content gamma");
 
         let _ = fs::remove_dir_all(&dir);
@@ -1140,7 +1156,7 @@ mod tests {
             assert_eq!(entry.disk_filename, disk_filename);
             drop(state);
 
-            let content = ztfs.read_encrypted_file(&disk_filename);
+            let content = ztfs.read_encrypted_file(&disk_filename).unwrap();
             assert_eq!(content, b"persisted data!");
         }
 

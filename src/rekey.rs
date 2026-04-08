@@ -435,7 +435,7 @@ mod tests {
         let ino = ZeroTrustFs::find_child(&state, 1, "secret.txt").expect("file should exist");
         let df = state.inodes.get(&ino).unwrap().disk_filename.clone();
         drop(state);
-        let content = ztfs.read_encrypted_file(&df);
+        let content = ztfs.read_encrypted_file(&df).expect("failed to read encrypted file");
         assert_eq!(content, b"secret data");
 
         let _ = fs::remove_dir_all(&dir);
@@ -484,7 +484,7 @@ mod tests {
         for (name, expected) in &files_data {
             let ino = ZeroTrustFs::find_child(&state, 1, name).expect("file should exist");
             let df = state.inodes.get(&ino).unwrap().disk_filename.clone();
-            let content = ztfs.read_encrypted_file(&df);
+            let content = ztfs.read_encrypted_file(&df).expect("failed to read encrypted file");
             assert_eq!(content, *expected, "mismatch for {name}");
         }
 
@@ -596,7 +596,7 @@ mod tests {
         let ino = ZeroTrustFs::find_child(&state, 1, "online.txt").expect("file should exist");
         let df = state.inodes.get(&ino).unwrap().disk_filename.clone();
         drop(state);
-        let content = ztfs2.read_encrypted_file(&df);
+        let content = ztfs2.read_encrypted_file(&df).expect("failed to read encrypted file");
         assert_eq!(content, b"online data!");
 
         assert!(!dir.join(".rekey_staging").exists());
@@ -689,7 +689,7 @@ mod tests {
         let ztfs2 = ZeroTrustFs::new(new_pw, dir.clone());
         let state = ztfs2.inner.state.write().unwrap();
         for filename in &["000001.age", "000002.age", "000003.age"] {
-            let content = ztfs2.read_encrypted_file(filename);
+            let content = ztfs2.read_encrypted_file(filename).expect("failed to read encrypted file");
             assert!(!content.is_empty(), "{filename} should be readable with new key");
         }
         drop(state);
@@ -759,7 +759,7 @@ mod tests {
         rekey(old_pw, new_pw, &dir, false);
 
         let ztfs2 = ZeroTrustFs::new(new_pw, dir.clone());
-        let content = ztfs2.read_encrypted_file("000001.age");
+        let content = ztfs2.read_encrypted_file("000001.age").expect("failed to read encrypted file");
         assert_eq!(content, b"data");
 
         assert!(!dir.join(".rekey_staging").exists());
