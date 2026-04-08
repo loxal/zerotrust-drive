@@ -5,7 +5,7 @@ use std::sync::atomic::Ordering;
 use serde::{Deserialize, Serialize};
 
 use crate::crypto::{decrypt_bytes, derive_key, encrypt_bytes};
-use crate::fs::{DiskIndex, FsInner, InodeKind};
+use crate::fs::{durable_write, DiskIndex, FsInner, InodeKind};
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct ManifestEntry {
@@ -63,9 +63,17 @@ pub fn recover_interrupted_rekey(base_path: &std::path::Path) -> bool {
                 .unwrap_or_else(|_| panic!("failed to rename staging/{} -> {}", entries[i].filename, entries[i].filename));
             entries[i].renamed = true;
             let updated = serde_json::to_vec(&entries).expect("failed to serialize manifest");
-            std::fs::write(&manifest_path, &updated).expect("failed to update manifest");
+            durable_write(&manifest_path, &updated).expect("failed to update manifest");
         }
     }
+    // Check for unresolved entries (staged file missing AND not yet renamed)
+    let unresolved = entries.iter().any(|e| !e.renamed);
+    if unresolved {
+        eprintln!("zerotrust-drive: ERROR: rekey recovery incomplete — some staged files missing");
+        eprintln!("zerotrust-drive: manifest kept at {} for investigation", manifest_path.display());
+        return false;
+    }
+    // Only clean up if ALL entries were renamed
     let _ = std::fs::remove_dir_all(&staging_dir);
     let _ = std::fs::remove_file(&manifest_path);
     let _ = std::fs::remove_file(base_path.join("_rekey.lock"));
@@ -105,15 +113,22 @@ pub fn rekey(old_passphrase: &str, new_passphrase: &str, base_path: &std::path::
 
     // Acquire lock (when resuming, the lock is expected from the interrupted run)
     let lock_path = base_path.join("_rekey.lock");
-    if lock_path.exists() && !resume {
-        eprintln!(
-            "zerotrust-drive: error: lock file exists at {} — another rekey may be in progress",
-            lock_path.display()
-        );
-        eprintln!("zerotrust-drive: if you are sure no other process is running, delete it manually");
-        std::process::exit(1);
+    if !resume {
+        use std::io::Write;
+        let mut lock_file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap_or_else(|_| {
+                eprintln!(
+                    "zerotrust-drive: error: lock file exists at {} — another rekey may be in progress",
+                    lock_path.display()
+                );
+                eprintln!("zerotrust-drive: if you are sure no other process is running, delete it manually");
+                std::process::exit(1);
+            });
+        write!(lock_file, "{}", std::process::id()).expect("failed to write lock file");
     }
-    std::fs::write(&lock_path, std::process::id().to_string()).expect("failed to create lock file");
 
     // Derive keys
     let old_key = derive_key(old_passphrase);
@@ -164,7 +179,7 @@ pub fn rekey(old_passphrase: &str, new_passphrase: &str, base_path: &std::path::
         let plaintext = decrypt_bytes(&old_key, &ciphertext)
             .unwrap_or_else(|_| panic!("failed to decrypt {filename} — data may be corrupted"));
         let new_ciphertext = encrypt_bytes(&new_key, &plaintext).expect("failed to re-encrypt");
-        std::fs::write(&staged_path, new_ciphertext)
+        durable_write(&staged_path, &new_ciphertext)
             .unwrap_or_else(|_| panic!("failed to write staging/{filename}"));
 
         eprintln!(
@@ -183,7 +198,7 @@ pub fn rekey(old_passphrase: &str, new_passphrase: &str, base_path: &std::path::
     if !resume || !staged_index.exists() {
         let new_index_ciphertext =
             encrypt_bytes(&new_key, &index_json).expect("failed to re-encrypt index");
-        std::fs::write(&staged_index, new_index_ciphertext)
+        durable_write(&staged_index, &new_index_ciphertext)
             .expect("failed to write staging/_index.age");
         eprintln!("zerotrust-drive: [{total}/{total}] re-encrypted _index.age");
     }
@@ -197,7 +212,7 @@ pub fn rekey(old_passphrase: &str, new_passphrase: &str, base_path: &std::path::
         .collect();
     let manifest_path = base_path.join("_rekey.manifest");
     let manifest_json = serde_json::to_vec(&manifest).expect("failed to serialize manifest");
-    std::fs::write(&manifest_path, &manifest_json)
+    durable_write(&manifest_path, &manifest_json)
         .expect("failed to write rekey manifest");
 
     // Phase 3: Rename pass — swap staged files over originals
@@ -208,7 +223,7 @@ pub fn rekey(old_passphrase: &str, new_passphrase: &str, base_path: &std::path::
             .unwrap_or_else(|_| panic!("failed to rename staging/{} -> {}", manifest[i].filename, manifest[i].filename));
         manifest[i].renamed = true;
         let updated = serde_json::to_vec(&manifest).expect("failed to serialize manifest");
-        std::fs::write(&manifest_path, &updated).expect("failed to update manifest");
+        durable_write(&manifest_path, &updated).expect("failed to update manifest");
     }
 
     // Cleanup
@@ -235,14 +250,14 @@ pub fn rekey_online(old_passphrase: &str, new_passphrase: &str, base_path: &std:
             if let Some(entry) = state.inodes.get(&ino) {
                 if !entry.disk_filename.is_empty() {
                     let encrypted = encrypt_bytes(&key, content).expect("failed to encrypt");
-                    std::fs::write(inner.base_path.join(&entry.disk_filename), encrypted).expect("failed to write");
+                    durable_write(&inner.base_path.join(&entry.disk_filename), &encrypted).expect("failed to write");
                 }
             }
         }
         // Also persist index
         let json = serde_json::to_vec(&*state).expect("failed to serialize index");
         let encrypted = encrypt_bytes(&key, &json).expect("failed to encrypt index");
-        std::fs::write(inner.base_path.join("_index.age"), encrypted).expect("failed to write index");
+        durable_write(&inner.base_path.join("_index.age"), &encrypted).expect("failed to write index");
     }
 
     // 3. Handle resume vs fresh
@@ -262,7 +277,15 @@ pub fn rekey_online(old_passphrase: &str, new_passphrase: &str, base_path: &std:
 
     // 4. Acquire lock
     let lock_path = base_path.join("_rekey.lock");
-    std::fs::write(&lock_path, std::process::id().to_string()).expect("failed to create lock file");
+    {
+        use std::io::Write;
+        let mut lock_file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&lock_path)
+            .expect("failed to create lock file — another rekey may be in progress");
+        write!(lock_file, "{}", std::process::id()).expect("failed to write lock file");
+    }
 
     // 5. Derive keys and do staging
     let old_key = derive_key(old_passphrase);
@@ -294,7 +317,7 @@ pub fn rekey_online(old_passphrase: &str, new_passphrase: &str, base_path: &std:
         let plaintext = decrypt_bytes(&old_key, &ciphertext)
             .unwrap_or_else(|_| panic!("failed to decrypt {filename}"));
         let new_ciphertext = encrypt_bytes(&new_key, &plaintext).expect("failed to re-encrypt");
-        std::fs::write(&staged_path, new_ciphertext).unwrap_or_else(|_| panic!("failed to write staging/{filename}"));
+        durable_write(&staged_path, &new_ciphertext).unwrap_or_else(|_| panic!("failed to write staging/{filename}"));
         eprintln!("zerotrust-drive: [{}/{}] re-encrypted {}", i + 1, total, filename);
     }
     if skipped > 0 {
@@ -304,7 +327,7 @@ pub fn rekey_online(old_passphrase: &str, new_passphrase: &str, base_path: &std:
     let staged_index = staging_dir.join("_index.age");
     if !resume || !staged_index.exists() {
         let new_index_ciphertext = encrypt_bytes(&new_key, &index_json).expect("failed to re-encrypt index");
-        std::fs::write(&staged_index, new_index_ciphertext).expect("failed to write staging/_index.age");
+        durable_write(&staged_index, &new_index_ciphertext).expect("failed to write staging/_index.age");
         eprintln!("zerotrust-drive: [{total}/{total}] re-encrypted _index.age");
     }
 
@@ -315,7 +338,7 @@ pub fn rekey_online(old_passphrase: &str, new_passphrase: &str, base_path: &std:
         .collect();
     let manifest_path = base_path.join("_rekey.manifest");
     let manifest_json = serde_json::to_vec(&manifest).expect("failed to serialize manifest");
-    std::fs::write(&manifest_path, &manifest_json).expect("failed to write manifest");
+    durable_write(&manifest_path, &manifest_json).expect("failed to write manifest");
 
     // 7. Rename pass
     for i in 0..manifest.len() {
@@ -323,7 +346,7 @@ pub fn rekey_online(old_passphrase: &str, new_passphrase: &str, base_path: &std:
             .unwrap_or_else(|_| panic!("failed to rename staging/{} -> {}", manifest[i].filename, manifest[i].filename));
         manifest[i].renamed = true;
         let updated = serde_json::to_vec(&manifest).expect("failed to serialize manifest");
-        std::fs::write(&manifest_path, &updated).expect("failed to update manifest");
+        durable_write(&manifest_path, &updated).expect("failed to update manifest");
     }
 
     let _ = std::fs::remove_dir_all(&staging_dir);
@@ -345,13 +368,13 @@ pub fn rekey_online(old_passphrase: &str, new_passphrase: &str, base_path: &std:
             if let Some(entry) = state.inodes.get(&ino) {
                 if !entry.disk_filename.is_empty() {
                     let encrypted = encrypt_bytes(&key, content).expect("failed to encrypt");
-                    std::fs::write(inner.base_path.join(&entry.disk_filename), encrypted).expect("failed to write");
+                    durable_write(&inner.base_path.join(&entry.disk_filename), &encrypted).expect("failed to write");
                 }
             }
         }
         let json = serde_json::to_vec(&*state).expect("failed to serialize index");
         let encrypted = encrypt_bytes(&key, &json).expect("failed to encrypt index");
-        std::fs::write(inner.base_path.join("_index.age"), encrypted).expect("failed to write index");
+        durable_write(&inner.base_path.join("_index.age"), &encrypted).expect("failed to write index");
         if let Ok(meta) = std::fs::metadata(inner.base_path.join("_index.age")) {
             if let Ok(mtime) = meta.modified() {
                 *inner.index_mtime.lock().unwrap() = Some(mtime);
@@ -397,8 +420,8 @@ mod tests {
                 name: "secret.txt".to_string(), inode: ino,
             });
             drop(state);
-            ztfs.write_encrypted_file(&df, b"secret data");
-            ztfs.flush_state();
+            ztfs.write_encrypted_file(&df, b"secret data").unwrap();
+            ztfs.flush_state().unwrap();
         }
 
         rekey(old_pw, new_pw, &dir, false);
@@ -449,9 +472,9 @@ mod tests {
                     });
                     df
                 };
-                ztfs.write_encrypted_file(&df, content);
+                ztfs.write_encrypted_file(&df, content).unwrap();
             }
-            ztfs.flush_state();
+            ztfs.flush_state().unwrap();
         }
 
         rekey(old_pw, new_pw, &dir, false);
@@ -550,8 +573,8 @@ mod tests {
                 name: "online.txt".to_string(), inode: ino,
             });
         }
-        ztfs.write_encrypted_file("000001.age", b"online data!");
-        ztfs.flush_state();
+        ztfs.write_encrypted_file("000001.age", b"online data!").unwrap();
+        ztfs.flush_state().unwrap();
 
         ztfs.inner.open_files.write().unwrap().insert(2, b"online data!".to_vec());
 
@@ -605,8 +628,8 @@ mod tests {
                 name: "test.txt".to_string(), inode: ino,
             });
         }
-        ztfs.write_encrypted_file("000001.age", b"test");
-        ztfs.flush_state();
+        ztfs.write_encrypted_file("000001.age", b"test").unwrap();
+        ztfs.flush_state().unwrap();
 
         ztfs.inner.read_only.store(true, Ordering::SeqCst);
         assert!(ztfs.inner.read_only.load(Ordering::Relaxed));
@@ -643,10 +666,10 @@ mod tests {
                 });
             }
         }
-        ztfs.write_encrypted_file("000001.age", b"aaa");
-        ztfs.write_encrypted_file("000002.age", b"bbb");
-        ztfs.write_encrypted_file("000003.age", b"ccc");
-        ztfs.flush_state();
+        ztfs.write_encrypted_file("000001.age", b"aaa").unwrap();
+        ztfs.write_encrypted_file("000002.age", b"bbb").unwrap();
+        ztfs.write_encrypted_file("000003.age", b"ccc").unwrap();
+        ztfs.flush_state().unwrap();
 
         let staging_dir = dir.join(".rekey_staging");
         fs::create_dir_all(&staging_dir).unwrap();
@@ -724,8 +747,8 @@ mod tests {
                 name: "file.txt".to_string(), inode: ino,
             });
         }
-        ztfs.write_encrypted_file("000001.age", b"data");
-        ztfs.flush_state();
+        ztfs.write_encrypted_file("000001.age", b"data").unwrap();
+        ztfs.flush_state().unwrap();
 
         let staging_dir = dir.join(".rekey_staging");
         fs::create_dir_all(&staging_dir).unwrap();
@@ -740,6 +763,46 @@ mod tests {
         assert_eq!(content, b"data");
 
         assert!(!dir.join(".rekey_staging").exists());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rekey_recovery_fails_on_missing_staged_file() {
+        let dir = PathBuf::from("target/test-recover-missing");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let staging_dir = dir.join(".rekey_staging");
+        fs::create_dir_all(&staging_dir).unwrap();
+
+        // 000001.age already renamed, 000002.age staged, 000003.age MISSING from staging
+        fs::write(dir.join("000001.age"), b"renamed-new").unwrap();
+        fs::write(dir.join("000002.age"), b"old-data").unwrap();
+        fs::write(staging_dir.join("000002.age"), b"new-data").unwrap();
+        // 000003.age is NOT in staging — simulates lost file
+
+        let manifest = vec![
+            ManifestEntry { filename: "000001.age".to_string(), renamed: true },
+            ManifestEntry { filename: "000002.age".to_string(), renamed: false },
+            ManifestEntry { filename: "000003.age".to_string(), renamed: false },
+        ];
+        fs::write(
+            dir.join("_rekey.manifest"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        fs::write(dir.join("_rekey.lock"), b"12345").unwrap();
+
+        let recovered = recover_interrupted_rekey(&dir);
+        assert!(!recovered, "recovery should fail when a staged file is missing");
+
+        // 000002.age should have been renamed (it was available)
+        assert_eq!(fs::read(dir.join("000002.age")).unwrap(), b"new-data");
+
+        // Manifest and lock should be preserved for investigation
+        assert!(dir.join("_rekey.manifest").exists(), "manifest should be kept for investigation");
+        assert!(dir.join("_rekey.lock").exists(), "lock should be kept");
 
         let _ = fs::remove_dir_all(&dir);
     }
