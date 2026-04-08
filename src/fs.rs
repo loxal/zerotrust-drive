@@ -396,7 +396,14 @@ impl Filesystem for ZeroTrustFs {
         };
         // Decrypt happens outside any lock — only the FUSE thread is blocked
         let content = if !disk_filename.is_empty() && self.inner.base_path.join(&disk_filename).exists() {
-            self.read_encrypted_file(&disk_filename)
+            match self.read_encrypted_file(&disk_filename) {
+                Ok(data) => data,
+                Err(e) => {
+                    eprintln!("zerotrust-drive: ERROR: failed to read/decrypt {}: {e}", disk_filename);
+                    reply.error(fuser::Errno::EIO);
+                    return;
+                }
+            }
         } else if !disk_filename.is_empty() {
             // Backing file missing — data loss
             eprintln!("zerotrust-drive: ERROR: backing file {} missing for inode {}", disk_filename, ino.0);
