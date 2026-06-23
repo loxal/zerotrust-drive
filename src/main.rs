@@ -2,6 +2,7 @@
 
 mod crypto;
 mod fs;
+mod migrate;
 mod rekey;
 
 use std::path::PathBuf;
@@ -31,6 +32,12 @@ struct Cli {
     /// Resume an interrupted rekey instead of starting over (requires --new-passphrase)
     #[arg(long)]
     continue_rekey: bool,
+
+    /// Upgrade a pre-0.7 drive to the v1 on-disk format (Argon2id +
+    /// XChaCha20-Poly1305) in place, using the current passphrase, then
+    /// exit. Crash-safe; re-run to resume an interrupted migration.
+    #[arg(long)]
+    migrate_format: bool,
 }
 
 fn main() {
@@ -46,8 +53,55 @@ fn main() {
 
     std::fs::create_dir_all(&base_path).unwrap();
 
-    // Recover from any interrupted rekey before doing anything else
+    // Recover from any interrupted rekey or format migration before
+    // doing anything else.
     rekey::recover_interrupted_rekey(&base_path);
+    migrate::recover_interrupted_migration(&base_path);
+
+    // Handle --migrate-format (v0 → v1 on-disk upgrade) and exit.
+    if cli.migrate_format {
+        if cli.new_passphrase.is_some() {
+            eprintln!("zerotrust-drive: error: --migrate-format upgrades in place with the current passphrase; do not combine it with --new-passphrase");
+            std::process::exit(1);
+        }
+        if !base_path.join("_index.age").exists() {
+            eprintln!(
+                "zerotrust-drive: error: no _index.age found in {} — nothing to migrate",
+                base_path.display()
+            );
+            std::process::exit(1);
+        }
+        if !migrate::needs_migration(&base_path) {
+            eprintln!("zerotrust-drive: drive is already in the v1 on-disk format — nothing to do");
+            return;
+        }
+        eprintln!("zerotrust-drive: migrating {} to v1 (Argon2id + XChaCha20-Poly1305)...", base_path.display());
+        eprintln!("zerotrust-drive: NOTE: every blob is re-encrypted, so a cloud-sync backend will re-upload the whole drive");
+        match migrate::migrate_v0_to_v1(&passphrase, &base_path) {
+            Ok(()) => {
+                eprintln!("zerotrust-drive: migration complete — mount normally to use the drive");
+                return;
+            }
+            Err(e) => {
+                eprintln!("zerotrust-drive: error: migration failed: {e}");
+                eprintln!("zerotrust-drive: the drive was left untouched in its previous format");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    // Refuse to operate on a pre-0.7 drive until it is migrated. This
+    // guards both the normal mount and the --new-passphrase rekey path
+    // (rekey assumes the v1 KDF + cipher).
+    if migrate::needs_migration(&base_path) {
+        eprintln!(
+            "zerotrust-drive: error: {} uses the pre-0.7 on-disk format (no _kdf.json)",
+            base_path.display()
+        );
+        eprintln!("zerotrust-drive: run `zerotrust-drive --migrate-format` (with the current passphrase) to upgrade it");
+        eprintln!("zerotrust-drive: ChaCha20-Poly1305 → XChaCha20-Poly1305 and the homemade KDF → Argon2id");
+        std::process::exit(1);
+    }
 
     // Validate --continue-rekey requires --new-passphrase
     let resume = cli.continue_rekey;

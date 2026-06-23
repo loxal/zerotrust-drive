@@ -4,7 +4,7 @@ use std::sync::atomic::Ordering;
 
 use serde::{Deserialize, Serialize};
 
-use crate::crypto::{decrypt_bytes, derive_key, encrypt_bytes};
+use crate::crypto::{decrypt_bytes, derive_key_at, encrypt_bytes};
 use crate::fs::{durable_write, DiskIndex, FsInner, InodeKind};
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -26,7 +26,7 @@ pub fn cleanup_stale_staging(base_path: &std::path::Path) {
 /// Picks the first `.age` file in the staging dir and tries to decrypt it with the new key.
 pub fn verify_staged_passphrase(new_passphrase: &str, base_path: &std::path::Path) -> Result<(), String> {
     let staging_dir = base_path.join(".rekey_staging");
-    let new_key = derive_key(new_passphrase);
+    let new_key = derive_key_at(base_path, new_passphrase);
     for entry in std::fs::read_dir(&staging_dir).map_err(|e| e.to_string())? {
         let entry = entry.map_err(|e| e.to_string())?;
         let name = entry.file_name().to_string_lossy().to_string();
@@ -130,9 +130,12 @@ pub fn rekey(old_passphrase: &str, new_passphrase: &str, base_path: &std::path::
         write!(lock_file, "{}", std::process::id()).expect("failed to write lock file");
     }
 
-    // Derive keys
-    let old_key = derive_key(old_passphrase);
-    let new_key = derive_key(new_passphrase);
+    // Derive keys. Rekey keeps the drive's existing Argon2id salt
+    // (`_kdf.json` is unchanged) — only the passphrase changes, which
+    // is sufficient to produce a fresh key. Both derivations therefore
+    // read the same salt.
+    let old_key = derive_key_at(base_path, old_passphrase);
+    let new_key = derive_key_at(base_path, new_passphrase);
 
     // Decrypt and validate the index with the old passphrase
     let index_path = base_path.join("_index.age");
@@ -287,9 +290,10 @@ pub fn rekey_online(old_passphrase: &str, new_passphrase: &str, base_path: &std:
         write!(lock_file, "{}", std::process::id()).expect("failed to write lock file");
     }
 
-    // 5. Derive keys and do staging
-    let old_key = derive_key(old_passphrase);
-    let new_key = derive_key(new_passphrase);
+    // 5. Derive keys and do staging. Same salt (see `rekey`), new
+    //    passphrase → new key.
+    let old_key = derive_key_at(base_path, old_passphrase);
+    let new_key = derive_key_at(base_path, new_passphrase);
 
     let index_ciphertext = std::fs::read(base_path.join("_index.age")).expect("failed to read _index.age");
     let index_json = decrypt_bytes(&old_key, &index_ciphertext).expect("failed to decrypt _index.age");
@@ -392,7 +396,7 @@ pub fn rekey_online(old_passphrase: &str, new_passphrase: &str, base_path: &std:
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto::derive_key;
+    use crate::crypto::derive_key_at;
     use crate::fs::{DirChild, InodeEntry, InodeKind, ZeroTrustFs};
     use std::fs;
     use std::path::PathBuf;
@@ -426,7 +430,7 @@ mod tests {
 
         rekey(old_pw, new_pw, &dir, false);
 
-        let old_key = derive_key(old_pw);
+        let old_key = derive_key_at(&dir, old_pw);
         let index_ct = fs::read(dir.join("_index.age")).unwrap();
         assert!(decrypt_bytes(&old_key, &index_ct).is_err());
 
@@ -584,10 +588,10 @@ mod tests {
 
         assert!(!ztfs.inner.read_only.load(Ordering::Relaxed));
 
-        let expected_new_key = derive_key(new_pw);
+        let expected_new_key = derive_key_at(&dir, new_pw);
         assert_eq!(*ztfs.inner.key.read().unwrap(), expected_new_key);
 
-        let old_key = derive_key(old_pw);
+        let old_key = derive_key_at(&dir, old_pw);
         let index_ct = fs::read(dir.join("_index.age")).unwrap();
         assert!(decrypt_bytes(&old_key, &index_ct).is_err());
 
@@ -673,8 +677,8 @@ mod tests {
 
         let staging_dir = dir.join(".rekey_staging");
         fs::create_dir_all(&staging_dir).unwrap();
-        let new_key = derive_key(new_pw);
-        let old_key = derive_key(old_pw);
+        let new_key = derive_key_at(&dir, new_pw);
+        let old_key = derive_key_at(&dir, old_pw);
         let ct = fs::read(dir.join("000001.age")).unwrap();
         let pt = decrypt_bytes(&old_key, &ct).unwrap();
         let new_ct = encrypt_bytes(&new_key, &pt).unwrap();
@@ -694,7 +698,7 @@ mod tests {
         }
         drop(state);
 
-        let old_key = derive_key(old_pw);
+        let old_key = derive_key_at(&dir, old_pw);
         let index_ct = fs::read(dir.join("_index.age")).unwrap();
         assert!(decrypt_bytes(&old_key, &index_ct).is_err());
 
@@ -712,7 +716,7 @@ mod tests {
 
         let staging_dir = dir.join(".rekey_staging");
         fs::create_dir_all(&staging_dir).unwrap();
-        let key_a = derive_key("passphrase-a");
+        let key_a = derive_key_at(&dir, "passphrase-a");
         let ct = encrypt_bytes(&key_a, b"some data").unwrap();
         fs::write(staging_dir.join("000001.age"), ct).unwrap();
 
@@ -752,7 +756,7 @@ mod tests {
 
         let staging_dir = dir.join(".rekey_staging");
         fs::create_dir_all(&staging_dir).unwrap();
-        let different_key = derive_key("some-other-passphrase");
+        let different_key = derive_key_at(&dir, "some-other-passphrase");
         let stale_ct = encrypt_bytes(&different_key, b"stale").unwrap();
         fs::write(staging_dir.join("000001.age"), &stale_ct).unwrap();
 

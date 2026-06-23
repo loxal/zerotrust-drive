@@ -16,7 +16,7 @@ use fuser::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::crypto::{decrypt_bytes, derive_key, encrypt_bytes};
+use crate::crypto::{decrypt_bytes, encrypt_bytes};
 
 macro_rules! trace {
     ($($arg:tt)*) => {{
@@ -111,10 +111,28 @@ pub struct ZeroTrustFs {
 
 impl ZeroTrustFs {
     pub fn new(passphrase: &str, base_path: PathBuf) -> Self {
-        let key = derive_key(passphrase);
         fs::create_dir_all(&base_path).expect("failed to create base path");
 
         let index_path = base_path.join("_index.age");
+        // Pre-0.7 (v0) drive guard: an index with no `_kdf.json` is the
+        // old on-disk format. Refuse rather than mint a fresh Argon2id
+        // key (which could never decrypt the v0 ChaCha20 data and would
+        // surface as a misleading "wrong passphrase"). main.rs offers
+        // `--migrate-format` to upgrade in place.
+        if index_path.exists() && crate::crypto::load_kdf(&base_path).ok().flatten().is_none() {
+            eprintln!(
+                "zerotrust-drive: error: {} uses the pre-0.7 on-disk format",
+                base_path.display()
+            );
+            eprintln!(
+                "zerotrust-drive: run `zerotrust-drive --migrate-format` (with the current passphrase) to upgrade it to Argon2id + XChaCha20-Poly1305"
+            );
+            std::process::exit(1);
+        }
+        // Argon2id key derived from the drive's per-drive salt
+        // (`_kdf.json`), created on first use for a brand-new drive.
+        let key = crate::crypto::derive_key_at(&base_path, passphrase);
+
         let state = if index_path.exists() {
             let ciphertext = fs::read(&index_path).expect("failed to read index");
             let json = match decrypt_bytes(&key, &ciphertext) {
@@ -860,11 +878,27 @@ impl Filesystem for ZeroTrustFs {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto::derive_key;
+    use crate::crypto::{KdfParams, FORMAT_VERSION, SALT_LEN, derive_key};
+
+    /// Derive a key with a fixed cheap test salt+params. Keeps the
+    /// crypto-level unit tests fast and self-contained (no drive dir).
+    fn tkey(pw: &str) -> [u8; 32] {
+        derive_key(
+            pw,
+            &KdfParams {
+                format_version: FORMAT_VERSION,
+                algorithm: "argon2id".to_string(),
+                salt: vec![3u8; SALT_LEN],
+                m_cost: 8,
+                t_cost: 1,
+                p_cost: 1,
+            },
+        )
+    }
 
     #[test]
     fn encrypt_decrypt_round_trip() {
-        let key = derive_key("pw");
+        let key = tkey("pw");
         let plaintext = b"round trip test data";
         let ciphertext = encrypt_bytes(&key, plaintext).unwrap();
         let decrypted = decrypt_bytes(&key, &ciphertext).unwrap();
@@ -873,8 +907,8 @@ mod tests {
 
     #[test]
     fn wrong_passphrase_fails() {
-        let right = derive_key("right");
-        let wrong = derive_key("wrong");
+        let right = tkey("right");
+        let wrong = tkey("wrong");
         let ciphertext = encrypt_bytes(&right, b"secret").unwrap();
         assert!(decrypt_bytes(&wrong, &ciphertext).is_err());
     }
@@ -897,7 +931,7 @@ mod tests {
         let index = DiskIndex { next_inode: 3, next_file_id: 2, inodes, children };
 
         let json = serde_json::to_vec(&index).unwrap();
-        let key = derive_key("test-pw");
+        let key = tkey("test-pw");
         let encrypted = encrypt_bytes(&key, &json).unwrap();
         let decrypted = decrypt_bytes(&key, &encrypted).unwrap();
         let restored: DiskIndex = serde_json::from_slice(&decrypted).unwrap();
@@ -962,14 +996,14 @@ mod tests {
     #[test]
     fn different_length_passphrases_produce_different_keys() {
         // "a" vs "aa" must produce different keys (length is folded into state)
-        let k1 = derive_key("a");
-        let k2 = derive_key("aa");
+        let k1 = tkey("a");
+        let k2 = tkey("aa");
         assert_ne!(k1, k2);
     }
 
     #[test]
     fn empty_passphrase_produces_valid_key() {
-        let k = derive_key("");
+        let k = tkey("");
         // Should not be all zeros
         assert!(k.iter().any(|&b| b != 0));
     }
@@ -1197,7 +1231,7 @@ mod tests {
         assert_ne!(mtime_before, mtime_after, "mtime should be updated after flush");
 
         let ciphertext = fs::read(&index_path).unwrap();
-        let key = derive_key("conflict-pw");
+        let key = crate::crypto::derive_key_at(&dir, "conflict-pw");
         let json = decrypt_bytes(&key, &ciphertext).expect("index should be decryptable");
         let _index: DiskIndex = serde_json::from_slice(&json).expect("index should be valid JSON");
 
