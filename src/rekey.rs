@@ -4,7 +4,7 @@ use std::sync::atomic::Ordering;
 
 use serde::{Deserialize, Serialize};
 
-use crate::crypto::{decrypt_bytes, derive_key_at, encrypt_bytes};
+use crate::crypto::{decrypt_blob, decrypt_index, derive_key_at, encrypt_blob, encrypt_index};
 use crate::fs::{durable_write, DiskIndex, FsInner, InodeKind};
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -32,7 +32,15 @@ pub fn verify_staged_passphrase(new_passphrase: &str, base_path: &std::path::Pat
         let name = entry.file_name().to_string_lossy().to_string();
         if name.ends_with(".age") {
             let ciphertext = std::fs::read(entry.path()).map_err(|e| e.to_string())?;
-            return decrypt_bytes(&new_key, &ciphertext)
+            // Staged data blobs are AAD-bound to their filename; the index
+            // uses the index AAD. Pick the matching verifier so a correct
+            // passphrase validates regardless of which file we sampled.
+            let result = if name == "_index.age" {
+                decrypt_index(&new_key, &ciphertext)
+            } else {
+                decrypt_blob(&new_key, &name, &ciphertext)
+            };
+            return result
                 .map(|_| ())
                 .map_err(|_| "staged files were encrypted with a different passphrase".to_string());
         }
@@ -140,7 +148,7 @@ pub fn rekey(old_passphrase: &str, new_passphrase: &str, base_path: &std::path::
     // Decrypt and validate the index with the old passphrase
     let index_path = base_path.join("_index.age");
     let index_ciphertext = std::fs::read(&index_path).expect("failed to read _index.age");
-    let index_json = match decrypt_bytes(&old_key, &index_ciphertext) {
+    let index_json = match decrypt_index(&old_key, &index_ciphertext) {
         Ok(json) => json,
         Err(_) => {
             let _ = std::fs::remove_file(&lock_path);
@@ -179,9 +187,9 @@ pub fn rekey(old_passphrase: &str, new_passphrase: &str, base_path: &std::path::
 
         let ciphertext =
             std::fs::read(&file_path).unwrap_or_else(|_| panic!("failed to read {filename}"));
-        let plaintext = decrypt_bytes(&old_key, &ciphertext)
+        let plaintext = decrypt_blob(&old_key, filename, &ciphertext)
             .unwrap_or_else(|_| panic!("failed to decrypt {filename} — data may be corrupted"));
-        let new_ciphertext = encrypt_bytes(&new_key, &plaintext).expect("failed to re-encrypt");
+        let new_ciphertext = encrypt_blob(&new_key, filename, &plaintext).expect("failed to re-encrypt");
         durable_write(&staged_path, &new_ciphertext)
             .unwrap_or_else(|_| panic!("failed to write staging/{filename}"));
 
@@ -200,7 +208,7 @@ pub fn rekey(old_passphrase: &str, new_passphrase: &str, base_path: &std::path::
     let staged_index = staging_dir.join("_index.age");
     if !resume || !staged_index.exists() {
         let new_index_ciphertext =
-            encrypt_bytes(&new_key, &index_json).expect("failed to re-encrypt index");
+            encrypt_index(&new_key, &index_json).expect("failed to re-encrypt index");
         durable_write(&staged_index, &new_index_ciphertext)
             .expect("failed to write staging/_index.age");
         eprintln!("zerotrust-drive: [{total}/{total}] re-encrypted _index.age");
@@ -252,14 +260,14 @@ pub fn rekey_online(old_passphrase: &str, new_passphrase: &str, base_path: &std:
         for (&ino, content) in open.iter() {
             if let Some(entry) = state.inodes.get(&ino) {
                 if !entry.disk_filename.is_empty() {
-                    let encrypted = encrypt_bytes(&key, content).expect("failed to encrypt");
+                    let encrypted = encrypt_blob(&key, &entry.disk_filename, content).expect("failed to encrypt");
                     durable_write(&inner.base_path.join(&entry.disk_filename), &encrypted).expect("failed to write");
                 }
             }
         }
         // Also persist index
         let json = serde_json::to_vec(&*state).expect("failed to serialize index");
-        let encrypted = encrypt_bytes(&key, &json).expect("failed to encrypt index");
+        let encrypted = encrypt_index(&key, &json).expect("failed to encrypt index");
         durable_write(&inner.base_path.join("_index.age"), &encrypted).expect("failed to write index");
     }
 
@@ -296,7 +304,7 @@ pub fn rekey_online(old_passphrase: &str, new_passphrase: &str, base_path: &std:
     let new_key = derive_key_at(base_path, new_passphrase);
 
     let index_ciphertext = std::fs::read(base_path.join("_index.age")).expect("failed to read _index.age");
-    let index_json = decrypt_bytes(&old_key, &index_ciphertext).expect("failed to decrypt _index.age");
+    let index_json = decrypt_index(&old_key, &index_ciphertext).expect("failed to decrypt _index.age");
     let index: DiskIndex = serde_json::from_slice(&index_json).expect("failed to parse index");
 
     let disk_files: Vec<String> = index.inodes.values()
@@ -318,9 +326,9 @@ pub fn rekey_online(old_passphrase: &str, new_passphrase: &str, base_path: &std:
             continue;
         }
         let ciphertext = std::fs::read(base_path.join(filename)).unwrap_or_else(|_| panic!("failed to read {filename}"));
-        let plaintext = decrypt_bytes(&old_key, &ciphertext)
+        let plaintext = decrypt_blob(&old_key, filename, &ciphertext)
             .unwrap_or_else(|_| panic!("failed to decrypt {filename}"));
-        let new_ciphertext = encrypt_bytes(&new_key, &plaintext).expect("failed to re-encrypt");
+        let new_ciphertext = encrypt_blob(&new_key, filename, &plaintext).expect("failed to re-encrypt");
         durable_write(&staged_path, &new_ciphertext).unwrap_or_else(|_| panic!("failed to write staging/{filename}"));
         eprintln!("zerotrust-drive: [{}/{}] re-encrypted {}", i + 1, total, filename);
     }
@@ -330,7 +338,7 @@ pub fn rekey_online(old_passphrase: &str, new_passphrase: &str, base_path: &std:
 
     let staged_index = staging_dir.join("_index.age");
     if !resume || !staged_index.exists() {
-        let new_index_ciphertext = encrypt_bytes(&new_key, &index_json).expect("failed to re-encrypt index");
+        let new_index_ciphertext = encrypt_index(&new_key, &index_json).expect("failed to re-encrypt index");
         durable_write(&staged_index, &new_index_ciphertext).expect("failed to write staging/_index.age");
         eprintln!("zerotrust-drive: [{total}/{total}] re-encrypted _index.age");
     }
@@ -371,13 +379,13 @@ pub fn rekey_online(old_passphrase: &str, new_passphrase: &str, base_path: &std:
         for (&ino, content) in open.iter() {
             if let Some(entry) = state.inodes.get(&ino) {
                 if !entry.disk_filename.is_empty() {
-                    let encrypted = encrypt_bytes(&key, content).expect("failed to encrypt");
+                    let encrypted = encrypt_blob(&key, &entry.disk_filename, content).expect("failed to encrypt");
                     durable_write(&inner.base_path.join(&entry.disk_filename), &encrypted).expect("failed to write");
                 }
             }
         }
         let json = serde_json::to_vec(&*state).expect("failed to serialize index");
-        let encrypted = encrypt_bytes(&key, &json).expect("failed to encrypt index");
+        let encrypted = encrypt_index(&key, &json).expect("failed to encrypt index");
         durable_write(&inner.base_path.join("_index.age"), &encrypted).expect("failed to write index");
         if let Ok(meta) = std::fs::metadata(inner.base_path.join("_index.age")) {
             if let Ok(mtime) = meta.modified() {
@@ -432,7 +440,7 @@ mod tests {
 
         let old_key = derive_key_at(&dir, old_pw);
         let index_ct = fs::read(dir.join("_index.age")).unwrap();
-        assert!(decrypt_bytes(&old_key, &index_ct).is_err());
+        assert!(decrypt_index(&old_key, &index_ct).is_err());
 
         let ztfs = ZeroTrustFs::new(new_pw, dir.clone());
         let state = ztfs.inner.state.read().unwrap();
@@ -593,7 +601,7 @@ mod tests {
 
         let old_key = derive_key_at(&dir, old_pw);
         let index_ct = fs::read(dir.join("_index.age")).unwrap();
-        assert!(decrypt_bytes(&old_key, &index_ct).is_err());
+        assert!(decrypt_index(&old_key, &index_ct).is_err());
 
         let ztfs2 = ZeroTrustFs::new(new_pw, dir.clone());
         let state = ztfs2.inner.state.write().unwrap();
@@ -680,8 +688,8 @@ mod tests {
         let new_key = derive_key_at(&dir, new_pw);
         let old_key = derive_key_at(&dir, old_pw);
         let ct = fs::read(dir.join("000001.age")).unwrap();
-        let pt = decrypt_bytes(&old_key, &ct).unwrap();
-        let new_ct = encrypt_bytes(&new_key, &pt).unwrap();
+        let pt = decrypt_blob(&old_key, "000001.age", &ct).unwrap();
+        let new_ct = encrypt_blob(&new_key, "000001.age", &pt).unwrap();
         fs::write(staging_dir.join("000001.age"), &new_ct).unwrap();
         fs::write(dir.join("_rekey.lock"), b"99999").unwrap();
 
@@ -700,7 +708,7 @@ mod tests {
 
         let old_key = derive_key_at(&dir, old_pw);
         let index_ct = fs::read(dir.join("_index.age")).unwrap();
-        assert!(decrypt_bytes(&old_key, &index_ct).is_err());
+        assert!(decrypt_index(&old_key, &index_ct).is_err());
 
         assert!(!dir.join(".rekey_staging").exists());
         assert!(!dir.join("_rekey.manifest").exists());
@@ -717,7 +725,7 @@ mod tests {
         let staging_dir = dir.join(".rekey_staging");
         fs::create_dir_all(&staging_dir).unwrap();
         let key_a = derive_key_at(&dir, "passphrase-a");
-        let ct = encrypt_bytes(&key_a, b"some data").unwrap();
+        let ct = encrypt_blob(&key_a, "000001.age", b"some data").unwrap();
         fs::write(staging_dir.join("000001.age"), ct).unwrap();
 
         assert!(verify_staged_passphrase("passphrase-a", &dir).is_ok());
@@ -757,7 +765,7 @@ mod tests {
         let staging_dir = dir.join(".rekey_staging");
         fs::create_dir_all(&staging_dir).unwrap();
         let different_key = derive_key_at(&dir, "some-other-passphrase");
-        let stale_ct = encrypt_bytes(&different_key, b"stale").unwrap();
+        let stale_ct = encrypt_blob(&different_key, "000001.age", b"stale").unwrap();
         fs::write(staging_dir.join("000001.age"), &stale_ct).unwrap();
 
         rekey(old_pw, new_pw, &dir, false);

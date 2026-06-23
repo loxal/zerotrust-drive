@@ -38,6 +38,12 @@ struct Cli {
     /// exit. Crash-safe; re-run to resume an interrupted migration.
     #[arg(long)]
     migrate_format: bool,
+
+    /// Allow creating a brand-new drive with the built-in demo
+    /// passphrase. Refused by default because a drive under a public
+    /// passphrase is effectively unencrypted. For tests/demos only.
+    #[arg(long)]
+    allow_default_passphrase: bool,
 }
 
 fn main() {
@@ -52,6 +58,21 @@ fn main() {
     let mountpoint = cli.decrypted_dir;
 
     std::fs::create_dir_all(&base_path).unwrap();
+
+    // Footgun guard: refuse to CREATE a brand-new drive under the
+    // built-in demo passphrase — that would store data under a
+    // publicly-known key (effectively plaintext). Existing drives are
+    // left alone (the operator may legitimately be opening a demo drive,
+    // and refusing would lock them out).
+    if using_default_passphrase
+        && !base_path.join("_index.age").exists()
+        && !cli.allow_default_passphrase
+    {
+        eprintln!("zerotrust-drive: error: refusing to create a new drive with the built-in demo passphrase");
+        eprintln!("zerotrust-drive: set ZEROTRUST_PASSPHRASE (or --passphrase) to a real secret,");
+        eprintln!("zerotrust-drive: or pass --allow-default-passphrase for a throwaway test drive");
+        std::process::exit(1);
+    }
 
     // Recover from any interrupted rekey or format migration before
     // doing anything else.

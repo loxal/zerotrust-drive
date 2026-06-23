@@ -25,7 +25,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::crypto::{
-    KdfParams, decrypt_bytes_legacy, derive_key, derive_key_legacy, encrypt_bytes, load_kdf,
+    KdfParams, decrypt_bytes_legacy, derive_key, derive_key_legacy, encrypt_blob, encrypt_index,
+    load_kdf,
 };
 use crate::fs::{DiskIndex, InodeKind, durable_write};
 
@@ -175,13 +176,13 @@ fn migrate_inner(passphrase: &str, base_path: &std::path::Path) -> Result<(), St
         let ct = std::fs::read(base_path.join(filename)).map_err(|e| format!("read {filename}: {e}"))?;
         let pt = decrypt_bytes_legacy(&old_key, &ct)
             .map_err(|_| format!("failed to decrypt {filename} — data may be corrupted"))?;
-        let new_ct = encrypt_bytes(&new_key, &pt)?;
+        let new_ct = encrypt_blob(&new_key, filename, &pt)?;
         durable_write(&staging.join(filename), &new_ct).map_err(|e| format!("stage {filename}: {e}"))?;
         eprintln!("zerotrust-drive: [{}/{}] migrated {}", i + 1, total, filename);
     }
 
     // 4. Stage the index (v1-encrypted) and the new _kdf.json (plaintext).
-    let new_index_ct = encrypt_bytes(&new_key, &index_json)?;
+    let new_index_ct = encrypt_index(&new_key, &index_json)?;
     durable_write(&staging.join(INDEX_FILE), &new_index_ct).map_err(|e| format!("stage index: {e}"))?;
     eprintln!("zerotrust-drive: [{}/{}] migrated {INDEX_FILE}", total - 1, total);
 
@@ -222,7 +223,7 @@ fn migrate_inner(passphrase: &str, base_path: &std::path::Path) -> Result<(), St
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto::{decrypt_bytes, derive_key_at};
+    use crate::crypto::{decrypt_index, derive_key_at};
     use crate::fs::{DirChild, InodeEntry, ZeroTrustFs};
     use std::collections::HashMap;
     use std::path::PathBuf;
@@ -316,7 +317,7 @@ mod tests {
         assert!(decrypt_bytes_legacy(&old_key, &idx_ct).is_err());
         // The v1 key must.
         let v1_key = derive_key_at(&dir, "secret-pw");
-        assert!(decrypt_bytes(&v1_key, &idx_ct).is_ok());
+        assert!(decrypt_index(&v1_key, &idx_ct).is_ok());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

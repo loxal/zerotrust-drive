@@ -31,7 +31,7 @@
 use argon2::{Algorithm, Argon2, Params, Version};
 use chacha20poly1305::{
     ChaCha20Poly1305, Nonce, XChaCha20Poly1305, XNonce,
-    aead::{Aead, KeyInit, OsRng, rand_core::RngCore},
+    aead::{Aead, KeyInit, OsRng, Payload, rand_core::RngCore},
 };
 use serde::{Deserialize, Serialize};
 
@@ -184,29 +184,86 @@ pub fn derive_key_legacy(passphrase: &str) -> [u8; 32] {
     key
 }
 
-/// Encrypt with XChaCha20-Poly1305 — random 24-byte nonce prepended.
-pub fn encrypt_bytes(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>, String> {
+// --- Associated data (AAD) binding -----------------------------------------
+//
+// XChaCha20-Poly1305 authenticates the AAD without encrypting it. Binding each
+// ciphertext to its logical identity stops an attacker who can write the
+// encrypted store (e.g. a compromised cloud-sync account) from **swapping**
+// one blob's bytes over another's: a blob encrypted as "blob:000005.age"
+// fails to authenticate when read as "blob:000003.age". Domain tags also keep
+// an index ciphertext from being substituted into a data slot and vice versa.
+//
+// AAD does NOT defend against whole-object rollback/replay (restoring an older
+// authenticated copy of the same name) — that needs a trusted monotonic
+// anchor the on-disk scheme does not have. Documented limitation.
+
+const AAD_DOMAIN: &[u8] = b"zerotrust-drive\x00v1\x00";
+
+/// AAD for the directory index (`_index.age`).
+fn index_aad() -> Vec<u8> {
+    let mut a = AAD_DOMAIN.to_vec();
+    a.extend_from_slice(b"index");
+    a
+}
+
+/// AAD for a data blob, bound to its on-disk filename.
+fn blob_aad(disk_filename: &str) -> Vec<u8> {
+    let mut a = AAD_DOMAIN.to_vec();
+    a.extend_from_slice(b"blob\x00");
+    a.extend_from_slice(disk_filename.as_bytes());
+    a
+}
+
+/// Low-level: encrypt with XChaCha20-Poly1305 and the given AAD — random
+/// 24-byte nonce prepended. Prefer the [`encrypt_blob`]/[`encrypt_index`]
+/// wrappers so the AAD policy lives in exactly one place.
+pub fn encrypt_bytes(key: &[u8; 32], plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>, String> {
     let cipher = XChaCha20Poly1305::new(key.into());
     let mut nonce_bytes = [0u8; XNONCE_LEN];
     OsRng.fill_bytes(&mut nonce_bytes);
     let nonce = XNonce::from_slice(&nonce_bytes);
-    let ciphertext = cipher.encrypt(nonce, plaintext).map_err(|e| e.to_string())?;
+    let ciphertext = cipher
+        .encrypt(nonce, Payload { msg: plaintext, aad })
+        .map_err(|e| e.to_string())?;
     let mut out = Vec::with_capacity(XNONCE_LEN + ciphertext.len());
     out.extend_from_slice(&nonce_bytes);
     out.extend_from_slice(&ciphertext);
     Ok(out)
 }
 
-/// Decrypt v1 XChaCha20-Poly1305 — first 24 bytes are the nonce.
-pub fn decrypt_bytes(key: &[u8; 32], data: &[u8]) -> Result<Vec<u8>, String> {
+/// Low-level: decrypt v1 XChaCha20-Poly1305 with the given AAD — first 24
+/// bytes are the nonce. Fails if the AAD does not match the one used to
+/// encrypt.
+pub fn decrypt_bytes(key: &[u8; 32], data: &[u8], aad: &[u8]) -> Result<Vec<u8>, String> {
     if data.len() < XNONCE_LEN {
         return Err("ciphertext too short".to_string());
     }
     let cipher = XChaCha20Poly1305::new(key.into());
     let nonce = XNonce::from_slice(&data[..XNONCE_LEN]);
     cipher
-        .decrypt(nonce, &data[XNONCE_LEN..])
+        .decrypt(nonce, Payload { msg: &data[XNONCE_LEN..], aad })
         .map_err(|e| e.to_string())
+}
+
+/// Encrypt a data blob, binding it to its on-disk filename via AAD.
+pub fn encrypt_blob(key: &[u8; 32], disk_filename: &str, plaintext: &[u8]) -> Result<Vec<u8>, String> {
+    encrypt_bytes(key, plaintext, &blob_aad(disk_filename))
+}
+
+/// Decrypt a data blob; fails if `disk_filename` does not match the name it
+/// was encrypted under (i.e. the blob was moved/swapped on disk).
+pub fn decrypt_blob(key: &[u8; 32], disk_filename: &str, data: &[u8]) -> Result<Vec<u8>, String> {
+    decrypt_bytes(key, data, &blob_aad(disk_filename))
+}
+
+/// Encrypt the directory index, bound to the index domain tag.
+pub fn encrypt_index(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>, String> {
+    encrypt_bytes(key, plaintext, &index_aad())
+}
+
+/// Decrypt the directory index.
+pub fn decrypt_index(key: &[u8; 32], data: &[u8]) -> Result<Vec<u8>, String> {
+    decrypt_bytes(key, data, &index_aad())
 }
 
 /// Decrypt v0 ChaCha20-Poly1305 — first 12 bytes are the nonce. Used
@@ -243,19 +300,19 @@ mod tests {
     fn v1_roundtrip() {
         let key = derive_key("correct horse battery staple", &test_kdf());
         let pt = b"the quick brown fox";
-        let ct = encrypt_bytes(&key, pt).unwrap();
+        let ct = encrypt_bytes(&key, pt, b"aad").unwrap();
         // Nonce (24) + tag (16) overhead, and ciphertext != plaintext.
         assert!(ct.len() >= pt.len() + 24 + 16);
         assert_ne!(&ct[24..], pt);
-        let rt = decrypt_bytes(&key, &ct).unwrap();
+        let rt = decrypt_bytes(&key, &ct, b"aad").unwrap();
         assert_eq!(rt, pt);
     }
 
     #[test]
     fn v1_nonce_is_24_bytes_and_random() {
         let key = derive_key("pw", &test_kdf());
-        let a = encrypt_bytes(&key, b"x").unwrap();
-        let b = encrypt_bytes(&key, b"x").unwrap();
+        let a = encrypt_bytes(&key, b"x", b"").unwrap();
+        let b = encrypt_bytes(&key, b"x", b"").unwrap();
         // Same plaintext, different nonce → different ciphertext prefix.
         assert_ne!(a[..24], b[..24], "nonces must differ between calls");
     }
@@ -266,8 +323,33 @@ mod tests {
         let mut other = test_kdf();
         other.salt = vec![9u8; SALT_LEN];
         let k2 = derive_key("right", &other); // same pw, different salt
-        let ct = encrypt_bytes(&k1, b"secret").unwrap();
-        assert!(decrypt_bytes(&k2, &ct).is_err());
+        let ct = encrypt_bytes(&k1, b"secret", b"").unwrap();
+        assert!(decrypt_bytes(&k2, &ct, b"").is_err());
+    }
+
+    #[test]
+    fn aad_mismatch_fails_to_decrypt() {
+        // The core anti-swap property: a blob encrypted under one
+        // filename must not decrypt under another.
+        let key = derive_key("pw", &test_kdf());
+        let ct = encrypt_blob(&key, "000005.age", b"file five").unwrap();
+        assert!(
+            decrypt_blob(&key, "000003.age", &ct).is_err(),
+            "a blob must not authenticate under a different filename (swap attack)"
+        );
+        // Correct filename still works.
+        assert_eq!(decrypt_blob(&key, "000005.age", &ct).unwrap(), b"file five");
+    }
+
+    #[test]
+    fn index_and_blob_domains_are_separated() {
+        // An index ciphertext must not be substitutable into a data
+        // slot (or vice versa), even at the same byte position.
+        let key = derive_key("pw", &test_kdf());
+        let idx = encrypt_index(&key, b"index bytes").unwrap();
+        assert!(decrypt_blob(&key, "000001.age", &idx).is_err());
+        let blob = encrypt_blob(&key, "000001.age", b"blob bytes").unwrap();
+        assert!(decrypt_index(&key, &blob).is_err());
     }
 
     #[test]
@@ -303,7 +385,7 @@ mod tests {
 
         let rt = decrypt_bytes_legacy(&key, &blob).unwrap();
         assert_eq!(rt, b"v0 data");
-        assert!(decrypt_bytes(&key, &blob).is_err(), "v1 reader must reject v0 blob");
+        assert!(decrypt_bytes(&key, &blob, b"").is_err(), "v1 reader must reject v0 blob");
     }
 
     #[test]
@@ -322,7 +404,7 @@ mod tests {
     #[test]
     fn short_ciphertext_is_rejected() {
         let key = derive_key("pw", &test_kdf());
-        assert!(decrypt_bytes(&key, &[0u8; 10]).is_err());
+        assert!(decrypt_bytes(&key, &[0u8; 10], b"").is_err());
         assert!(decrypt_bytes_legacy(&key, &[0u8; 5]).is_err());
     }
 }

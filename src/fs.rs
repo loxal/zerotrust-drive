@@ -16,7 +16,7 @@ use fuser::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::crypto::{decrypt_bytes, encrypt_bytes};
+use crate::crypto::{decrypt_blob, decrypt_index, encrypt_blob, encrypt_index};
 
 macro_rules! trace {
     ($($arg:tt)*) => {{
@@ -92,6 +92,12 @@ pub(crate) struct FsInner {
     pub(crate) key: RwLock<[u8; 32]>,
     pub(crate) state: RwLock<DiskIndex>,
     pub(crate) open_files: RwLock<HashMap<u64, Vec<u8>>>,
+    /// Per-inode open reference count. An inode's `open_files` buffer is
+    /// loaded on the first `open` and only persisted+evicted on the last
+    /// `release`, so concurrent open handles share one buffer without a
+    /// premature evict (lost reads) or a reload clobbering unflushed
+    /// writes (lost writes).
+    pub(crate) open_counts: Mutex<HashMap<u64, u32>>,
     pub(crate) index_mtime: Mutex<Option<SystemTime>>,
     pub(crate) read_only: AtomicBool,
     /// Inodes whose in-memory content has been persisted by flush() but not yet
@@ -135,7 +141,7 @@ impl ZeroTrustFs {
 
         let state = if index_path.exists() {
             let ciphertext = fs::read(&index_path).expect("failed to read index");
-            let json = match decrypt_bytes(&key, &ciphertext) {
+            let json = match decrypt_index(&key, &ciphertext) {
                 Ok(j) => j,
                 Err(_) => {
                     eprintln!("zerotrust-drive: error: wrong passphrase — failed to decrypt {}", index_path.display());
@@ -163,6 +169,7 @@ impl ZeroTrustFs {
         let inner = Arc::new(FsInner {
             base_path, key: RwLock::new(key),
             state: RwLock::new(state), open_files: RwLock::new(HashMap::new()),
+            open_counts: Mutex::new(HashMap::new()),
             index_mtime: Mutex::new(None),
             read_only: AtomicBool::new(false),
             flushed_inodes: Mutex::new(HashSet::new()),
@@ -204,7 +211,7 @@ impl ZeroTrustFs {
     /// Encrypt and write pre-serialized JSON to _index.age. No locks held.
     pub(crate) fn persist_index(&self, json: &[u8]) -> Result<(), std::io::Error> {
         let index_path = self.inner.base_path.join("_index.age");
-        let encrypted = encrypt_bytes(&*self.inner.key.read().unwrap(), json)
+        let encrypted = encrypt_index(&*self.inner.key.read().unwrap(), json)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
         durable_write(&index_path, &encrypted)?;
         // Record mtime so we can detect external modifications
@@ -248,15 +255,161 @@ impl ZeroTrustFs {
     }
 
     pub(crate) fn write_encrypted_file(&self, disk_filename: &str, content: &[u8]) -> Result<(), std::io::Error> {
-        let encrypted = encrypt_bytes(&*self.inner.key.read().unwrap(), content)
+        let encrypted = encrypt_blob(&*self.inner.key.read().unwrap(), disk_filename, content)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
         durable_write(&self.inner.base_path.join(disk_filename), &encrypted)
     }
 
     pub(crate) fn read_encrypted_file(&self, disk_filename: &str) -> Result<Vec<u8>, std::io::Error> {
         let ciphertext = fs::read(self.inner.base_path.join(disk_filename))?;
-        decrypt_bytes(&*self.inner.key.read().unwrap(), &ciphertext)
+        decrypt_blob(&*self.inner.key.read().unwrap(), disk_filename, &ciphertext)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    }
+
+    // --- Open / release / truncate / fsync core logic ---------------------
+    //
+    // Extracted from the FUSE handlers so they can be unit-tested without a
+    // mount. The handlers are thin wrappers that map the `io::Result` to a
+    // FUSE reply (errno = the error's raw OS code, or EIO).
+
+    /// Load an inode's content into `open_files` on first open and bump its
+    /// open count. Subsequent opens reuse the existing buffer (preserving
+    /// unflushed writes). A zero-size file whose backing blob does not yet
+    /// exist (freshly `mknod`'d, or created-but-never-written) opens as an
+    /// empty buffer rather than erroring; a non-empty file with a missing
+    /// backing blob is genuine data loss and errors.
+    pub(crate) fn open_inode(&self, ino: u64) -> std::io::Result<()> {
+        let (disk_filename, size, is_file) = {
+            let state = self.inner.state.read().unwrap();
+            match state.inodes.get(&ino) {
+                Some(e) => (e.disk_filename.clone(), e.size, e.kind == InodeKind::File),
+                None => return Err(std::io::Error::from_raw_os_error(libc::ENOENT)),
+            }
+        };
+        if !is_file {
+            return Err(std::io::Error::from_raw_os_error(libc::EISDIR));
+        }
+        let already_open = self
+            .inner
+            .open_counts
+            .lock()
+            .unwrap()
+            .get(&ino)
+            .copied()
+            .unwrap_or(0)
+            > 0;
+        if !already_open {
+            let path = self.inner.base_path.join(&disk_filename);
+            let content = if !disk_filename.is_empty() && path.exists() {
+                self.read_encrypted_file(&disk_filename)?
+            } else if !disk_filename.is_empty() && size > 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("backing file {disk_filename} missing for inode {ino}"),
+                ));
+            } else {
+                Vec::new()
+            };
+            // `or_insert`: never clobber a buffer a prior/concurrent opener
+            // already loaded — it may hold unflushed writes.
+            self.inner.open_files.write().unwrap().entry(ino).or_insert(content);
+        }
+        *self.inner.open_counts.lock().unwrap().entry(ino).or_insert(0) += 1;
+        Ok(())
+    }
+
+    /// Drop one open reference. Only the last release persists the buffer
+    /// (if `flush` didn't already) and evicts it from `open_files`.
+    pub(crate) fn release_inode(&self, ino: u64) -> std::io::Result<()> {
+        let remaining = {
+            let mut counts = self.inner.open_counts.lock().unwrap();
+            match counts.get_mut(&ino) {
+                Some(c) => {
+                    *c = c.saturating_sub(1);
+                    let r = *c;
+                    if r == 0 {
+                        counts.remove(&ino);
+                    }
+                    r
+                }
+                None => 0,
+            }
+        };
+        if remaining > 0 {
+            return Ok(()); // other handles still hold this inode open
+        }
+        let was_flushed = self.inner.flushed_inodes.lock().unwrap().remove(&ino);
+        let content = self.inner.open_files.write().unwrap().remove(&ino);
+        if let Some(data) = content {
+            let disk_filename = {
+                let state = self.inner.state.read().unwrap();
+                state.inodes.get(&ino).map(|e| e.disk_filename.clone()).unwrap_or_default()
+            };
+            if !disk_filename.is_empty() && !was_flushed {
+                self.write_encrypted_file(&disk_filename, &data)?;
+                self.flush_state()?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Resize a file to `new_size`. If the file is open, the in-memory
+    /// buffer is the source of truth; if it is closed, the on-disk blob is
+    /// read-modify-written so a truncation of a closed file is actually
+    /// persisted (it used to be silently dropped).
+    pub(crate) fn truncate_inode(&self, ino: u64, new_size: u64) -> std::io::Result<()> {
+        {
+            let mut open = self.inner.open_files.write().unwrap();
+            if let Some(content) = open.get_mut(&ino) {
+                content.resize(new_size as usize, 0);
+                return Ok(());
+            }
+        }
+        let disk_filename = {
+            let state = self.inner.state.read().unwrap();
+            match state.inodes.get(&ino) {
+                Some(e) if e.kind == InodeKind::File => e.disk_filename.clone(),
+                Some(_) => return Err(std::io::Error::from_raw_os_error(libc::EISDIR)),
+                None => return Err(std::io::Error::from_raw_os_error(libc::ENOENT)),
+            }
+        };
+        if disk_filename.is_empty() {
+            return Ok(());
+        }
+        let path = self.inner.base_path.join(&disk_filename);
+        let mut data = if path.exists() {
+            self.read_encrypted_file(&disk_filename)?
+        } else {
+            Vec::new()
+        };
+        data.resize(new_size as usize, 0);
+        self.write_encrypted_file(&disk_filename, &data)
+    }
+
+    /// Durably persist an inode's open content (if any) + the index.
+    /// Backs the FUSE `fsync` handler.
+    pub(crate) fn fsync_inode(&self, ino: u64) -> std::io::Result<()> {
+        let disk_filename = {
+            let state = self.inner.state.read().unwrap();
+            state.inodes.get(&ino).map(|e| e.disk_filename.clone()).unwrap_or_default()
+        };
+        if !disk_filename.is_empty() {
+            let ct = {
+                let open = self.inner.open_files.read().unwrap();
+                match open.get(&ino) {
+                    Some(content) => Some(
+                        encrypt_blob(&*self.inner.key.read().unwrap(), &disk_filename, content)
+                            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?,
+                    ),
+                    None => None,
+                }
+            };
+            if let Some(ct) = ct {
+                durable_write(&self.inner.base_path.join(&disk_filename), &ct)?;
+                self.inner.flushed_inodes.lock().unwrap().insert(ino);
+            }
+        }
+        self.flush_state()
     }
 
     /// Mark the index as dirty so the debounce thread will flush it soon.
@@ -292,6 +445,12 @@ impl ZeroTrustFs {
 
 fn now_secs() -> u64 {
     SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs()
+}
+
+/// Map an `io::Error` to a FUSE errno: the underlying OS code when present
+/// (e.g. ENOENT/EISDIR set via `from_raw_os_error`), otherwise EIO.
+fn io_to_errno(e: &std::io::Error) -> fuser::Errno {
+    fuser::Errno::from_i32(e.raw_os_error().unwrap_or(libc::EIO))
 }
 
 impl Filesystem for ZeroTrustFs {
@@ -395,9 +554,11 @@ impl Filesystem for ZeroTrustFs {
             Self::inode_to_attr(ino.0, entry)
         };
         if let Some(new_size) = size {
-            let mut open = self.inner.open_files.write().unwrap();
-            if let Some(content) = open.get_mut(&ino.0) {
-                content.resize(new_size as usize, 0);
+            // truncate_inode resizes the open buffer OR the on-disk blob,
+            // so truncating a closed file is actually persisted.
+            if let Err(e) = self.truncate_inode(ino.0, new_size) {
+                reply.error(io_to_errno(&e));
+                return;
             }
         }
         reply.attr(&TTL, &attr);
@@ -405,34 +566,17 @@ impl Filesystem for ZeroTrustFs {
     }
 
     fn open(&self, _req: &Request, ino: INodeNo, _flags: fuser::OpenFlags, reply: ReplyOpen) {
-        let disk_filename = {
-            let state = self.inner.state.read().unwrap();
-            match state.inodes.get(&ino.0) {
-                Some(entry) if entry.kind == InodeKind::File => entry.disk_filename.clone(),
-                Some(_) => { reply.error(fuser::Errno::EISDIR); return; }
-                None => { reply.error(fuser::Errno::ENOENT); return; }
-            }
-        };
-        // Decrypt happens outside any lock — only the FUSE thread is blocked
-        let content = if !disk_filename.is_empty() && self.inner.base_path.join(&disk_filename).exists() {
-            match self.read_encrypted_file(&disk_filename) {
-                Ok(data) => data,
-                Err(e) => {
-                    eprintln!("zerotrust-drive: ERROR: failed to read/decrypt {}: {e}", disk_filename);
-                    reply.error(fuser::Errno::EIO);
-                    return;
+        match self.open_inode(ino.0) {
+            Ok(()) => reply.opened(FileHandle(ino.0), FopenFlags::empty()),
+            Err(e) => {
+                // InvalidData = decrypt failure or genuinely-missing backing
+                // blob; worth logging since it signals corruption/data loss.
+                if e.kind() == std::io::ErrorKind::InvalidData {
+                    eprintln!("zerotrust-drive: ERROR: open inode {}: {e}", ino.0);
                 }
+                reply.error(io_to_errno(&e));
             }
-        } else if !disk_filename.is_empty() {
-            // Backing file missing — data loss
-            eprintln!("zerotrust-drive: ERROR: backing file {} missing for inode {}", disk_filename, ino.0);
-            reply.error(fuser::Errno::EIO);
-            return;
-        } else {
-            Vec::new() // New file, no backing yet
-        };
-        self.inner.open_files.write().unwrap().insert(ino.0, content);
-        reply.opened(FileHandle(ino.0), FopenFlags::empty());
+        }
     }
 
     fn read(
@@ -508,7 +652,7 @@ impl Filesystem for ZeroTrustFs {
                 let open = self.inner.open_files.read().unwrap();
                 if let Some(content) = open.get(&ino.0) {
                     let key = self.inner.key.read().unwrap();
-                    match encrypt_bytes(&*key, content) {
+                    match encrypt_blob(&*key, &disk_filename, content) {
                         Ok(ct) => Some(ct),
                         Err(e) => {
                             eprintln!("zerotrust-drive: ERROR: encrypt failed in flush: {e}");
@@ -547,28 +691,30 @@ impl Filesystem for ZeroTrustFs {
             return;
         }
         trace!("FUSE: release ino={}", ino.0);
-        let was_flushed = self.inner.flushed_inodes.lock().unwrap().remove(&ino.0);
-        let content = self.inner.open_files.write().unwrap().remove(&ino.0);
-        if let Some(data) = content {
-            let disk_filename = {
-                let state = self.inner.state.read().unwrap();
-                state.inodes.get(&ino.0).map(|e| e.disk_filename.clone()).unwrap_or_default()
-            };
-            if !disk_filename.is_empty() && !was_flushed {
-                // Only re-encrypt if flush() didn't already persist this content
-                if let Err(e) = self.write_encrypted_file(&disk_filename, &data) {
-                    eprintln!("zerotrust-drive: ERROR: write failed in release for inode {}: {e}", ino.0);
-                    reply.error(fuser::Errno::EIO);
-                    return;
-                }
-                if let Err(e) = self.flush_state() {
-                    eprintln!("zerotrust-drive: ERROR: flush_state failed in release: {e}");
-                    reply.error(fuser::Errno::EIO);
-                    return;
-                }
+        match self.release_inode(ino.0) {
+            Ok(()) => reply.ok(),
+            Err(e) => {
+                eprintln!("zerotrust-drive: ERROR: release inode {}: {e}", ino.0);
+                reply.error(io_to_errno(&e));
             }
         }
-        reply.ok();
+    }
+
+    fn fsync(
+        &self, _req: &Request, ino: INodeNo, _fh: FileHandle, _datasync: bool, reply: ReplyEmpty,
+    ) {
+        if self.inner.read_only.load(Ordering::Relaxed) {
+            reply.ok();
+            return;
+        }
+        trace!("FUSE: fsync ino={}", ino.0);
+        match self.fsync_inode(ino.0) {
+            Ok(()) => reply.ok(),
+            Err(e) => {
+                eprintln!("zerotrust-drive: ERROR: fsync inode {}: {e}", ino.0);
+                reply.error(io_to_errno(&e));
+            }
+        }
     }
 
     fn mknod(
@@ -665,6 +811,9 @@ impl Filesystem for ZeroTrustFs {
             (ino, attr, disk_filename)
         };
         self.inner.open_files.write().unwrap().insert(ino, Vec::new());
+        // create returns an open file handle — count it so the matching
+        // release persists+evicts at the right time (refcount model).
+        *self.inner.open_counts.lock().unwrap().entry(ino).or_insert(0) += 1;
         reply.created(&TTL, &attr, Generation(0), FileHandle(ino), FopenFlags::empty());
         self.mark_dirty();
         trace!("FUSE: create replied ino={} fh={}", ino, ino);
@@ -740,6 +889,7 @@ impl Filesystem for ZeroTrustFs {
         // Lock open_files separately — never nested inside state lock
         self.inner.open_files.write().unwrap().remove(&ino);
         self.inner.flushed_inodes.lock().unwrap().remove(&ino);
+        self.inner.open_counts.lock().unwrap().remove(&ino);
         if !disk_filename.is_empty() {
             let _ = fs::remove_file(self.inner.base_path.join(&disk_filename));
         }
@@ -797,19 +947,21 @@ impl Filesystem for ZeroTrustFs {
             reply.error(fuser::Errno::ENAMETOOLONG); return;
         }
 
-        let disk_file_to_remove = {
+        let (disk_file_to_remove, overwritten_ino) = {
             let mut state = self.inner.state.write().unwrap();
             let ino = match Self::find_child(&state, parent.0, name_str) {
                 Some(i) => i,
                 None => { reply.error(fuser::Errno::ENOENT); return; }
             };
             let mut to_remove = None;
+            let mut overwritten = None;
             if let Some(existing) = Self::find_child(&state, newparent.0, newname_str) {
                 to_remove = state.inodes.get(&existing).and_then(|e| {
                     if e.disk_filename.is_empty() { None } else { Some(e.disk_filename.clone()) }
                 });
                 state.inodes.remove(&existing);
                 if let Some(ch) = state.children.get_mut(&newparent.0) { ch.retain(|c| c.inode != existing); }
+                overwritten = Some(existing);
             }
             if let Some(ch) = state.children.get_mut(&parent.0) { ch.retain(|c| c.inode != ino); }
             state.children.entry(newparent.0).or_default().push(DirChild {
@@ -820,8 +972,14 @@ impl Filesystem for ZeroTrustFs {
                 entry.parent = newparent.0;
                 entry.ctime_secs = now_secs();
             }
-            to_remove
+            (to_remove, overwritten)
         };
+        // Evict the clobbered target's in-memory state (was leaking).
+        if let Some(existing) = overwritten_ino {
+            self.inner.open_files.write().unwrap().remove(&existing);
+            self.inner.flushed_inodes.lock().unwrap().remove(&existing);
+            self.inner.open_counts.lock().unwrap().remove(&existing);
+        }
         self.mark_dirty();
         if let Some(f) = disk_file_to_remove {
             let _ = fs::remove_file(self.inner.base_path.join(&f));
@@ -878,7 +1036,9 @@ impl Filesystem for ZeroTrustFs {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto::{KdfParams, FORMAT_VERSION, SALT_LEN, derive_key};
+    use crate::crypto::{
+        KdfParams, FORMAT_VERSION, SALT_LEN, decrypt_bytes, derive_key, encrypt_bytes,
+    };
 
     /// Derive a key with a fixed cheap test salt+params. Keeps the
     /// crypto-level unit tests fast and self-contained (no drive dir).
@@ -900,8 +1060,8 @@ mod tests {
     fn encrypt_decrypt_round_trip() {
         let key = tkey("pw");
         let plaintext = b"round trip test data";
-        let ciphertext = encrypt_bytes(&key, plaintext).unwrap();
-        let decrypted = decrypt_bytes(&key, &ciphertext).unwrap();
+        let ciphertext = encrypt_bytes(&key, plaintext, b"aad").unwrap();
+        let decrypted = decrypt_bytes(&key, &ciphertext, b"aad").unwrap();
         assert_eq!(decrypted, plaintext);
     }
 
@@ -909,8 +1069,8 @@ mod tests {
     fn wrong_passphrase_fails() {
         let right = tkey("right");
         let wrong = tkey("wrong");
-        let ciphertext = encrypt_bytes(&right, b"secret").unwrap();
-        assert!(decrypt_bytes(&wrong, &ciphertext).is_err());
+        let ciphertext = encrypt_bytes(&right, b"secret", b"aad").unwrap();
+        assert!(decrypt_bytes(&wrong, &ciphertext, b"aad").is_err());
     }
 
     #[test]
@@ -932,8 +1092,8 @@ mod tests {
 
         let json = serde_json::to_vec(&index).unwrap();
         let key = tkey("test-pw");
-        let encrypted = encrypt_bytes(&key, &json).unwrap();
-        let decrypted = decrypt_bytes(&key, &encrypted).unwrap();
+        let encrypted = encrypt_bytes(&key, &json, b"aad").unwrap();
+        let decrypted = decrypt_bytes(&key, &encrypted, b"aad").unwrap();
         let restored: DiskIndex = serde_json::from_slice(&decrypted).unwrap();
 
         assert_eq!(restored.next_inode, 3);
@@ -1232,7 +1392,7 @@ mod tests {
 
         let ciphertext = fs::read(&index_path).unwrap();
         let key = crate::crypto::derive_key_at(&dir, "conflict-pw");
-        let json = decrypt_bytes(&key, &ciphertext).expect("index should be decryptable");
+        let json = crate::crypto::decrypt_index(&key, &ciphertext).expect("index should be decryptable");
         let _index: DiskIndex = serde_json::from_slice(&json).expect("index should be valid JSON");
 
         let _ = fs::remove_dir_all(&dir);
@@ -1291,6 +1451,165 @@ mod tests {
             assert!(!backing.exists(), "backing file should not exist for this test");
         }
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // --- Regression tests for the open/release/truncate/fsync fixes -------
+
+    /// Add a 0-size file inode under root and return (ino, disk_filename).
+    fn add_file(ztfs: &ZeroTrustFs, name: &str) -> (u64, String) {
+        let mut state = ztfs.inner.state.write().unwrap();
+        let ino = ZeroTrustFs::allocate_inode(&mut state);
+        let df = ZeroTrustFs::allocate_disk_filename(&mut state);
+        state.inodes.insert(ino, InodeEntry {
+            name: name.to_string(), kind: InodeKind::File, disk_filename: df.clone(),
+            size: 0, perm: 0o644, uid: 501, gid: 20,
+            atime_secs: 0, mtime_secs: 0, ctime_secs: 0, nlink: 1, parent: 1,
+        });
+        state.children.entry(1).or_default().push(DirChild { name: name.to_string(), inode: ino });
+        (ino, df)
+    }
+
+    /// mknod-style inode (non-empty disk_filename, size 0, no backing blob)
+    /// must open as an empty buffer, not EIO.
+    #[test]
+    fn open_inode_empty_when_zero_size_backing_absent() {
+        let dir = PathBuf::from("target/test-open-zero-missing");
+        let _ = fs::remove_dir_all(&dir);
+        let ztfs = ZeroTrustFs::new("pw", dir.clone());
+        let (ino, df) = add_file(&ztfs, "fresh.txt");
+        assert!(!ztfs.inner.base_path.join(&df).exists());
+        ztfs.open_inode(ino).expect("zero-size missing backing must open as empty");
+        assert_eq!(ztfs.inner.open_files.read().unwrap().get(&ino).unwrap().len(), 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A non-empty file whose backing blob vanished is genuine data loss
+    /// and must error on open.
+    #[test]
+    fn open_inode_errors_when_nonempty_backing_absent() {
+        let dir = PathBuf::from("target/test-open-missing-loss");
+        let _ = fs::remove_dir_all(&dir);
+        let ztfs = ZeroTrustFs::new("pw", dir.clone());
+        let (ino, _df) = add_file(&ztfs, "ghost.txt");
+        ztfs.inner.state.write().unwrap().inodes.get_mut(&ino).unwrap().size = 42;
+        assert!(ztfs.open_inode(ino).is_err(), "missing backing for a non-empty file must error");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A second open of an already-open inode must NOT reload from disk and
+    /// clobber unflushed in-memory writes.
+    #[test]
+    fn second_open_does_not_clobber_dirty_buffer() {
+        let dir = PathBuf::from("target/test-open-no-clobber");
+        let _ = fs::remove_dir_all(&dir);
+        let ztfs = ZeroTrustFs::new("pw", dir.clone());
+        let (ino, df) = add_file(&ztfs, "doc.txt");
+        // Backing has "ondisk"; size set so first open loads it.
+        ztfs.write_encrypted_file(&df, b"ondisk").unwrap();
+        ztfs.inner.state.write().unwrap().inodes.get_mut(&ino).unwrap().size = 6;
+        ztfs.open_inode(ino).unwrap();
+        // Simulate an unflushed write into the open buffer.
+        ztfs.inner.open_files.write().unwrap().insert(ino, b"dirty!!".to_vec());
+        // Second opener must reuse the buffer, not reload "ondisk".
+        ztfs.open_inode(ino).unwrap();
+        assert_eq!(ztfs.inner.open_files.read().unwrap().get(&ino).unwrap(), b"dirty!!");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// With two open handles, the buffer survives the first release and is
+    /// persisted+evicted only on the last release.
+    #[test]
+    fn buffer_persists_only_on_last_release() {
+        let dir = PathBuf::from("target/test-last-release");
+        let _ = fs::remove_dir_all(&dir);
+        let ztfs = ZeroTrustFs::new("pw", dir.clone());
+        let (ino, df) = add_file(&ztfs, "shared.txt");
+        ztfs.open_inode(ino).unwrap();
+        ztfs.open_inode(ino).unwrap(); // count = 2
+        ztfs.inner.open_files.write().unwrap().insert(ino, b"final".to_vec());
+
+        ztfs.release_inode(ino).unwrap(); // count → 1: no evict, no persist
+        assert!(ztfs.inner.open_files.read().unwrap().contains_key(&ino), "buffer must survive non-final release");
+        assert!(!ztfs.inner.base_path.join(&df).exists(), "must not persist before last release");
+
+        ztfs.release_inode(ino).unwrap(); // count → 0: persist + evict
+        assert!(!ztfs.inner.open_files.read().unwrap().contains_key(&ino), "buffer evicted on last release");
+        assert_eq!(ztfs.read_encrypted_file(&df).unwrap(), b"final");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Truncating a CLOSED file must persist to the on-disk blob (this was
+    /// previously a silent no-op).
+    #[test]
+    fn truncate_closed_file_persists_to_disk() {
+        let dir = PathBuf::from("target/test-truncate-closed");
+        let _ = fs::remove_dir_all(&dir);
+        let ztfs = ZeroTrustFs::new("pw", dir.clone());
+        let (ino, df) = add_file(&ztfs, "log.txt");
+        ztfs.write_encrypted_file(&df, b"0123456789").unwrap();
+        ztfs.inner.state.write().unwrap().inodes.get_mut(&ino).unwrap().size = 10;
+        // File is closed (never opened). Truncate to 4.
+        ztfs.truncate_inode(ino, 4).unwrap();
+        assert_eq!(ztfs.read_encrypted_file(&df).unwrap(), b"0123", "closed-file truncate must shrink the blob");
+        // Truncate-extend to 6 zero-fills.
+        ztfs.truncate_inode(ino, 6).unwrap();
+        assert_eq!(ztfs.read_encrypted_file(&df).unwrap(), b"0123\0\0");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Truncating an OPEN file resizes the in-memory buffer.
+    #[test]
+    fn truncate_open_file_resizes_buffer() {
+        let dir = PathBuf::from("target/test-truncate-open");
+        let _ = fs::remove_dir_all(&dir);
+        let ztfs = ZeroTrustFs::new("pw", dir.clone());
+        let (ino, _df) = add_file(&ztfs, "buf.txt");
+        ztfs.open_inode(ino).unwrap();
+        ztfs.inner.open_files.write().unwrap().insert(ino, b"abcdef".to_vec());
+        ztfs.truncate_inode(ino, 3).unwrap();
+        assert_eq!(ztfs.inner.open_files.read().unwrap().get(&ino).unwrap(), b"abc");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// fsync persists the open buffer to the backing blob durably.
+    #[test]
+    fn fsync_inode_persists_open_content() {
+        let dir = PathBuf::from("target/test-fsync");
+        let _ = fs::remove_dir_all(&dir);
+        let ztfs = ZeroTrustFs::new("pw", dir.clone());
+        let (ino, df) = add_file(&ztfs, "data.txt");
+        ztfs.open_inode(ino).unwrap();
+        ztfs.inner.open_files.write().unwrap().insert(ino, b"synced".to_vec());
+        ztfs.fsync_inode(ino).unwrap();
+        assert_eq!(ztfs.read_encrypted_file(&df).unwrap(), b"synced");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Security regression (AAD): swapping two blobs on disk must be
+    /// detected on read — a blob encrypted under one filename must not
+    /// authenticate under another.
+    #[test]
+    fn on_disk_blob_swap_is_rejected() {
+        let dir = PathBuf::from("target/test-blob-swap");
+        let _ = fs::remove_dir_all(&dir);
+        let ztfs = ZeroTrustFs::new("pw", dir.clone());
+        let (_a, df_a) = add_file(&ztfs, "a.txt");
+        let (_b, df_b) = add_file(&ztfs, "b.txt");
+        ztfs.write_encrypted_file(&df_a, b"secret-A").unwrap();
+        ztfs.write_encrypted_file(&df_b, b"secret-B").unwrap();
+
+        // Attacker with write access swaps the two ciphertext blobs.
+        let pa = ztfs.inner.base_path.join(&df_a);
+        let pb = ztfs.inner.base_path.join(&df_b);
+        let ba = fs::read(&pa).unwrap();
+        let bb = fs::read(&pb).unwrap();
+        fs::write(&pa, &bb).unwrap();
+        fs::write(&pb, &ba).unwrap();
+
+        // Both reads must now fail (AAD = filename no longer matches).
+        assert!(ztfs.read_encrypted_file(&df_a).is_err(), "swapped blob must fail AAD check");
+        assert!(ztfs.read_encrypted_file(&df_b).is_err(), "swapped blob must fail AAD check");
         let _ = fs::remove_dir_all(&dir);
     }
 }
