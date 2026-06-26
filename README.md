@@ -1,12 +1,14 @@
 # ZeroTrust Drive
 
 FUSE-based encrypted overlay filesystem. You work with decrypted files in the mount directory
-while all data is stored encrypted at rest using ChaCha20-Poly1305 AEAD encryption (the `.age`
-file extension is a naming convention — not the age crate).
+while all data is stored encrypted at rest with XChaCha20-Poly1305 AEAD encryption, under a key
+derived from your passphrase with Argon2id (the `.age` file extension is a naming convention —
+not the age crate).
 
 Google Drive never sees plaintext file names or content. The encrypted storage directory
-contains only opaque files (`000001.age`, `000002.age`, ...) and an encrypted index
-(`_index.age`). The index stores the full directory tree — filenames, permissions, sizes,
+contains opaque data files (`000001.age`, `000002.age`, ...), an encrypted index
+(`_index.age`), and a small plaintext `_kdf.json` holding the key-derivation salt and cost
+parameters (not secret — see [Encryption](#encryption)). The index stores the full directory tree — filenames, permissions, sizes,
 timestamps, and the mapping from each real filename to its opaque `.age` counterpart. It is
 encrypted with the same passphrase and re-written on every metadata change. Without the
 correct passphrase, the index (and therefore the entire directory structure) is unreadable.
@@ -41,7 +43,7 @@ it for your terminal application (e.g. Terminal.app, iTerm2, Alacritty).
 
 ### Directory Layout
 
-    ~/g.drive/.zerotrust.drive.encrypted/    encrypted storage — synced by Google Drive (ciphertext only)
+    ~/g.drive/.zerotrust.drive.encrypted/    encrypted storage — synced by Google Drive (ciphertext + non-secret KDF salt)
     ~/z.drive/                              FUSE mount point — local, NOT synced (you work here)
 
 The encrypted directory is auto-managed by zerotrust-drive. Do not modify its contents directly.
@@ -141,17 +143,51 @@ is no hard cap.
 
 ### Encryption
 
-zerotrust-drive uses ChaCha20-Poly1305, an AEAD (Authenticated Encryption with Associated
-Data) cipher standardized by the IETF in RFC 8439. It provides both confidentiality and
-integrity — if a file is tampered with or corrupted (e.g. during cloud sync), decryption
-fails rather than silently returning garbage.
+Files are encrypted at rest with **XChaCha20-Poly1305**, an AEAD (Authenticated Encryption
+with Associated Data) cipher. It is the extended-nonce variant of the ChaCha20-Poly1305
+construction standardized by the IETF in RFC 8439 — the same cipher used by WireGuard, TLS 1.3,
+SSH (OpenSSH), and Google's QUIC. The 256-bit key makes it equally secure to AES-256, and its
+192-bit (24-byte) random nonce is wide enough that randomly generated nonces never collide in
+practice, even when one long-lived per-drive key encrypts millions of blobs and index rewrites.
 
-The same cipher is used by WireGuard, TLS 1.3, SSH (OpenSSH), Google's QUIC protocol, and
-Android disk encryption. It is a 256-bit cipher considered equally secure to AES-256.
+AEAD provides both confidentiality and integrity: if a file is tampered with or corrupted (e.g.
+during cloud sync), decryption fails rather than silently returning garbage. Each blob is
+additionally bound to its on-disk filename through the AEAD associated data, and the index is
+bound to a domain tag — so an attacker who can write to the encrypted store (e.g. a compromised
+cloud-sync account) cannot swap one blob's ciphertext over another's, or substitute the index
+for a data blob, without the read failing. (Whole-object rollback — restoring an older
+authenticated copy of the same file — is not defended against; that would require a trusted
+monotonic anchor the on-disk format does not have.)
+
+The passphrase is never used as a key directly. It is stretched into the 256-bit key with
+**Argon2id**, the memory-hard KDF that won the Password Hashing Competition, using a per-drive
+random 16-byte salt and OWASP-baseline cost parameters (19 MiB memory, 2 iterations). The salt
+and parameters are stored in plaintext in `_kdf.json` — a salt is not a secret; its job is to
+defeat precomputation and to make two drives with the same passphrase derive different keys.
+Memory-hardness is the primary defense against offline brute-forcing of the passphrase against
+the cloud-stored ciphertext.
 
 Apple FileVault uses AES-XTS, which is designed for fixed-size disk sectors and does not
-provide authentication. ChaCha20-Poly1305 is a better fit for file-level encryption with
-cloud sync because its built-in authentication detects corruption or tampering automatically.
+authenticate. XChaCha20-Poly1305 is a better fit for file-level encryption with cloud sync
+because its built-in authentication detects corruption or tampering automatically.
+
+#### On-disk format versions
+
+| Version | Drives | Key derivation | Cipher |
+|---|---|---|---|
+| **v1** | 0.7+ — have a `_kdf.json` | Argon2id + per-drive salt | XChaCha20-Poly1305 (24-byte nonce) |
+| **v0** | pre-0.7 — no `_kdf.json` | homemade iterative KDF, no salt | ChaCha20-Poly1305 (12-byte nonce) |
+
+The v1 format fixes two weaknesses in v0: a custom KDF with no memory-hardness (cheap to
+brute-force offline against the at-rest blobs) and a 96-bit nonce (random nonces risk a
+birthday-bound collision under a single long-lived key, which is catastrophic for a stream
+cipher). A pre-0.7 drive refuses to mount until it is upgraded in place with the current
+passphrase:
+
+    zerotrust-drive --migrate-format
+
+The migration re-encrypts every blob, so a cloud-sync backend will re-upload the whole drive.
+It is crash-safe — re-run the same command to resume an interrupted migration.
 
 ### Building
 
