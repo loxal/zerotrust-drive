@@ -5,23 +5,40 @@ while all data is stored encrypted at rest with XChaCha20-Poly1305 AEAD encrypti
 derived from your passphrase with Argon2id (the `.age` file extension is a naming convention —
 not the age crate).
 
-Google Drive never sees plaintext file names or content. The encrypted storage directory
+The cloud provider never sees plaintext file names or content. The encrypted storage directory
 contains opaque data files (`000001.age`, `000002.age`, ...), an encrypted index
 (`_index.age`), and a small plaintext `_kdf.json` holding the key-derivation salt and cost
 parameters (not secret — see [Encryption](#encryption)). The index stores the full directory tree — filenames, permissions, sizes,
 timestamps, and the mapping from each real filename to its opaque `.age` counterpart. It is
-encrypted with the same passphrase and re-written on every metadata change. Without the
+encrypted with the same passphrase and rewritten when metadata changes are committed. Without the
 correct passphrase, the index (and therefore the entire directory structure) is unreadable.
 
-Point `--encrypted-dir` at a Google Drive sync folder and Google Drive handles upload/sync
-of the ciphertext automatically.
+Point `--encrypted-dir` at a fully local cloud-sync folder and its provider handles replication
+of the ciphertext. Placeholder/on-demand storage is not a safe backing filesystem for this tool.
 
 This is an in-memory filesystem — all file content is held in RAM while open.
 Not recommended for files larger than available memory.
 
 If the encrypted storage is modified externally (e.g. by cloud sync) while mounted,
-zerotrust-drive detects the conflict, logs a warning, and preserves the in-memory state.
-Unmount and remount to pick up external changes.
+zerotrust-drive fingerprints the encrypted index and refuses the next local commit instead of
+overwriting the external generation. Unmount and reconcile or remount to pick up external
+changes. Never mount the same store on two computers at once.
+
+### Cloud backend guidance
+
+The primary supported target is a dedicated folder in Google Drive `My Drive`, with Google
+Drive for desktop configured to **Mirror files**. Mirror mode keeps ordinary local files and
+best matches the POSIX `fsync` and atomic-rename behavior used here. Do not use Google Drive
+Stream mode or a Shared Drive as the backing store.
+
+iCloud Drive is a macOS-only beta target. Mark the complete encrypted backing folder
+**Keep Downloaded** before use. iCloud's File Provider placeholders and lack of a general
+user-facing pause-sync control make migration and recovery less predictable.
+
+Neither provider supplies a multi-file transaction, a cross-machine writer lock, or a backup.
+Use one active mount, wait for sync to finish before switching computers, and keep an independent
+versioned snapshot. See the [2026 cloud backend and user-experience review](docs/cloud-storage-backends-2026-08.md)
+for the technical tradeoffs, vendor documentation, and reported failure modes.
 
 ### Prerequisites
 
@@ -51,7 +68,7 @@ Both paths are overridable via justfile variables or CLI flags `--encrypted-dir`
 
 ### Usage
 
-    just mount                                          # mount (warns if using default passphrase)
+    ZEROTRUST_PASSPHRASE="my-secret" just mount         # mount or create with a real secret
     just populate                                       # create test files on the mounted filesystem
     just umount                                         # unmount (decrypted dir becomes empty)
     just mount                                          # remount — files reappear from encrypted storage
@@ -61,12 +78,14 @@ Both paths are overridable via justfile variables or CLI flags `--encrypted-dir`
 
 ### Passphrase
 
-Set the encryption passphrase via env var or CLI flag. If neither is set, the default
-passphrase `zerotrust-demo-passphrase` is used and a warning is shown at mount.
-Do not rely on this for real data.
+Set the encryption passphrase via env var or CLI flag. A new store refuses an empty
+passphrase or the built-in `zerotrust-demo-passphrase`. The explicit
+`--allow-default-passphrase` override exists only for throwaway tests. An existing store
+created with either insecure value remains accessible but prints a warning.
 
     ZEROTRUST_PASSPHRASE="my-secret" just mount         # via env var (recommended)
     cargo run -- --passphrase "my-secret"                # via CLI flag
+    cargo run -- --allow-default-passphrase              # throwaway new store only
 
 The env var takes precedence if both are provided.
 
@@ -86,18 +105,19 @@ return EROFS. Once re-encryption finishes the filesystem becomes read-write agai
 
 #### How rekey works
 
-The rekey process has two phases. Originals are never modified in place — the design
-guarantees that no data is lost regardless of when or how the process is interrupted.
+The rekey process has two phases. Originals are not replaced until staging is complete, and
+post-commit recovery evidence is preserved when an operation cannot finish automatically.
 
 **Phase 1 — Staging**: Each file is decrypted with the old passphrase, re-encrypted with
 the new passphrase, and written into a hidden `.rekey_staging/` directory. The original
 files remain untouched throughout this phase.
 
-**Phase 2 — Rename pass**: Once every file has been staged, a `_rekey.manifest` is written
-(the commit point). Each staged file is then atomically renamed over its original via a
-single `rename()` syscall. After each successful rename the manifest is updated on disk,
-so the exact progress is always known. The encrypted index (`_index.age`) is always renamed
-last — until that final rename, the old passphrase can still open the drive.
+**Phase 2 - Rename pass**: Once every file has been staged, an immutable `_rekey.manifest`
+is written (the commit point). It records a compact fingerprint for every staged ciphertext.
+Each staged file is then atomically renamed over its original via a single `rename()` syscall.
+After a crash, recovery uses the fingerprint to distinguish a completed rename from a missing
+file without rewriting the whole manifest after every item. The encrypted index (`_index.age`)
+is always renamed last - until that final rename, the old passphrase can still open the drive.
 
 After all renames complete, `.rekey_staging/`, `_rekey.manifest`, and `_rekey.lock` are
 removed.
@@ -107,7 +127,7 @@ removed.
 | Scenario | What happens | Recovery |
 |---|---|---|
 | **Ctrl+C / crash during Phase 1** (staging) | Originals untouched. `.rekey_staging/` contains partial re-encrypted files. | Next `--new-passphrase` wipes the partial staging and starts fresh. Use `--continue-rekey` to resume instead (see below). |
-| **Ctrl+C / crash during Phase 2** (rename pass) | Some files already renamed, manifest tracks which. | **Automatic** — on next startup `recover_interrupted_rekey()` reads the manifest and completes the remaining renames. No user action needed. |
+| **Ctrl+C / crash during Phase 2** (rename pass) | Some files may already be renamed; immutable fingerprints identify them. | **Automatic** - on next startup `recover_interrupted_rekey()` verifies the manifest and completes the remaining renames. No user action needed. |
 | **Wrong old passphrase** | Decryption of `_index.age` fails immediately. | Lock file removed, clear error shown. No files modified. |
 | **Disk full during staging** | Write fails, no manifest written. | `.rekey_staging/` cleaned up on next run. Originals intact. |
 | **Lock file exists** (`_rekey.lock`) | Another rekey may be in progress. | Refuses to start. If no other process is running, delete the lock file manually. |
@@ -127,9 +147,9 @@ Or directly:
 
     cargo run -- --new-passphrase "same-passphrase" --continue-rekey
 
-Before resuming, the passphrase is **cryptographically verified** — one file from the
-staging directory is test-decrypted with the provided new passphrase. If decryption fails,
-the resume is rejected with a clear error. No passphrase is ever stored on disk.
+Before resuming, the passphrase is **cryptographically verified** against every recognized
+staged blob and staged index. If any decryption fails, the resume is rejected with a clear
+error. No passphrase is ever stored on disk.
 
 ### Limits
 
@@ -138,8 +158,10 @@ NTFS. Operations that exceed this limit (create, mkdir, rename) return `ENAMETOO
 
 Disk filenames use a 6-digit hex counter (`000001.age` through `ffffff.age`), supporting
 up to **16,777,215 files**. The counter increases monotonically and is never reused, even
-after deletions. If the counter exceeds 6 digits the filenames simply grow longer — there
-is no hard cap.
+after deletions. If the counter exceeds 6 digits the filenames simply grow longer. Rekey and
+format-migration transactions currently support at most **100,000 manifest entries** and a
+64 MiB manifest; these explicit bounds prevent a malformed cloud-supplied manifest from causing
+unbounded memory allocation.
 
 ### Encryption
 
@@ -188,6 +210,15 @@ passphrase:
 
 The migration re-encrypts every blob, so a cloud-sync backend will re-upload the whole drive.
 It is crash-safe — re-run the same command to resume an interrupted migration.
+
+#### Cloud-backed rekey and migration
+
+Before either maintenance operation, unmount this store on every device, wait until cloud sync
+reports complete, and create an independent recoverable snapshot. Pause Google Drive sync while
+the local operation runs. For the iCloud beta target, first confirm the folder is fully downloaded
+and synchronized, then disconnect the Mac from the network because iCloud has no equivalent
+general Pause Sync control. Validate the transformed store locally before reconnecting or resuming
+sync. Do not mount it on another device until every changed blob and `_index.age` has uploaded.
 
 ### Building
 

@@ -34,6 +34,7 @@ use chacha20poly1305::{
     aead::{Aead, KeyInit, OsRng, Payload, rand_core::RngCore},
 };
 use serde::{Deserialize, Serialize};
+use std::io::{Read, Seek, SeekFrom};
 
 /// On-disk format version recorded in `_kdf.json`. Bump only on a
 /// breaking change to the KDF or AEAD; the presence/absence of
@@ -44,8 +45,23 @@ pub const FORMAT_VERSION: u32 = 1;
 /// minimum and matches common practice.
 pub const SALT_LEN: usize = 16;
 
+/// Reject cloud-supplied KDF settings that would turn metadata parsing into a
+/// resource-exhaustion attack. Existing drives use about 19 MiB, two passes,
+/// and one lane; these caps leave ample room for future strengthening.
+const MAX_KDF_FILE_LEN: u64 = 64 * 1024;
+const MAX_M_COST_KIB: u32 = 256 * 1024;
+const MAX_T_COST: u32 = 10;
+const MAX_P_COST: u32 = 16;
+
 /// XChaCha20-Poly1305 extended nonce length (192-bit).
 const XNONCE_LEN: usize = 24;
+
+/// Poly1305 authentication-tag length appended to every ciphertext.
+const TAG_LEN: usize = 16;
+
+/// `_kdf.json` is tiny. This bound prevents a malformed recovery manifest
+/// from making startup retain an unexpectedly large exact fingerprint.
+const MAX_EXACT_FINGERPRINT_LEN: u64 = 64 * 1024;
 
 /// Legacy (v0) ChaCha20-Poly1305 nonce length (96-bit).
 const LEGACY_NONCE_LEN: usize = 12;
@@ -82,6 +98,35 @@ impl KdfParams {
             p_cost: Params::DEFAULT_P_COST,
         }
     }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.format_version != FORMAT_VERSION {
+            return Err(format!(
+                "unsupported KDF format version {} (expected {FORMAT_VERSION})",
+                self.format_version
+            ));
+        }
+        if self.algorithm != "argon2id" {
+            return Err(format!(
+                "unsupported KDF algorithm {:?} (expected argon2id)",
+                self.algorithm
+            ));
+        }
+        if self.salt.len() != SALT_LEN {
+            return Err(format!(
+                "invalid Argon2id salt length {} (expected {SALT_LEN})",
+                self.salt.len()
+            ));
+        }
+        if self.m_cost > MAX_M_COST_KIB || self.t_cost > MAX_T_COST || self.p_cost > MAX_P_COST {
+            return Err(format!(
+                "KDF resource parameters exceed safety caps (m_cost <= {MAX_M_COST_KIB} KiB, t_cost <= {MAX_T_COST}, p_cost <= {MAX_P_COST})"
+            ));
+        }
+        Params::new(self.m_cost, self.t_cost, self.p_cost, Some(32))
+            .map_err(|e| format!("invalid Argon2id parameters: {e}"))?;
+        Ok(())
+    }
 }
 
 /// Path to the per-drive KDF metadata file.
@@ -93,12 +138,38 @@ pub fn kdf_path(base_path: &std::path::Path) -> std::path::PathBuf {
 /// file — i.e. it is brand-new or a pre-0.7 (v0) drive.
 pub fn load_kdf(base_path: &std::path::Path) -> Result<Option<KdfParams>, String> {
     let path = kdf_path(base_path);
-    if !path.exists() {
+    if !path
+        .try_exists()
+        .map_err(|e| format!("check {}: {e}", path.display()))?
+    {
         return Ok(None);
     }
-    let bytes = std::fs::read(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let file = std::fs::File::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
+    let len = file
+        .metadata()
+        .map_err(|e| format!("stat {}: {e}", path.display()))?
+        .len();
+    if len > MAX_KDF_FILE_LEN {
+        return Err(format!(
+            "{} is unexpectedly large ({len} bytes; maximum {MAX_KDF_FILE_LEN})",
+            path.display()
+        ));
+    }
+    let mut bytes = Vec::with_capacity(len as usize);
+    file.take(MAX_KDF_FILE_LEN + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("read {}: {e}", path.display()))?;
+    if bytes.len() as u64 > MAX_KDF_FILE_LEN {
+        return Err(format!(
+            "{} grew beyond the {MAX_KDF_FILE_LEN}-byte maximum while being read",
+            path.display()
+        ));
+    }
     let params: KdfParams =
         serde_json::from_slice(&bytes).map_err(|e| format!("parse {}: {e}", path.display()))?;
+    params
+        .validate()
+        .map_err(|e| format!("validate {}: {e}", path.display()))?;
     Ok(Some(params))
 }
 
@@ -107,16 +178,19 @@ pub fn load_kdf(base_path: &std::path::Path) -> Result<Option<KdfParams>, String
 /// avoid a crypto→fs dependency direction.
 pub fn save_kdf(base_path: &std::path::Path, params: &KdfParams) -> Result<(), String> {
     use std::io::Write;
+    params.validate()?;
     let path = kdf_path(base_path);
     let json = serde_json::to_vec_pretty(params).map_err(|e| e.to_string())?;
     let tmp = path.with_extension("json.tmp");
-    let mut f = std::fs::File::create(&tmp).map_err(|e| format!("create {}: {e}", tmp.display()))?;
+    let mut f =
+        std::fs::File::create(&tmp).map_err(|e| format!("create {}: {e}", tmp.display()))?;
     f.write_all(&json).map_err(|e| e.to_string())?;
     f.sync_all().map_err(|e| e.to_string())?;
     std::fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
-    if let Ok(dir) = std::fs::File::open(base_path) {
-        let _ = dir.sync_all();
-    }
+    std::fs::File::open(base_path)
+        .map_err(|e| format!("open KDF parent {}: {e}", base_path.display()))?
+        .sync_all()
+        .map_err(|e| format!("sync KDF parent {}: {e}", base_path.display()))?;
     Ok(())
 }
 
@@ -140,22 +214,56 @@ pub fn load_or_create_kdf(base_path: &std::path::Path) -> Result<KdfParams, Stri
 /// Derive a 256-bit key from a passphrase with Argon2id, using the
 /// drive's stored salt and cost parameters. Memory-hard — the primary
 /// defense against offline passphrase guessing against the blobs.
-pub fn derive_key(passphrase: &str, kdf: &KdfParams) -> [u8; 32] {
+pub fn try_derive_key(passphrase: &str, kdf: &KdfParams) -> Result<[u8; 32], String> {
+    kdf.validate()?;
     let params = Params::new(kdf.m_cost, kdf.t_cost, kdf.p_cost, Some(32))
-        .expect("argon2 params invalid");
+        .map_err(|e| format!("invalid Argon2id parameters: {e}"))?;
     let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
     let mut key = [0u8; 32];
     argon2
         .hash_password_into(passphrase.as_bytes(), &kdf.salt, &mut key)
-        .expect("argon2 key derivation failed");
-    key
+        .map_err(|e| format!("Argon2id key derivation failed: {e}"))?;
+    Ok(key)
 }
 
-/// Convenience: load (or create) the drive's KDF params and derive the
-/// key in one call. Used by the FUSE layer, rekey, and tests.
+/// Infallible compatibility wrapper for callers that already validated their
+/// in-memory parameters. Production metadata paths should use
+/// [`try_derive_key`] so resource/allocation failures remain recoverable.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn derive_key(passphrase: &str, kdf: &KdfParams) -> [u8; 32] {
+    try_derive_key(passphrase, kdf).expect("argon2 key derivation failed")
+}
+
+/// Convenience for tests and brand-new-store setup: load or create KDF
+/// metadata and derive the corresponding key.
+pub fn try_derive_key_at(
+    base_path: &std::path::Path,
+    passphrase: &str,
+) -> Result<[u8; 32], String> {
+    let kdf = load_or_create_kdf(base_path)?;
+    try_derive_key(passphrase, &kdf)
+}
+
+/// Load an existing drive's KDF params and derive its key. Maintenance paths
+/// must use this variant: if `_kdf.json` is temporarily unavailable in a
+/// cloud-backed store, minting a replacement salt would make the existing
+/// ciphertext undecryptable.
+pub fn try_derive_existing_key_at(
+    base_path: &std::path::Path,
+    passphrase: &str,
+) -> Result<[u8; 32], String> {
+    let kdf = load_kdf(base_path)?.ok_or_else(|| {
+        format!(
+            "required KDF metadata {} is missing",
+            kdf_path(base_path).display()
+        )
+    })?;
+    try_derive_key(passphrase, &kdf)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn derive_key_at(base_path: &std::path::Path, passphrase: &str) -> [u8; 32] {
-    let kdf = load_or_create_kdf(base_path).expect("failed to load/create KDF params");
-    derive_key(passphrase, &kdf)
+    try_derive_key_at(base_path, passphrase).expect("failed to load KDF parameters or derive key")
 }
 
 /// v0 (pre-0.7) key derivation: homemade iterative mixing, no salt, no
@@ -182,6 +290,120 @@ pub fn derive_key_legacy(passphrase: &str) -> [u8; 32] {
     }
     key.copy_from_slice(&state[..32]);
     key
+}
+
+/// Original v0 key derivation shipped by the tagged 0.6.0 release and
+/// retained by early 0.6.1 builds: 10,000 mixing rounds and no passphrase
+/// length fold. The hardened v0 derivation above changed both details without
+/// an on-disk format marker, so migration must authenticate-probe both keys.
+pub fn derive_key_legacy_tagged(passphrase: &str) -> [u8; 32] {
+    let mut key = [0u8; 32];
+    let bytes = passphrase.as_bytes();
+    let mut state = [0u8; 64];
+    for (i, &b) in bytes.iter().enumerate() {
+        state[i % 64] ^= b;
+    }
+    for _ in 0..10_000 {
+        for i in 0..64 {
+            state[i] = state[i]
+                .wrapping_add(state[(i + 1) % 64])
+                .wrapping_mul(7)
+                .wrapping_add(0x9e);
+        }
+    }
+    key.copy_from_slice(&state[..32]);
+    key
+}
+
+/// Small, dependency-free identity for recovery artifacts. XChaCha's random
+/// nonce plus its authentication tag and exact length identifies the staged
+/// ciphertext across the narrow rename-success/manifest-update crash window.
+/// `_kdf.json` uses an exact fingerprint because it is plaintext and tiny.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum RecoveryFingerprint {
+    Ciphertext {
+        len: u64,
+        nonce: Vec<u8>,
+        tag: Vec<u8>,
+    },
+    Exact {
+        bytes: Vec<u8>,
+    },
+}
+
+impl RecoveryFingerprint {
+    pub(crate) fn is_ciphertext(&self) -> bool {
+        matches!(self, Self::Ciphertext { .. })
+    }
+
+    pub(crate) fn is_exact(&self) -> bool {
+        matches!(self, Self::Exact { .. })
+    }
+
+    pub(crate) fn is_well_formed(&self) -> bool {
+        match self {
+            Self::Ciphertext { len, nonce, tag } => {
+                *len >= (XNONCE_LEN + TAG_LEN) as u64
+                    && nonce.len() == XNONCE_LEN
+                    && tag.len() == TAG_LEN
+            }
+            Self::Exact { bytes } => bytes.len() as u64 <= MAX_EXACT_FINGERPRINT_LEN,
+        }
+    }
+}
+
+pub(crate) fn ciphertext_fingerprint(
+    path: &std::path::Path,
+) -> Result<RecoveryFingerprint, String> {
+    let mut file =
+        std::fs::File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+    let len = file
+        .metadata()
+        .map_err(|e| format!("stat {}: {e}", path.display()))?
+        .len();
+    if len < (XNONCE_LEN + TAG_LEN) as u64 {
+        return Err(format!(
+            "{} is too short to be an XChaCha20-Poly1305 ciphertext",
+            path.display()
+        ));
+    }
+
+    let mut nonce = vec![0u8; XNONCE_LEN];
+    file.read_exact(&mut nonce)
+        .map_err(|e| format!("read nonce from {}: {e}", path.display()))?;
+    file.seek(SeekFrom::End(-(TAG_LEN as i64)))
+        .map_err(|e| format!("seek tag in {}: {e}", path.display()))?;
+    let mut tag = vec![0u8; TAG_LEN];
+    file.read_exact(&mut tag)
+        .map_err(|e| format!("read tag from {}: {e}", path.display()))?;
+
+    Ok(RecoveryFingerprint::Ciphertext { len, nonce, tag })
+}
+
+pub(crate) fn ciphertext_bytes_fingerprint(bytes: &[u8]) -> Result<RecoveryFingerprint, String> {
+    if bytes.len() < XNONCE_LEN + TAG_LEN {
+        return Err("data is too short to be an XChaCha20-Poly1305 ciphertext".to_string());
+    }
+    Ok(RecoveryFingerprint::Ciphertext {
+        len: bytes.len() as u64,
+        nonce: bytes[..XNONCE_LEN].to_vec(),
+        tag: bytes[bytes.len() - TAG_LEN..].to_vec(),
+    })
+}
+
+pub(crate) fn exact_fingerprint(path: &std::path::Path) -> Result<RecoveryFingerprint, String> {
+    let len = std::fs::metadata(path)
+        .map_err(|e| format!("stat {}: {e}", path.display()))?
+        .len();
+    if len > MAX_EXACT_FINGERPRINT_LEN {
+        return Err(format!(
+            "{} is unexpectedly large ({len} bytes)",
+            path.display()
+        ));
+    }
+    let bytes = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    Ok(RecoveryFingerprint::Exact { bytes })
 }
 
 // --- Associated data (AAD) binding -----------------------------------------
@@ -223,7 +445,13 @@ pub fn encrypt_bytes(key: &[u8; 32], plaintext: &[u8], aad: &[u8]) -> Result<Vec
     OsRng.fill_bytes(&mut nonce_bytes);
     let nonce = XNonce::from_slice(&nonce_bytes);
     let ciphertext = cipher
-        .encrypt(nonce, Payload { msg: plaintext, aad })
+        .encrypt(
+            nonce,
+            Payload {
+                msg: plaintext,
+                aad,
+            },
+        )
         .map_err(|e| e.to_string())?;
     let mut out = Vec::with_capacity(XNONCE_LEN + ciphertext.len());
     out.extend_from_slice(&nonce_bytes);
@@ -241,12 +469,22 @@ pub fn decrypt_bytes(key: &[u8; 32], data: &[u8], aad: &[u8]) -> Result<Vec<u8>,
     let cipher = XChaCha20Poly1305::new(key.into());
     let nonce = XNonce::from_slice(&data[..XNONCE_LEN]);
     cipher
-        .decrypt(nonce, Payload { msg: &data[XNONCE_LEN..], aad })
+        .decrypt(
+            nonce,
+            Payload {
+                msg: &data[XNONCE_LEN..],
+                aad,
+            },
+        )
         .map_err(|e| e.to_string())
 }
 
 /// Encrypt a data blob, binding it to its on-disk filename via AAD.
-pub fn encrypt_blob(key: &[u8; 32], disk_filename: &str, plaintext: &[u8]) -> Result<Vec<u8>, String> {
+pub fn encrypt_blob(
+    key: &[u8; 32],
+    disk_filename: &str,
+    plaintext: &[u8],
+) -> Result<Vec<u8>, String> {
     encrypt_bytes(key, plaintext, &blob_aad(disk_filename))
 }
 
@@ -385,7 +623,30 @@ mod tests {
 
         let rt = decrypt_bytes_legacy(&key, &blob).unwrap();
         assert_eq!(rt, b"v0 data");
-        assert!(decrypt_bytes(&key, &blob, b"").is_err(), "v1 reader must reject v0 blob");
+        assert!(
+            decrypt_bytes(&key, &blob, b"").is_err(),
+            "v1 reader must reject v0 blob"
+        );
+    }
+
+    #[test]
+    fn historical_v0_kdf_vectors_match_shipped_implementations() {
+        fn decode_key(hex: &str) -> [u8; 32] {
+            let mut key = [0u8; 32];
+            for (i, byte) in key.iter_mut().enumerate() {
+                *byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap();
+            }
+            key
+        }
+
+        assert_eq!(
+            derive_key_legacy_tagged("historical-pw"),
+            decode_key("c2e2ba62ba0a02fa5aa27222728a1a9a8212cf2e127d68321f1fb78bf2a6c461")
+        );
+        assert_eq!(
+            derive_key_legacy("historical-pw"),
+            decode_key("3208ac0566b6a79f30369c5f6454795968de7e0f5a3ac765d802749d4424df67")
+        );
     }
 
     #[test]
@@ -399,6 +660,48 @@ mod tests {
         assert_eq!(a.format_version, FORMAT_VERSION);
         assert_eq!(a.salt.len(), SALT_LEN);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_kdf_rejects_untrusted_metadata_before_derivation() {
+        let dir = std::path::PathBuf::from("target/test-kdf-validation");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut invalid = Vec::new();
+        let mut value = test_kdf();
+        value.format_version = FORMAT_VERSION + 1;
+        invalid.push(value);
+        let mut value = test_kdf();
+        value.algorithm = "argon2i".to_string();
+        invalid.push(value);
+        let mut value = test_kdf();
+        value.salt.pop();
+        invalid.push(value);
+        let mut value = test_kdf();
+        value.m_cost = MAX_M_COST_KIB + 1;
+        invalid.push(value);
+        let mut value = test_kdf();
+        value.t_cost = MAX_T_COST + 1;
+        invalid.push(value);
+        let mut value = test_kdf();
+        value.p_cost = MAX_P_COST + 1;
+        invalid.push(value);
+        let mut value = test_kdf();
+        value.m_cost = 1;
+        invalid.push(value);
+
+        for params in invalid {
+            std::fs::write(kdf_path(&dir), serde_json::to_vec(&params).unwrap()).unwrap();
+            assert!(
+                load_kdf(&dir).is_err(),
+                "invalid metadata must be rejected: {params:?}"
+            );
+        }
+
+        std::fs::write(kdf_path(&dir), vec![b' '; MAX_KDF_FILE_LEN as usize + 1]).unwrap();
+        assert!(load_kdf(&dir).unwrap_err().contains("unexpectedly large"));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
