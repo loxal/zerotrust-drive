@@ -1,6 +1,6 @@
 [package]
 name = "zerotrust-drive"
-version = "0.8.0"
+version = "0.9.0"
 license = "AGPL-3.0-only"
 edition = "2024"
 
@@ -12,6 +12,8 @@ fuser = "0.17"
 chacha20poly1305 = "0.10"
 # Memory-hard passphrase KDF (Argon2id) — replaces the homemade v0 KDF.
 argon2 = "0.5"
+# Streaming full-ciphertext fingerprints for crash-recovery manifests.
+blake2 = "0.10"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

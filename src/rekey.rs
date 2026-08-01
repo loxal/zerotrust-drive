@@ -1,25 +1,35 @@
 // Copyright 2026 Alexander Orlov <alexander.orlov@loxal.net>
 
 use std::collections::HashSet;
-use std::io::{Read, Write};
 use std::sync::atomic::Ordering;
 
 use serde::{Deserialize, Serialize};
 
 use crate::crypto::{
-    RecoveryFingerprint, ciphertext_bytes_fingerprint, ciphertext_fingerprint, decrypt_blob,
-    decrypt_index, encrypt_blob, encrypt_index, try_derive_existing_key_at,
+    RecoveryFingerprint, ciphertext_bytes_fingerprint, ciphertext_fingerprint,
+    ciphertext_fingerprint_bounded, ciphertext_fingerprint_expected, decrypt_blob_owned,
+    decrypt_index_owned, encrypt_blob, encrypt_blob_owned, encrypt_index,
+    load_kdf_with_fingerprint, try_derive_existing_key_at, try_derive_key,
 };
 #[cfg(test)]
-use crate::fs::DiskIndex;
-use crate::fs::{FsInner, InodeKind, durable_write};
+use crate::crypto::{decrypt_blob, decrypt_index, exact_fingerprint};
+#[cfg(test)]
+use crate::fs::{DiskIndex, validate_disk_index};
+use crate::fs::{
+    FsInner, InodeKind, durable_create_new, durable_write, ensure_index_plaintext_within_limit,
+    ensure_no_index_siblings, ensure_real_directory, read_bounded_backing_file,
+    read_index_ciphertext, read_v1_blob_ciphertext, serialize_index_bounded,
+};
+use crate::transaction_lock::{lock_owner_is_active, prepare_lock_owner, write_lock_owner};
 
 const STAGING: &str = ".rekey_staging";
 const MANIFEST: &str = "_rekey.manifest";
 const LOCK: &str = "_rekey.lock";
 const INDEX_FILE: &str = "_index.age";
 const MAX_MANIFEST_FILE_LEN: u64 = 64 * 1024 * 1024;
+const MAX_INDEX_CIPHERTEXT_LEN: u64 = 64 * 1024 * 1024;
 const MAX_MANIFEST_ENTRIES: usize = 100_000;
+const MAX_PASSPHRASE_PROBE_LEN: u64 = 64 * 1024 * 1024;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct ManifestEntry {
@@ -107,6 +117,15 @@ fn validate_manifest(entries: &[ManifestEntry]) -> Result<(), String> {
                 entry.filename
             ));
         }
+        if is_index
+            && entry
+                .fingerprint
+                .as_ref()
+                .and_then(RecoveryFingerprint::ciphertext_len)
+                .is_some_and(|len| len > MAX_INDEX_CIPHERTEXT_LEN)
+        {
+            return Err("rekey manifest index exceeds the live index-size limit".to_string());
+        }
     }
     Ok(())
 }
@@ -119,8 +138,7 @@ fn sync_dir(path: &std::path::Path) -> Result<(), String> {
 }
 
 fn checked_exists(path: &std::path::Path) -> Result<bool, String> {
-    path.try_exists()
-        .map_err(|e| format!("check {}: {e}", path.display()))
+    crate::fs::backing_entry_exists(path).map_err(|e| format!("check {}: {e}", path.display()))
 }
 
 fn durable_write_checked(path: &std::path::Path, data: &[u8]) -> Result<(), String> {
@@ -136,11 +154,23 @@ fn remove_file_if_exists(path: &std::path::Path) -> Result<(), String> {
 }
 
 fn remove_dir_if_exists(path: &std::path::Path) -> Result<(), String> {
-    match std::fs::remove_dir_all(path) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(format!("remove {}: {e}", path.display())),
+    match std::fs::symlink_metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(format!("inspect {}: {e}", path.display())),
+        Ok(_) => {}
     }
+    ensure_real_directory(path).map_err(|e| e.to_string())?;
+    std::fs::remove_dir_all(path).map_err(|e| format!("remove {}: {e}", path.display()))
+}
+
+fn remove_empty_dir_if_exists(path: &std::path::Path) -> Result<(), String> {
+    match std::fs::symlink_metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(format!("inspect {}: {e}", path.display())),
+        Ok(_) => {}
+    }
+    ensure_real_directory(path).map_err(|e| e.to_string())?;
+    std::fs::remove_dir(path).map_err(|e| format!("remove empty {}: {e}", path.display()))
 }
 
 fn write_manifest(path: &std::path::Path, entries: &[ManifestEntry]) -> Result<(), String> {
@@ -155,28 +185,26 @@ fn write_manifest(path: &std::path::Path, entries: &[ManifestEntry]) -> Result<(
     durable_write_checked(path, &json)
 }
 
-fn read_manifest(path: &std::path::Path) -> Result<Vec<ManifestEntry>, String> {
-    let file = std::fs::File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
-    let len = file
-        .metadata()
-        .map_err(|e| format!("stat {}: {e}", path.display()))?
-        .len();
-    if len > MAX_MANIFEST_FILE_LEN {
-        return Err(format!(
-            "{} is too large ({len} bytes; maximum {MAX_MANIFEST_FILE_LEN})",
-            path.display()
-        ));
-    }
-    let mut json = Vec::with_capacity(len as usize);
-    file.take(MAX_MANIFEST_FILE_LEN + 1)
-        .read_to_end(&mut json)
-        .map_err(|e| format!("read {}: {e}", path.display()))?;
+fn create_manifest(path: &std::path::Path, entries: &[ManifestEntry]) -> Result<(), String> {
+    validate_manifest(entries)?;
+    let json = serde_json::to_vec(entries).map_err(|e| format!("serialize rekey manifest: {e}"))?;
     if json.len() as u64 > MAX_MANIFEST_FILE_LEN {
         return Err(format!(
-            "{} grew beyond the {MAX_MANIFEST_FILE_LEN}-byte maximum while being read",
-            path.display()
+            "rekey manifest is too large ({} bytes; maximum {MAX_MANIFEST_FILE_LEN})",
+            json.len()
         ));
     }
+    durable_create_new(path, &json).map_err(|error| {
+        format!(
+            "publish new rekey manifest {} without replacement: {error}",
+            path.display()
+        )
+    })
+}
+
+fn read_manifest(path: &std::path::Path) -> Result<Vec<ManifestEntry>, String> {
+    let json = read_bounded_backing_file(path, MAX_MANIFEST_FILE_LEN)
+        .map_err(|e| format!("read {}: {e}", path.display()))?;
     let entries: Vec<ManifestEntry> =
         serde_json::from_slice(&json).map_err(|e| format!("parse rekey manifest: {e}"))?;
     validate_manifest(&entries)?;
@@ -191,16 +219,22 @@ fn upgrade_manifest_fingerprints(
 ) -> Result<(), String> {
     let mut changed = false;
     for entry in entries.iter_mut() {
-        if entry.fingerprint.is_some() {
+        if entry
+            .fingerprint
+            .as_ref()
+            .is_some_and(RecoveryFingerprint::has_full_content_identity)
+        {
             continue;
         }
         let staged = staging_dir.join(&entry.filename);
-        let source = if staged
-            .try_exists()
-            .map_err(|e| format!("check {}: {e}", staged.display()))?
-        {
+        let source = if entry.renamed {
+            base_path.join(&entry.filename)
+        } else if checked_exists(&staged)? {
             staged
-        } else if entry.renamed {
+        } else if entry.fingerprint.is_some() {
+            // Fingerprint-backed manifests are immutable. A matching target
+            // can therefore prove a rename that completed immediately before
+            // a crash, even though `renamed` was never updated.
             base_path.join(&entry.filename)
         } else {
             return Err(format!(
@@ -208,11 +242,63 @@ fn upgrade_manifest_fingerprints(
                 entry.filename
             ));
         };
-        entry.fingerprint = Some(ciphertext_fingerprint(&source)?);
+        let upgraded = match entry
+            .fingerprint
+            .as_ref()
+            .and_then(RecoveryFingerprint::ciphertext_len)
+        {
+            Some(expected_len) => ciphertext_fingerprint_expected(&source, expected_len)?,
+            None if entry.filename == INDEX_FILE => {
+                ciphertext_fingerprint_bounded(&source, MAX_INDEX_CIPHERTEXT_LEN)?
+            }
+            None => ciphertext_fingerprint(&source)?,
+        };
+        if let Some(existing) = &entry.fingerprint
+            && !existing.has_same_legacy_identity(&upgraded)
+        {
+            return Err(format!(
+                "cannot upgrade rekey manifest fingerprint for {} because the staged/target identity changed",
+                entry.filename
+            ));
+        }
+        entry.fingerprint = Some(upgraded);
         changed = true;
     }
     if changed {
         write_manifest(manifest_path, entries)?;
+    }
+    Ok(())
+}
+
+fn ensure_staging_unambiguous(
+    staging_dir: &std::path::Path,
+    entries: &[ManifestEntry],
+) -> Result<(), String> {
+    if !checked_exists(staging_dir)? {
+        return Ok(());
+    }
+    ensure_real_directory(staging_dir).map_err(|e| e.to_string())?;
+    let allowed: HashSet<&str> = entries
+        .iter()
+        .map(|entry| entry.filename.as_str())
+        .collect();
+    for entry in std::fs::read_dir(staging_dir)
+        .map_err(|e| format!("read staging directory {}: {e}", staging_dir.display()))?
+    {
+        let entry = entry.map_err(|e| format!("read staging entry: {e}"))?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            return Err(format!(
+                "rekey staging {} contains a non-UTF-8 entry; preserving it for reconciliation",
+                staging_dir.display()
+            ));
+        };
+        if !allowed.contains(name) {
+            return Err(format!(
+                "rekey staging {} contains unexpected provider/interrupted artifact {name:?}; preserving all recovery evidence",
+                staging_dir.display()
+            ));
+        }
     }
     Ok(())
 }
@@ -222,18 +308,31 @@ fn commit_manifest(
     staging_dir: &std::path::Path,
     entries: &[ManifestEntry],
 ) -> Result<(), String> {
+    if checked_exists(staging_dir)? {
+        ensure_real_directory(staging_dir).map_err(|e| e.to_string())?;
+    }
+    ensure_staging_unambiguous(staging_dir, entries)?;
     for entry in entries {
         let expected = entry
             .fingerprint
             .as_ref()
             .ok_or_else(|| format!("rekey manifest entry {} has no fingerprint", entry.filename))?;
+        if !expected.has_full_content_identity() {
+            return Err(format!(
+                "rekey manifest entry {} has no full-content fingerprint",
+                entry.filename
+            ));
+        }
+        let expected_len = expected.ciphertext_len().ok_or_else(|| {
+            format!(
+                "rekey manifest entry {} has a non-ciphertext fingerprint",
+                entry.filename
+            )
+        })?;
         let staged = staging_dir.join(&entry.filename);
         let target = base_path.join(&entry.filename);
-        if staged
-            .try_exists()
-            .map_err(|e| format!("check {}: {e}", staged.display()))?
-        {
-            if ciphertext_fingerprint(&staged)? != *expected {
+        if checked_exists(&staged)? {
+            if ciphertext_fingerprint_expected(&staged, expected_len)? != *expected {
                 return Err(format!(
                     "staged {} does not match its rekey manifest",
                     entry.filename
@@ -244,7 +343,7 @@ fn commit_manifest(
             sync_dir(staging_dir)?;
             sync_dir(base_path)?;
         } else {
-            let actual = ciphertext_fingerprint(&target).map_err(|e| {
+            let actual = ciphertext_fingerprint_expected(&target, expected_len).map_err(|e| {
                 format!(
                     "rekey entry {} is missing from staging and target does not verify: {e}",
                     entry.filename
@@ -262,7 +361,10 @@ fn commit_manifest(
 }
 
 fn cleanup_transaction(base_path: &std::path::Path) -> Result<(), String> {
-    remove_dir_if_exists(&base_path.join(STAGING))?;
+    // Every manifest entry has been moved out. A nonempty staging directory
+    // now means a provider/interrupted artifact appeared after the pre-scan;
+    // preserve it and the manifest instead of recursively deleting evidence.
+    remove_empty_dir_if_exists(&base_path.join(STAGING))?;
     remove_file_if_exists(&base_path.join(LOCK))?;
     // Keep the manifest until every other cleanup step succeeds. If cleanup is
     // interrupted, target fingerprints still prove that the commit completed.
@@ -270,42 +372,11 @@ fn cleanup_transaction(base_path: &std::path::Path) -> Result<(), String> {
     sync_dir(base_path)
 }
 
-#[cfg(unix)]
-fn pid_is_live(pid: u32) -> bool {
-    if pid > i32::MAX as u32 {
-        return false;
-    }
-    let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
-    result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-}
-
-#[cfg(not(unix))]
-fn pid_is_live(pid: u32) -> bool {
-    pid == std::process::id()
-}
-
-fn lock_owner_is_live(lock_path: &std::path::Path) -> Result<bool, String> {
-    if !lock_path
-        .try_exists()
-        .map_err(|e| format!("check {}: {e}", lock_path.display()))?
-    {
-        return Ok(false);
-    }
-    let value = std::fs::read_to_string(lock_path)
-        .map_err(|e| format!("read rekey lock {}: {e}", lock_path.display()))?;
-    let Ok(pid) = value.trim().parse::<u32>() else {
-        return Ok(false);
-    };
-    Ok(pid_is_live(pid))
-}
-
 fn acquire_rekey_lock(base_path: &std::path::Path) -> Result<(), String> {
     let lock_path = base_path.join(LOCK);
-    if lock_path
-        .try_exists()
-        .map_err(|e| format!("check {}: {e}", lock_path.display()))?
-    {
-        if lock_owner_is_live(&lock_path)? {
+    let lock_record = prepare_lock_owner("rekey")?;
+    if checked_exists(&lock_path)? {
+        if lock_owner_is_active(&lock_path, "rekey")? {
             return Err(format!(
                 "lock file exists at {} and its owner is still running",
                 lock_path.display()
@@ -324,8 +395,16 @@ fn acquire_rekey_lock(base_path: &std::path::Path) -> Result<(), String> {
         .write(true)
         .open(&lock_path)
         .map_err(|e| format!("create rekey lock {}: {e}", lock_path.display()))?;
-    write!(lock_file, "{}", std::process::id())
-        .map_err(|e| format!("write rekey lock {}: {e}", lock_path.display()))?;
+    if let Err(error) = write_lock_owner(&mut lock_file, &lock_record, &lock_path, "rekey") {
+        drop(lock_file);
+        let cleanup = remove_file_if_exists(&lock_path).and_then(|()| sync_dir(base_path));
+        return match cleanup {
+            Ok(()) => Err(error),
+            Err(cleanup_error) => Err(format!(
+                "{error}; additionally failed to remove the new incomplete lock: {cleanup_error}"
+            )),
+        };
+    }
     lock_file
         .sync_all()
         .map_err(|e| format!("sync rekey lock {}: {e}", lock_path.display()))?;
@@ -334,16 +413,9 @@ fn acquire_rekey_lock(base_path: &std::path::Path) -> Result<(), String> {
 
 fn cleanup_stale_staging_result(base_path: &std::path::Path) -> Result<(), String> {
     let staging_dir = base_path.join(STAGING);
-    if staging_dir
-        .try_exists()
-        .map_err(|e| format!("check {}: {e}", staging_dir.display()))?
-        && !base_path
-            .join(MANIFEST)
-            .try_exists()
-            .map_err(|e| format!("check rekey manifest: {e}"))?
-    {
+    if checked_exists(&staging_dir)? && !checked_exists(&base_path.join(MANIFEST))? {
         let lock_path = base_path.join(LOCK);
-        if lock_owner_is_live(&lock_path)? {
+        if lock_owner_is_active(&lock_path, "rekey")? {
             return Err(format!(
                 "refusing to clean staging owned by a live process ({})",
                 lock_path.display()
@@ -371,6 +443,7 @@ pub fn verify_staged_passphrase(
     base_path: &std::path::Path,
 ) -> Result<(), String> {
     let staging_dir = base_path.join(STAGING);
+    ensure_real_directory(&staging_dir).map_err(|e| e.to_string())?;
     let new_key = try_derive_existing_key_at(base_path, new_passphrase)?;
     let mut staged = Vec::new();
     for entry in std::fs::read_dir(&staging_dir).map_err(|e| e.to_string())? {
@@ -384,18 +457,31 @@ pub fn verify_staged_passphrase(
     if staged.is_empty() {
         return Err("no staged files found to verify".to_string());
     }
-    for (name, path) in staged {
-        let ciphertext = std::fs::read(path).map_err(|e| e.to_string())?;
-        let result = if name == INDEX_FILE {
-            decrypt_index(&new_key, &ciphertext)
-        } else {
-            decrypt_blob(&new_key, &name, &ciphertext)
-        };
-        result.map_err(|_| {
-            format!("staged file {name} was encrypted with a different passphrase or is corrupt")
-        })?;
+    let (name, path) = staged
+        .iter()
+        .find(|(name, _)| name == INDEX_FILE)
+        .or_else(|| {
+            staged.iter().min_by_key(|(_, path)| {
+                path.metadata()
+                    .map(|metadata| metadata.len())
+                    .unwrap_or(u64::MAX)
+            })
+        })
+        .expect("non-empty staged list");
+    let ciphertext = if name == INDEX_FILE {
+        read_index_ciphertext(path)
+    } else {
+        read_bounded_backing_file(path, MAX_PASSPHRASE_PROBE_LEN)
     }
-    Ok(())
+    .map_err(|e| format!("read staged {name}: {e}"))?;
+    let result = if name == INDEX_FILE {
+        decrypt_index_owned(&new_key, ciphertext)
+    } else {
+        decrypt_blob_owned(&new_key, name, ciphertext)
+    };
+    result.map(|_| ()).map_err(|_| {
+        format!("staged file {name} was encrypted with a different passphrase or is corrupt")
+    })
 }
 
 /// Complete an interrupted rekey by finishing the rename pass from the manifest.
@@ -414,17 +500,13 @@ pub fn recover_interrupted_rekey(base_path: &std::path::Path) -> bool {
 pub(crate) fn recover_interrupted_rekey_result(
     base_path: &std::path::Path,
 ) -> Result<bool, String> {
+    ensure_no_index_siblings(base_path)
+        .map_err(|e| format!("refuse rekey recovery while control metadata is ambiguous: {e}"))?;
     let manifest_path = base_path.join(MANIFEST);
-    if !manifest_path
-        .try_exists()
-        .map_err(|e| format!("check {}: {e}", manifest_path.display()))?
-    {
+    if !checked_exists(&manifest_path)? {
         let lock_path = base_path.join(LOCK);
-        if lock_path
-            .try_exists()
-            .map_err(|e| format!("check {}: {e}", lock_path.display()))?
-        {
-            if lock_owner_is_live(&lock_path)? {
+        if checked_exists(&lock_path)? {
+            if lock_owner_is_active(&lock_path, "rekey")? {
                 return Err(format!(
                     "refusing to clean rekey state owned by a live process ({})",
                     lock_path.display()
@@ -437,7 +519,7 @@ pub(crate) fn recover_interrupted_rekey_result(
     }
 
     let lock_path = base_path.join(LOCK);
-    if lock_owner_is_live(&lock_path)? {
+    if lock_owner_is_active(&lock_path, "rekey")? {
         return Err(format!(
             "refusing to recover rekey owned by a live process ({})",
             lock_path.display()
@@ -489,14 +571,25 @@ pub fn rekey(
     let lock_path = base_path.join(LOCK);
 
     let result = (|| -> Result<(), String> {
-        let old_key = try_derive_existing_key_at(base_path, old_passphrase)?;
-        let new_key = try_derive_existing_key_at(base_path, new_passphrase)?;
-        let index_ciphertext = std::fs::read(base_path.join(INDEX_FILE))
-            .map_err(|e| format!("read {INDEX_FILE}: {e}"))?;
-        let index_json = decrypt_index(&old_key, &index_ciphertext)
+        let (kdf, expected_kdf_fingerprint) =
+            load_kdf_with_fingerprint(base_path)?.ok_or_else(|| {
+                format!(
+                    "required KDF metadata {} is missing",
+                    base_path.join("_kdf.json").display()
+                )
+            })?;
+        let old_key = try_derive_key(old_passphrase, &kdf)?;
+        let new_key = try_derive_key(new_passphrase, &kdf)?;
+        let index_path = base_path.join(INDEX_FILE);
+        let index_ciphertext =
+            read_index_ciphertext(&index_path).map_err(|e| format!("read {INDEX_FILE}: {e}"))?;
+        let expected_index_fingerprint = ciphertext_bytes_fingerprint(&index_ciphertext)?;
+        let index_json = decrypt_index_owned(&old_key, index_ciphertext)
             .map_err(|_| "failed to decrypt _index.age - wrong passphrase?".to_string())?;
         let index: DiskIndex =
             serde_json::from_slice(&index_json).map_err(|e| format!("parse index: {e}"))?;
+        validate_disk_index(&index)
+            .map_err(|error| format!("refuse rekey of structurally invalid index: {error}"))?;
         let mut disk_files: Vec<IndexedBlob> = index
             .inodes
             .values()
@@ -512,34 +605,44 @@ pub fn rekey(
         let staging_dir = base_path.join(STAGING);
         std::fs::create_dir_all(&staging_dir)
             .map_err(|e| format!("create {}: {e}", staging_dir.display()))?;
+        ensure_real_directory(&staging_dir).map_err(|e| e.to_string())?;
         sync_dir(base_path)?;
         let total = disk_files.len() + 1;
         let mut skipped = 0usize;
+        let mut staged_blob_fingerprints = Vec::with_capacity(disk_files.len());
         for (i, blob) in disk_files.iter().enumerate() {
             let filename = &blob.filename;
-            let current = match std::fs::read(base_path.join(filename)) {
+            let current = match read_v1_blob_ciphertext(&base_path.join(filename), blob.size) {
                 Ok(current) => Some(current),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound && blob.size == 0 => None,
                 Err(e) => return Err(format!("read {filename}: {e}")),
             };
             let plaintext = match current {
-                Some(current) => decrypt_blob(&old_key, filename, &current)
+                Some(current) => decrypt_blob_owned(&old_key, filename, current)
                     .map_err(|_| format!("failed to decrypt {filename} - data may be corrupted"))?,
                 None => Vec::new(),
             };
             let staged_path = staging_dir.join(filename);
             if resume && checked_exists(&staged_path)? {
-                let staged = std::fs::read(&staged_path)
+                let staged = read_v1_blob_ciphertext(&staged_path, blob.size)
                     .map_err(|e| format!("read staged {filename}: {e}"))?;
-                if decrypt_blob(&new_key, filename, &staged).ok().as_deref()
+                let staged_fingerprint = ciphertext_bytes_fingerprint(&staged)?;
+                if decrypt_blob_owned(&new_key, filename, staged)
+                    .ok()
+                    .as_deref()
                     == Some(plaintext.as_slice())
                 {
+                    staged_blob_fingerprints.push((filename.clone(), staged_fingerprint));
                     skipped += 1;
                     continue;
                 }
             }
-            let new_ciphertext = encrypt_blob(&new_key, filename, &plaintext)?;
+            let new_ciphertext = encrypt_blob_owned(&new_key, filename, plaintext)?;
             durable_write_checked(&staged_path, &new_ciphertext)?;
+            staged_blob_fingerprints.push((
+                filename.clone(),
+                ciphertext_bytes_fingerprint(&new_ciphertext)?,
+            ));
             eprintln!(
                 "zerotrust-drive: [{}/{}] re-encrypted {}",
                 i + 1,
@@ -554,9 +657,9 @@ pub fn rekey(
         let staged_index = staging_dir.join(INDEX_FILE);
         let reuse_staged_index = resume
             && checked_exists(&staged_index)?
-            && std::fs::read(&staged_index)
+            && read_index_ciphertext(&staged_index)
                 .ok()
-                .and_then(|bytes| decrypt_index(&new_key, &bytes).ok())
+                .and_then(|bytes| decrypt_index_owned(&new_key, bytes).ok())
                 .as_deref()
                 == Some(index_json.as_slice());
         if !reuse_staged_index {
@@ -564,21 +667,37 @@ pub fn rekey(
             eprintln!("zerotrust-drive: [{total}/{total}] re-encrypted {INDEX_FILE}");
         }
 
-        let manifest: Vec<ManifestEntry> = disk_files
-            .iter()
-            .map(|blob| blob.filename.clone())
-            .chain(std::iter::once(INDEX_FILE.to_string()))
-            .map(|filename| {
-                let fingerprint = ciphertext_fingerprint(&staging_dir.join(&filename))?;
-                Ok(ManifestEntry {
-                    filename,
-                    renamed: false,
-                    fingerprint: Some(fingerprint),
-                })
+        let mut manifest: Vec<ManifestEntry> = staged_blob_fingerprints
+            .into_iter()
+            .map(|(filename, fingerprint)| ManifestEntry {
+                filename,
+                renamed: false,
+                fingerprint: Some(fingerprint),
             })
-            .collect::<Result<_, String>>()?;
+            .collect();
+        manifest.push(ManifestEntry {
+            filename: INDEX_FILE.to_string(),
+            renamed: false,
+            fingerprint: Some(ciphertext_fingerprint_bounded(
+                &staging_dir.join(INDEX_FILE),
+                MAX_INDEX_CIPHERTEXT_LEN,
+            )?),
+        });
         validate_manifest(&manifest)?;
-        write_manifest(&base_path.join(MANIFEST), &manifest)?;
+        ensure_no_index_siblings(base_path).map_err(|e| format!("refuse rekey commit: {e}"))?;
+        if ciphertext_fingerprint_bounded(&index_path, MAX_INDEX_CIPHERTEXT_LEN)?
+            != expected_index_fingerprint
+        {
+            return Err(
+                "encrypted index changed during rekey staging; refusing to commit".to_string(),
+            );
+        }
+        if exact_fingerprint(&base_path.join("_kdf.json"))? != expected_kdf_fingerprint {
+            return Err(
+                "KDF metadata changed during rekey staging; refusing to commit".to_string(),
+            );
+        }
+        create_manifest(&base_path.join(MANIFEST), &manifest)?;
         commit_manifest(base_path, &staging_dir, &manifest)?;
         cleanup_transaction(base_path)?;
         Ok(())
@@ -627,7 +746,7 @@ fn clean_online_precommit_and_restore_writes(
     resume: bool,
 ) {
     match clean_online_precommit(base_path, resume) {
-        Ok(()) => inner.read_only.store(false, Ordering::SeqCst),
+        Ok(()) => inner.restore_writes_if_healthy(),
         Err(e) => eprintln!(
             "zerotrust-drive: ERROR: pre-commit cleanup failed; filesystem remains read-only: {e}"
         ),
@@ -658,11 +777,61 @@ fn prepare_online_snapshot(
     let open_files = inner
         .open_files
         .read()
-        .map_err(|_| "open-file lock is poisoned".to_string())?
-        .clone();
+        .map_err(|_| "open-file lock is poisoned".to_string())?;
+    let dirty_inodes = inner.dirty_inode_snapshot()?;
 
     eprintln!("zerotrust-drive: flushing open files before re-encryption...");
-    for (ino, content) in &open_files {
+    // Validate every open buffer before replacing the first base blob. A
+    // later mismatch must not strand an earlier blob under the old index.
+    for (ino, content) in open_files.iter() {
+        let entry = state
+            .inodes
+            .get(ino)
+            .ok_or_else(|| format!("open inode {ino} is missing from the index"))?;
+        if entry.kind != InodeKind::File || entry.disk_filename.is_empty() {
+            return Err(format!("open inode {ino} has no valid backing filename"));
+        }
+        if content.len() as u64 != entry.size {
+            return Err(format!(
+                "open inode {ino} has {} buffered bytes but records {}",
+                content.len(),
+                entry.size
+            ));
+        }
+    }
+    for ino in &dirty_inodes {
+        if !open_files.contains_key(ino) {
+            return Err(format!(
+                "dirty inode {ino} has no open plaintext buffer during rekey snapshot"
+            ));
+        }
+    }
+    let mut disk_files: Vec<IndexedBlob> = state
+        .inodes
+        .values()
+        .filter(|entry| entry.kind == InodeKind::File && !entry.disk_filename.is_empty())
+        .map(|entry| IndexedBlob {
+            filename: entry.disk_filename.clone(),
+            size: entry.size,
+        })
+        .collect();
+    disk_files.sort_by(|a, b| a.filename.cmp(&b.filename));
+    validate_disk_files(&disk_files)?;
+
+    // Prepare the matching index before replacing the first open-file blob.
+    // Serialization, size bounds, or index encryption must fail while the
+    // complete old generation is still intact.
+    let index_json =
+        serialize_index_bounded(&state).map_err(|e| format!("serialize index: {e}"))?;
+    ensure_index_plaintext_within_limit(index_json.len())
+        .map_err(|e| format!("refuse rekey snapshot: {e}"))?;
+    let encrypted_index = encrypt_index(&current_key, &index_json)?;
+    let index_fingerprint = ciphertext_bytes_fingerprint(&encrypted_index)?;
+
+    for (ino, content) in open_files.iter() {
+        if !dirty_inodes.contains(ino) {
+            continue;
+        }
         if let Some(entry) = state.inodes.get(ino)
             && !entry.disk_filename.is_empty()
         {
@@ -670,9 +839,9 @@ fn prepare_online_snapshot(
             durable_write_checked(&inner.base_path.join(&entry.disk_filename), &encrypted)?;
         }
     }
-    let index_json = serde_json::to_vec(&state).map_err(|e| format!("serialize index: {e}"))?;
-    let encrypted_index = encrypt_index(&current_key, &index_json)?;
-    let index_fingerprint = ciphertext_bytes_fingerprint(&encrypted_index)?;
+    inner
+        .ensure_index_unchanged()
+        .map_err(|e| format!("refuse rekey snapshot index replacement: {e}"))?;
     durable_write_checked(&inner.base_path.join(INDEX_FILE), &encrypted_index)?;
     *inner
         .index_fingerprint
@@ -688,17 +857,6 @@ fn prepare_online_snapshot(
     }
     inner.clear_persisted_maintenance_state()?;
 
-    let mut disk_files: Vec<IndexedBlob> = state
-        .inodes
-        .values()
-        .filter(|entry| entry.kind == InodeKind::File && !entry.disk_filename.is_empty())
-        .map(|entry| IndexedBlob {
-            filename: entry.disk_filename.clone(),
-            size: entry.size,
-        })
-        .collect();
-    disk_files.sort_by(|a, b| a.filename.cmp(&b.filename));
-    validate_disk_files(&disk_files)?;
     Ok(RekeySnapshot {
         old_key,
         new_key,
@@ -715,6 +873,7 @@ fn stage_online_rekey(
     let staging_dir = base_path.join(STAGING);
     std::fs::create_dir_all(&staging_dir)
         .map_err(|e| format!("create {}: {e}", staging_dir.display()))?;
+    ensure_real_directory(&staging_dir).map_err(|e| e.to_string())?;
     sync_dir(base_path)?;
     let total = snapshot.disk_files.len() + 1;
     eprintln!(
@@ -723,35 +882,38 @@ fn stage_online_rekey(
     );
 
     let mut skipped = 0usize;
+    let mut staged_blob_fingerprints = Vec::with_capacity(snapshot.disk_files.len());
     for (i, blob) in snapshot.disk_files.iter().enumerate() {
         let filename = &blob.filename;
-        let ciphertext = match std::fs::read(base_path.join(filename)) {
+        let ciphertext = match read_v1_blob_ciphertext(&base_path.join(filename), blob.size) {
             Ok(ciphertext) => Some(ciphertext),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound && blob.size == 0 => None,
             Err(e) => return Err(format!("read {filename}: {e}")),
         };
         let plaintext = match ciphertext {
-            Some(ciphertext) => decrypt_blob(&snapshot.old_key, filename, &ciphertext)
+            Some(ciphertext) => decrypt_blob_owned(&snapshot.old_key, filename, ciphertext)
                 .map_err(|_| format!("failed to decrypt {filename} - data may be corrupted"))?,
             None => Vec::new(),
         };
         let staged_path = staging_dir.join(filename);
         if resume && checked_exists(&staged_path)? {
-            let staged =
-                std::fs::read(&staged_path).map_err(|e| format!("read staged {filename}: {e}"))?;
-            if decrypt_blob(&snapshot.new_key, filename, &staged)
+            let staged = read_v1_blob_ciphertext(&staged_path, blob.size)
+                .map_err(|e| format!("read staged {filename}: {e}"))?;
+            let staged_fingerprint = ciphertext_bytes_fingerprint(&staged)?;
+            if decrypt_blob_owned(&snapshot.new_key, filename, staged)
                 .ok()
                 .as_deref()
                 == Some(plaintext.as_slice())
             {
+                staged_blob_fingerprints.push((filename.clone(), staged_fingerprint));
                 skipped += 1;
                 continue;
             }
         }
-        durable_write_checked(
-            &staged_path,
-            &encrypt_blob(&snapshot.new_key, filename, &plaintext)?,
-        )?;
+        let encrypted = encrypt_blob_owned(&snapshot.new_key, filename, plaintext)?;
+        durable_write_checked(&staged_path, &encrypted)?;
+        staged_blob_fingerprints
+            .push((filename.clone(), ciphertext_bytes_fingerprint(&encrypted)?));
         eprintln!(
             "zerotrust-drive: [{}/{}] re-encrypted {}",
             i + 1,
@@ -766,9 +928,9 @@ fn stage_online_rekey(
     let staged_index = staging_dir.join(INDEX_FILE);
     let reuse_staged_index = resume
         && checked_exists(&staged_index)?
-        && std::fs::read(&staged_index)
+        && read_index_ciphertext(&staged_index)
             .ok()
-            .and_then(|bytes| decrypt_index(&snapshot.new_key, &bytes).ok())
+            .and_then(|bytes| decrypt_index_owned(&snapshot.new_key, bytes).ok())
             .as_deref()
             == Some(snapshot.index_json.as_slice());
     if !reuse_staged_index {
@@ -779,20 +941,22 @@ fn stage_online_rekey(
         eprintln!("zerotrust-drive: [{total}/{total}] re-encrypted {INDEX_FILE}");
     }
 
-    let manifest: Vec<ManifestEntry> = snapshot
-        .disk_files
-        .iter()
-        .map(|blob| blob.filename.clone())
-        .chain(std::iter::once(INDEX_FILE.to_string()))
-        .map(|filename| {
-            let fingerprint = ciphertext_fingerprint(&staging_dir.join(&filename))?;
-            Ok(ManifestEntry {
-                filename,
-                renamed: false,
-                fingerprint: Some(fingerprint),
-            })
+    let mut manifest: Vec<ManifestEntry> = staged_blob_fingerprints
+        .into_iter()
+        .map(|(filename, fingerprint)| ManifestEntry {
+            filename,
+            renamed: false,
+            fingerprint: Some(fingerprint),
         })
-        .collect::<Result<_, String>>()?;
+        .collect();
+    manifest.push(ManifestEntry {
+        filename: INDEX_FILE.to_string(),
+        renamed: false,
+        fingerprint: Some(ciphertext_fingerprint_bounded(
+            &staging_dir.join(INDEX_FILE),
+            MAX_INDEX_CIPHERTEXT_LEN,
+        )?),
+    });
     validate_manifest(&manifest)?;
     Ok(manifest)
 }
@@ -823,14 +987,14 @@ pub fn rekey_online(
     let staging_exists = match checked_exists(&base_path.join(STAGING)) {
         Ok(exists) => exists,
         Err(e) => {
-            inner.read_only.store(false, Ordering::SeqCst);
+            inner.restore_writes_if_healthy();
             eprintln!("zerotrust-drive: error: cannot inspect rekey staging - {e}");
             return;
         }
     };
     if resume && staging_exists {
         if let Err(e) = verify_staged_passphrase(new_passphrase, base_path) {
-            inner.read_only.store(false, Ordering::SeqCst);
+            inner.restore_writes_if_healthy();
             eprintln!("zerotrust-drive: error: cannot resume - {e}");
             return;
         }
@@ -844,7 +1008,20 @@ pub fn rekey_online(
         eprintln!("zerotrust-drive: error: cannot acquire rekey lock - {e}");
         return;
     }
-    let old_key = match try_derive_existing_key_at(base_path, old_passphrase) {
+    let loaded_kdf = match load_kdf_with_fingerprint(base_path) {
+        Ok(Some((kdf, _fingerprint))) => kdf,
+        Ok(None) => {
+            clean_online_precommit_and_restore_writes(base_path, inner, resume);
+            eprintln!("zerotrust-drive: error: required KDF metadata is missing");
+            return;
+        }
+        Err(e) => {
+            clean_online_precommit_and_restore_writes(base_path, inner, resume);
+            eprintln!("zerotrust-drive: error: cannot load KDF metadata - {e}");
+            return;
+        }
+    };
+    let old_key = match try_derive_key(old_passphrase, &loaded_kdf) {
         Ok(key) => key,
         Err(e) => {
             clean_online_precommit_and_restore_writes(base_path, inner, resume);
@@ -852,7 +1029,7 @@ pub fn rekey_online(
             return;
         }
     };
-    let new_key = match try_derive_existing_key_at(base_path, new_passphrase) {
+    let new_key = match try_derive_key(new_passphrase, &loaded_kdf) {
         Ok(key) => key,
         Err(e) => {
             clean_online_precommit_and_restore_writes(base_path, inner, resume);
@@ -920,18 +1097,22 @@ pub fn rekey_online(
             {
                 return Err("filesystem key changed during rekey staging".to_string());
             }
-            let current_index = serde_json::to_vec(
-                &*inner
-                    .state
-                    .read()
-                    .map_err(|_| "filesystem state lock is poisoned".to_string())?,
-            )
-            .map_err(|e| format!("serialize current index: {e}"))?;
+            let state = inner
+                .state
+                .read()
+                .map_err(|_| "filesystem state lock is poisoned".to_string())?;
+            let current_index = serialize_index_bounded(&state)
+                .map_err(|e| format!("serialize current index: {e}"))?;
+            drop(state);
             if current_index != snapshot.index_json {
                 return Err("filesystem state changed during read-only rekey staging".to_string());
             }
 
-            write_manifest(&base_path.join(MANIFEST), &manifest)?;
+            inner
+                .ensure_index_unchanged()
+                .map_err(|e| format!("refuse rekey commit: {e}"))?;
+
+            create_manifest(&base_path.join(MANIFEST), &manifest)?;
             crossed_commit_point = true;
             commit_manifest(base_path, &base_path.join(STAGING), &manifest)?;
             *inner
@@ -942,7 +1123,10 @@ pub fn rekey_online(
                 .index_fingerprint
                 .lock()
                 .map_err(|_| "index fingerprint lock is poisoned".to_string())? =
-                Some(ciphertext_fingerprint(&base_path.join(INDEX_FILE))?);
+                Some(ciphertext_fingerprint_bounded(
+                    &base_path.join(INDEX_FILE),
+                    MAX_INDEX_CIPHERTEXT_LEN,
+                )?);
             if let Ok(metadata) = std::fs::metadata(base_path.join(INDEX_FILE))
                 && let Ok(mtime) = metadata.modified()
             {
@@ -974,7 +1158,7 @@ pub fn rekey_online(
         return;
     }
 
-    inner.read_only.store(false, Ordering::SeqCst);
+    inner.restore_writes_if_healthy();
     eprintln!("zerotrust-drive: passphrase rotation complete - filesystem is read-write again");
     eprintln!("zerotrust-drive: all files are now encrypted with the new passphrase");
     eprintln!("zerotrust-drive: remember to update ZEROTRUST_PASSPHRASE before next mount");
@@ -985,9 +1169,18 @@ mod tests {
     use super::*;
     use crate::crypto::derive_key_at;
     use crate::fs::{DirChild, InodeEntry, InodeKind, ZeroTrustFs};
+    use crate::transaction_lock::local_lock_record_for_test;
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::Ordering;
+
+    fn legacy_ciphertext_fingerprint(path: &std::path::Path) -> RecoveryFingerprint {
+        let mut fingerprint = ciphertext_fingerprint(path).unwrap();
+        if let RecoveryFingerprint::Ciphertext { digest, .. } = &mut fingerprint {
+            *digest = None;
+        }
+        fingerprint
+    }
 
     #[test]
     fn rekey_basic() {
@@ -1131,6 +1324,36 @@ mod tests {
     }
 
     #[test]
+    fn committed_rekey_refuses_unexpected_staging_artifacts() {
+        let dir = PathBuf::from("target/test-rekey-staging-conflict");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join(STAGING)).unwrap();
+        let conflict = dir.join(STAGING).join("000001 (conflicted copy).age");
+        fs::write(&conflict, b"provider artifact").unwrap();
+
+        let error = commit_manifest(&dir, &dir.join(STAGING), &[]).unwrap_err();
+        assert!(error.contains("unexpected provider/interrupted artifact"));
+        assert!(conflict.exists());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn committed_rekey_cleanup_preserves_late_staging_artifact_and_manifest() {
+        let dir = PathBuf::from("target/test-rekey-late-staging-conflict");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join(STAGING)).unwrap();
+        fs::write(dir.join(STAGING).join("late-conflict"), b"evidence").unwrap();
+        fs::write(dir.join(MANIFEST), b"manifest evidence").unwrap();
+        fs::write(dir.join(LOCK), b"lock evidence").unwrap();
+
+        assert!(cleanup_transaction(&dir).is_err());
+        assert!(dir.join(STAGING).join("late-conflict").exists());
+        assert!(dir.join(MANIFEST).exists());
+        assert!(dir.join(LOCK).exists());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn recover_interrupted_rekey_test() {
         let dir = PathBuf::from("target/test-recover-rekey");
         let _ = fs::remove_dir_all(&dir);
@@ -1170,7 +1393,7 @@ mod tests {
             serde_json::to_vec(&manifest).unwrap(),
         )
         .unwrap();
-        fs::write(dir.join(LOCK), u32::MAX.to_string()).unwrap();
+        fs::write(dir.join(LOCK), local_lock_record_for_test(i32::MAX as u32)).unwrap();
 
         let recovered = recover_interrupted_rekey(&dir);
         assert!(recovered);
@@ -1218,18 +1441,18 @@ mod tests {
             ManifestEntry {
                 filename: "000001.age".to_string(),
                 renamed: false,
-                fingerprint: Some(ciphertext_fingerprint(&dir.join("000001.age")).unwrap()),
+                fingerprint: Some(legacy_ciphertext_fingerprint(&dir.join("000001.age"))),
             },
             ManifestEntry {
                 filename: INDEX_FILE.to_string(),
                 renamed: false,
-                fingerprint: Some(
-                    ciphertext_fingerprint(&dir.join(STAGING).join(INDEX_FILE)).unwrap(),
-                ),
+                fingerprint: Some(legacy_ciphertext_fingerprint(
+                    &dir.join(STAGING).join(INDEX_FILE),
+                )),
             },
         ];
         fs::write(dir.join(MANIFEST), serde_json::to_vec(&manifest).unwrap()).unwrap();
-        fs::write(dir.join(LOCK), u32::MAX.to_string()).unwrap();
+        fs::write(dir.join(LOCK), local_lock_record_for_test(i32::MAX as u32)).unwrap();
 
         assert_eq!(recover_interrupted_rekey_result(&dir), Ok(true));
         assert_eq!(
@@ -1246,6 +1469,74 @@ mod tests {
             b"new-index"
         );
         assert!(!dir.join(MANIFEST).exists());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn legacy_renamed_entry_never_prefers_resurrected_staging_content() {
+        let dir = PathBuf::from("target/test-rekey-renamed-stale-staging");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join(STAGING)).unwrap();
+        let key = derive_key_at(&dir, "new-passphrase");
+        let committed = encrypt_blob(&key, "000001.age", b"committed").unwrap();
+        let resurrected = encrypt_blob(&key, "000001.age", b"stale-copy").unwrap();
+        let index = encrypt_index(&key, b"new-index").unwrap();
+        fs::write(dir.join("000001.age"), &committed).unwrap();
+        fs::write(dir.join(STAGING).join("000001.age"), &resurrected).unwrap();
+        fs::write(dir.join(STAGING).join(INDEX_FILE), &index).unwrap();
+        let manifest = vec![
+            ManifestEntry {
+                filename: "000001.age".to_string(),
+                renamed: true,
+                fingerprint: None,
+            },
+            ManifestEntry {
+                filename: INDEX_FILE.to_string(),
+                renamed: false,
+                fingerprint: None,
+            },
+        ];
+        fs::write(dir.join(MANIFEST), serde_json::to_vec(&manifest).unwrap()).unwrap();
+        fs::write(dir.join(LOCK), local_lock_record_for_test(i32::MAX as u32)).unwrap();
+
+        let error = recover_interrupted_rekey_result(&dir).unwrap_err();
+        assert!(!error.is_empty());
+        assert_eq!(fs::read(dir.join("000001.age")).unwrap(), committed);
+        assert!(dir.join(STAGING).join("000001.age").exists());
+        assert!(dir.join(MANIFEST).exists());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn recovery_accepts_fully_committed_manifest_after_staging_cleanup() {
+        let dir = PathBuf::from("target/test-rekey-recover-after-staging-cleanup");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let key = derive_key_at(&dir, "new-passphrase");
+        let blob = encrypt_blob(&key, "000001.age", b"committed").unwrap();
+        let index = encrypt_index(&key, b"committed-index").unwrap();
+        fs::write(dir.join("000001.age"), &blob).unwrap();
+        fs::write(dir.join(INDEX_FILE), &index).unwrap();
+        let manifest = vec![
+            ManifestEntry {
+                filename: "000001.age".to_string(),
+                renamed: false,
+                fingerprint: Some(ciphertext_bytes_fingerprint(&blob).unwrap()),
+            },
+            ManifestEntry {
+                filename: INDEX_FILE.to_string(),
+                renamed: false,
+                fingerprint: Some(ciphertext_bytes_fingerprint(&index).unwrap()),
+            },
+        ];
+        fs::write(dir.join(MANIFEST), serde_json::to_vec(&manifest).unwrap()).unwrap();
+        fs::write(dir.join(LOCK), local_lock_record_for_test(i32::MAX as u32)).unwrap();
+
+        assert_eq!(recover_interrupted_rekey_result(&dir), Ok(true));
+        assert_eq!(fs::read(dir.join("000001.age")).unwrap(), blob);
+        assert_eq!(fs::read(dir.join(INDEX_FILE)).unwrap(), index);
+        assert!(!dir.join(MANIFEST).exists());
+        assert!(!dir.join(LOCK).exists());
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -1432,7 +1723,10 @@ mod tests {
         assert_eq!(fs::read(dir.join(INDEX_FILE)).unwrap(), external_index);
         assert_eq!(*ztfs.inner.key.read().unwrap(), old_key);
         assert!(!dir.join(MANIFEST).exists());
-        assert!(!ztfs.inner.read_only.load(Ordering::SeqCst));
+        assert!(
+            ztfs.inner.read_only.load(Ordering::SeqCst),
+            "a detected external generation must stay latched read-only until remount"
+        );
 
         // Avoid a noisy conflict retry from Drop after the assertion target is
         // removed; no dirty state is pending.
@@ -1528,7 +1822,7 @@ mod tests {
                         name: format!("file{i}.txt"),
                         kind: InodeKind::File,
                         disk_filename: df.clone(),
-                        size: 5,
+                        size: 3,
                         perm: 0o644,
                         uid: 501,
                         gid: 20,
@@ -1558,7 +1852,7 @@ mod tests {
         let pt = decrypt_blob(&old_key, "000001.age", &ct).unwrap();
         let new_ct = encrypt_blob(&new_key, "000001.age", &pt).unwrap();
         fs::write(staging_dir.join("000001.age"), &new_ct).unwrap();
-        fs::write(dir.join(LOCK), u32::MAX.to_string()).unwrap();
+        fs::write(dir.join(LOCK), local_lock_record_for_test(i32::MAX as u32)).unwrap();
 
         assert!(verify_staged_passphrase(new_pw, &dir).is_ok());
         assert!(verify_staged_passphrase("wrong-pw", &dir).is_err());
@@ -1628,7 +1922,7 @@ mod tests {
                     name: "file.txt".to_string(),
                     kind: InodeKind::File,
                     disk_filename: df.clone(),
-                    size: 5,
+                    size: 4,
                     perm: 0o644,
                     uid: 501,
                     gid: 20,
@@ -1673,23 +1967,23 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let lock = dir.join(LOCK);
 
-        fs::write(&lock, u32::MAX.to_string()).unwrap();
+        fs::write(&lock, local_lock_record_for_test(i32::MAX as u32)).unwrap();
         acquire_rekey_lock(&dir).unwrap();
         assert_eq!(
-            fs::read_to_string(&lock).unwrap(),
-            std::process::id().to_string()
+            fs::read(&lock).unwrap(),
+            local_lock_record_for_test(std::process::id())
         );
         remove_file_if_exists(&lock).unwrap();
 
-        fs::write(&lock, std::process::id().to_string()).unwrap();
+        fs::write(&lock, local_lock_record_for_test(std::process::id())).unwrap();
         assert!(
             acquire_rekey_lock(&dir)
                 .unwrap_err()
                 .contains("still running")
         );
         assert_eq!(
-            fs::read_to_string(&lock).unwrap(),
-            std::process::id().to_string()
+            fs::read(&lock).unwrap(),
+            local_lock_record_for_test(std::process::id())
         );
         fs::create_dir_all(dir.join(STAGING)).unwrap();
         fs::write(dir.join(STAGING).join("000001.age"), b"active staging").unwrap();
@@ -1795,11 +2089,7 @@ mod tests {
             ManifestEntry {
                 filename: INDEX_FILE.to_string(),
                 renamed: false,
-                fingerprint: Some(RecoveryFingerprint::Ciphertext {
-                    len: expected_missing_index.len() as u64,
-                    nonce: expected_missing_index[..24].to_vec(),
-                    tag: expected_missing_index[expected_missing_index.len() - 16..].to_vec(),
-                }),
+                fingerprint: Some(ciphertext_bytes_fingerprint(&expected_missing_index).unwrap()),
             },
         ];
         fs::write(
@@ -1807,7 +2097,7 @@ mod tests {
             serde_json::to_vec(&manifest).unwrap(),
         )
         .unwrap();
-        fs::write(dir.join(LOCK), u32::MAX.to_string()).unwrap();
+        fs::write(dir.join(LOCK), local_lock_record_for_test(i32::MAX as u32)).unwrap();
 
         let recovered = recover_interrupted_rekey(&dir);
         assert!(

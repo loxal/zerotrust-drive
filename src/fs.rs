@@ -3,11 +3,12 @@
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs;
-use std::path::PathBuf;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use fuser::{
     FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo, ReplyAttr,
@@ -17,8 +18,9 @@ use fuser::{
 use serde::{Deserialize, Serialize};
 
 use crate::crypto::{
-    RecoveryFingerprint, ciphertext_bytes_fingerprint, ciphertext_fingerprint, decrypt_blob,
-    decrypt_index, encrypt_blob, encrypt_index,
+    LEGACY_CIPHERTEXT_OVERHEAD, RecoveryFingerprint, V1_CIPHERTEXT_OVERHEAD,
+    ciphertext_bytes_fingerprint, ciphertext_fingerprint_bounded, decrypt_blob_owned,
+    decrypt_index_owned, encrypt_blob, encrypt_blob_owned, encrypt_index_owned, exact_fingerprint,
 };
 
 macro_rules! trace {
@@ -32,7 +34,33 @@ macro_rules! trace {
 const TTL: Duration = Duration::from_secs(1);
 const BLKSIZE: u32 = 4096;
 const NAME_MAX: usize = 255;
+const INDEX_FILE: &str = "_index.age";
+const MAX_INDEX_CIPHERTEXT_LEN: u64 = 64 * 1024 * 1024;
+const MAX_INDEX_PLAINTEXT_LEN: u64 = MAX_INDEX_CIPHERTEXT_LEN - V1_CIPHERTEXT_OVERHEAD;
+const DEBOUNCE_QUIET_INTERVAL: Duration = Duration::from_secs(5);
+const MAX_DIRTY_INTERVAL: Duration = Duration::from_secs(30);
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy, Debug)]
+struct DirtyTiming {
+    first: Instant,
+    last: Instant,
+}
+
+impl DirtyTiming {
+    fn new(now: Instant) -> Self {
+        Self {
+            first: now,
+            last: now,
+        }
+    }
+
+    fn next_wait(self, now: Instant) -> Duration {
+        let quiet = (self.last + DEBOUNCE_QUIET_INTERVAL).saturating_duration_since(now);
+        let maximum = (self.first + MAX_DIRTY_INTERVAL).saturating_duration_since(now);
+        quiet.min(maximum)
+    }
+}
 
 // --- Persistent index ---
 
@@ -72,10 +100,285 @@ pub(crate) struct DiskIndex {
     pub children: HashMap<u64, Vec<DirChild>>,
 }
 
+fn index_allocation_error(what: &str) -> String {
+    format!("cannot allocate while validating encrypted index {what}")
+}
+
+fn validate_index_name(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.bytes().any(|byte| byte == b'/' || byte == 0)
+}
+
+fn canonical_blob_id(filename: &str) -> Option<u64> {
+    let hex = filename.strip_suffix(".age")?;
+    if !(6..=16).contains(&hex.len())
+        || !hex
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return None;
+    }
+    let id = u64::from_str_radix(hex, 16).ok()?;
+    (id > 0 && format!("{id:06x}.age") == filename).then_some(id)
+}
+
+pub(crate) fn validate_disk_index(index: &DiskIndex) -> Result<(), String> {
+    if index.inodes.contains_key(&0) {
+        return Err("encrypted index contains reserved inode 0".to_string());
+    }
+    let root = index
+        .inodes
+        .get(&1)
+        .ok_or_else(|| "encrypted index is missing root inode 1".to_string())?;
+    if root.kind != InodeKind::Directory
+        || !root.name.is_empty()
+        || root.parent != 1
+        || !root.disk_filename.is_empty()
+    {
+        return Err("encrypted index root inode is malformed".to_string());
+    }
+    let max_inode = index.inodes.keys().copied().max().unwrap_or(1);
+    if index.next_inode < 2 || index.next_inode <= max_inode || index.next_inode == u64::MAX {
+        return Err(format!(
+            "encrypted index has unsafe next_inode {} for maximum live inode {max_inode}",
+            index.next_inode
+        ));
+    }
+
+    let mut blob_filenames = HashSet::new();
+    blob_filenames
+        .try_reserve(index.inodes.len())
+        .map_err(|_| index_allocation_error("blob set"))?;
+    let mut max_blob_id = 0u64;
+    for (&inode, entry) in &index.inodes {
+        if inode != 1 && !validate_index_name(&entry.name) {
+            return Err(format!(
+                "encrypted index inode {inode} has an invalid name component"
+            ));
+        }
+        match entry.kind {
+            InodeKind::Directory => {
+                if !entry.disk_filename.is_empty() {
+                    return Err(format!(
+                        "encrypted index directory inode {inode} has a blob filename"
+                    ));
+                }
+            }
+            InodeKind::File => {
+                let blob_id = canonical_blob_id(&entry.disk_filename).ok_or_else(|| {
+                    format!(
+                        "encrypted index file inode {inode} has invalid blob filename {:?}",
+                        entry.disk_filename
+                    )
+                })?;
+                if !blob_filenames.insert(entry.disk_filename.as_str()) {
+                    return Err(format!(
+                        "encrypted index maps more than one inode to blob {}",
+                        entry.disk_filename
+                    ));
+                }
+                max_blob_id = max_blob_id.max(blob_id);
+            }
+        }
+    }
+    if index.next_file_id < 1 || index.next_file_id <= max_blob_id || index.next_file_id == u64::MAX
+    {
+        return Err(format!(
+            "encrypted index has unsafe next_file_id {} for maximum live blob id {max_blob_id}",
+            index.next_file_id
+        ));
+    }
+
+    let mut referenced = HashSet::new();
+    referenced
+        .try_reserve(index.inodes.len())
+        .map_err(|_| index_allocation_error("reference set"))?;
+    for (&parent, children) in &index.children {
+        let parent_entry = index
+            .inodes
+            .get(&parent)
+            .ok_or_else(|| format!("encrypted index has children for missing inode {parent}"))?;
+        if parent_entry.kind != InodeKind::Directory {
+            return Err(format!(
+                "encrypted index file inode {parent} owns a child list"
+            ));
+        }
+        let mut names = HashSet::new();
+        names
+            .try_reserve(children.len())
+            .map_err(|_| index_allocation_error("directory-name set"))?;
+        for child in children {
+            if !validate_index_name(&child.name) {
+                return Err(format!(
+                    "encrypted index directory inode {parent} has an invalid child name"
+                ));
+            }
+            if !names.insert(child.name.as_str()) {
+                return Err(format!(
+                    "encrypted index directory inode {parent} has duplicate child name {:?}",
+                    child.name
+                ));
+            }
+            if child.inode == 1 || !referenced.insert(child.inode) {
+                return Err(format!(
+                    "encrypted index inode {} has multiple directory links or aliases the root",
+                    child.inode
+                ));
+            }
+            let target = index.inodes.get(&child.inode).ok_or_else(|| {
+                format!(
+                    "encrypted index child {:?} points to missing inode {}",
+                    child.name, child.inode
+                )
+            })?;
+            if target.parent != parent || target.name != child.name {
+                return Err(format!(
+                    "encrypted index child {:?} disagrees with inode {} parent/name metadata",
+                    child.name, child.inode
+                ));
+            }
+        }
+    }
+    if referenced.len() + 1 != index.inodes.len() {
+        return Err("encrypted index contains an unlinked inode".to_string());
+    }
+
+    let mut visited = HashSet::new();
+    visited
+        .try_reserve(index.inodes.len())
+        .map_err(|_| index_allocation_error("reachability set"))?;
+    let mut pending = Vec::new();
+    pending
+        .try_reserve(index.inodes.len())
+        .map_err(|_| index_allocation_error("reachability stack"))?;
+    pending.push(1u64);
+    while let Some(inode) = pending.pop() {
+        if !visited.insert(inode) {
+            return Err(format!(
+                "encrypted index directory graph contains a cycle at inode {inode}"
+            ));
+        }
+        if let Some(children) = index.children.get(&inode) {
+            pending.extend(children.iter().map(|child| child.inode));
+        }
+    }
+    if visited.len() != index.inodes.len() {
+        return Err("encrypted index contains an unreachable inode or directory cycle".to_string());
+    }
+    Ok(())
+}
+
+fn ensure_no_future_blob_collisions(base_path: &Path, index: &DiskIndex) -> std::io::Result<()> {
+    let mut referenced = HashSet::new();
+    referenced
+        .try_reserve(index.inodes.len())
+        .map_err(|_| std::io::Error::from_raw_os_error(libc::ENOMEM))?;
+    for entry in index
+        .inodes
+        .values()
+        .filter(|entry| entry.kind == InodeKind::File)
+    {
+        referenced.insert(entry.disk_filename.as_str());
+    }
+    for entry in fs::read_dir(base_path)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Some(blob_id) = canonical_blob_id(name) else {
+            continue;
+        };
+        if !referenced.contains(name) && blob_id >= index.next_file_id {
+            return Err(std::io::Error::other(format!(
+                "unreferenced canonical blob {name:?} in {} collides with current/future allocation {} - preserving it as possible crash or cloud-conflict evidence",
+                base_path.display(),
+                index.next_file_id
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn ensure_next_blob_slot_absent(base_path: &Path, index: &DiskIndex) -> std::io::Result<()> {
+    let filename = format!("{:06x}.age", index.next_file_id);
+    let path = base_path.join(&filename);
+    if backing_entry_exists(&path)? {
+        return Err(std::io::Error::other(format!(
+            "next blob slot {filename} already exists outside the authenticated index; refusing to overwrite possible crash or cloud-conflict evidence"
+        )));
+    }
+    Ok(())
+}
+
+struct BoundedIndexWriter {
+    bytes: Vec<u8>,
+    max_len: usize,
+    limit_exceeded: bool,
+}
+
+impl Write for BoundedIndexWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let new_len = self
+            .bytes
+            .len()
+            .checked_add(buf.len())
+            .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EFBIG))?;
+        if new_len > self.max_len {
+            self.limit_exceeded = true;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "serialized index exceeds the {}-byte plaintext limit",
+                    self.max_len
+                ),
+            ));
+        }
+        self.bytes
+            .try_reserve(buf.len())
+            .map_err(|_| std::io::Error::from_raw_os_error(libc::ENOMEM))?;
+        self.bytes.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+pub(crate) fn serialize_index_bounded(index: &DiskIndex) -> std::io::Result<Vec<u8>> {
+    validate_disk_index(index).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("refuse to serialize invalid encrypted index: {error}"),
+        )
+    })?;
+    let max_len = usize::try_from(MAX_INDEX_PLAINTEXT_LEN)
+        .map_err(|_| std::io::Error::from_raw_os_error(libc::EFBIG))?;
+    let mut writer = BoundedIndexWriter {
+        bytes: Vec::new(),
+        max_len,
+        limit_exceeded: false,
+    };
+    if let Err(error) = serde_json::to_writer(&mut writer, index) {
+        let kind = if writer.limit_exceeded {
+            std::io::ErrorKind::InvalidData
+        } else {
+            std::io::ErrorKind::Other
+        };
+        return Err(std::io::Error::new(
+            kind,
+            format!("serialize encrypted index: {error}"),
+        ));
+    }
+    Ok(writer.bytes)
+}
+
 /// Durable write: temp file + fsync + rename + fsync(parent dir).
 /// Survives crash at any point without corrupting the target file.
 pub(crate) fn durable_write(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
     let parent = path.parent().ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -116,6 +419,206 @@ pub(crate) fn durable_write(path: &std::path::Path, data: &[u8]) -> std::io::Res
     result
 }
 
+/// Durably publish a new control file without ever replacing an entry that
+/// appeared concurrently. A complete, fsynced temp remains as recovery
+/// evidence if publication becomes ambiguous.
+pub(crate) fn durable_create_new(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "target has no parent directory",
+        )
+    })?;
+    let file_name = path.file_name().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "target has no file name")
+    })?;
+    let (tmp, mut file) = loop {
+        let sequence = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let mut tmp_name = std::ffi::OsString::from(".");
+        tmp_name.push(file_name);
+        tmp_name.push(format!(".{}.{sequence}.tmp", std::process::id()));
+        let tmp = parent.join(tmp_name);
+        let mut options = std::fs::OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW);
+        }
+        match options.open(&tmp) {
+            Ok(file) => break (tmp, file),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    };
+
+    let mut preserve_temp_on_error = false;
+    let sync_parent = || std::fs::File::open(parent)?.sync_all();
+    let result = (|| {
+        file.write_all(data)?;
+        file.sync_all()?;
+        drop(file);
+        sync_parent()?;
+        preserve_temp_on_error = true;
+
+        match std::fs::hard_link(&tmp, path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(error);
+            }
+            Err(_) => {
+                let mut options = std::fs::OpenOptions::new();
+                options.create_new(true).write(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    options.custom_flags(libc::O_NOFOLLOW);
+                }
+                let mut target = options.open(path)?;
+                target.write_all(data)?;
+                target.sync_all()?;
+            }
+        }
+        sync_parent()?;
+        std::fs::remove_file(&tmp)?;
+        sync_parent()
+    })();
+    if result.is_err() && !preserve_temp_on_error {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
+pub(crate) fn ensure_real_directory(path: &Path) -> std::io::Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() {
+        return Ok(());
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!("{} is not a real directory", path.display()),
+    ))
+}
+
+/// Read one already-opened file with allocation and race bounds. Using the
+/// descriptor's metadata avoids allocating from an untrusted path size and
+/// keeps a provider-side replacement from switching the inode mid-read.
+fn read_bounded_file(
+    path: &Path,
+    expected_len: Option<u64>,
+    max_len: u64,
+) -> std::io::Result<Vec<u8>> {
+    let file = {
+        let mut options = fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW);
+        }
+        options.open(path)?
+    };
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{} is not a regular backing file", path.display()),
+        ));
+    }
+    let observed_len = metadata.len();
+    if observed_len > max_len {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "{} is unexpectedly large ({observed_len} bytes; maximum {max_len})",
+                path.display()
+            ),
+        ));
+    }
+    if let Some(expected_len) = expected_len
+        && observed_len != expected_len
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "{} has {observed_len} ciphertext bytes; expected {expected_len}",
+                path.display()
+            ),
+        ));
+    }
+
+    let read_len = expected_len.unwrap_or(observed_len);
+    let capacity =
+        usize::try_from(read_len).map_err(|_| std::io::Error::from_raw_os_error(libc::EFBIG))?;
+    let limit = read_len
+        .checked_add(1)
+        .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EFBIG))?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(capacity)
+        .map_err(|_| std::io::Error::from_raw_os_error(libc::ENOMEM))?;
+    file.take(limit).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 != read_len {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "{} changed size while being read (expected {read_len}, read {})",
+                path.display(),
+                bytes.len()
+            ),
+        ));
+    }
+    Ok(bytes)
+}
+
+pub(crate) fn read_bounded_backing_file(path: &Path, max_len: u64) -> std::io::Result<Vec<u8>> {
+    read_bounded_file(path, None, max_len)
+}
+
+pub(crate) fn read_index_ciphertext(path: &Path) -> std::io::Result<Vec<u8>> {
+    read_bounded_backing_file(path, MAX_INDEX_CIPHERTEXT_LEN)
+}
+
+fn read_blob_ciphertext(
+    path: &Path,
+    plaintext_len: u64,
+    overhead: u64,
+) -> std::io::Result<Vec<u8>> {
+    let ciphertext_len = plaintext_len
+        .checked_add(overhead)
+        .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EFBIG))?;
+    read_bounded_file(path, Some(ciphertext_len), ciphertext_len)
+}
+
+pub(crate) fn read_v1_blob_ciphertext(path: &Path, plaintext_len: u64) -> std::io::Result<Vec<u8>> {
+    read_blob_ciphertext(path, plaintext_len, V1_CIPHERTEXT_OVERHEAD)
+}
+
+pub(crate) fn read_legacy_blob_ciphertext(
+    path: &Path,
+    plaintext_len: u64,
+) -> std::io::Result<Vec<u8>> {
+    read_blob_ciphertext(path, plaintext_len, LEGACY_CIPHERTEXT_OVERHEAD)
+}
+
+fn ensure_index_ciphertext_within_limit(len: u64, max_len: u64) -> std::io::Result<()> {
+    if len <= max_len {
+        return Ok(());
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!("encrypted index is too large ({len} bytes; maximum {max_len})"),
+    ))
+}
+
+pub(crate) fn ensure_index_plaintext_within_limit(plaintext_len: usize) -> std::io::Result<()> {
+    let ciphertext_len = u64::try_from(plaintext_len)
+        .map_err(|_| std::io::Error::from_raw_os_error(libc::EFBIG))?
+        .checked_add(V1_CIPHERTEXT_OVERHEAD)
+        .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EFBIG))?;
+    ensure_index_ciphertext_within_limit(ciphertext_len, MAX_INDEX_CIPHERTEXT_LEN)
+}
+
 fn ensure_new_store_directory_empty(base_path: &std::path::Path) -> Result<(), String> {
     let entries = fs::read_dir(base_path)
         .map_err(|e| format!("cannot inspect new store {}: {e}", base_path.display()))?;
@@ -145,6 +648,91 @@ fn ensure_new_store_directory_empty(base_path: &std::path::Path) -> Result<(), S
     }
 }
 
+fn is_possible_index_sibling_name(name: &str) -> bool {
+    name != INDEX_FILE && name.to_ascii_lowercase().contains("_index")
+}
+
+fn is_possible_kdf_sibling_name(name: &str) -> bool {
+    name != "_kdf.json" && name.to_ascii_lowercase().contains("_kdf")
+}
+
+fn is_possible_blob_sibling_name(name: &str) -> bool {
+    if canonical_blob_id(name).is_some() {
+        return false;
+    }
+    let lower = name.to_ascii_lowercase();
+    lower.contains(".age")
+        && lower.as_bytes().windows(6).any(|window| {
+            window
+                .iter()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+        })
+}
+
+fn is_possible_transaction_sibling_name(name: &str) -> bool {
+    const CANONICAL: [&str; 6] = [
+        "_rekey.manifest",
+        "_rekey.lock",
+        ".rekey_staging",
+        "_migrate.manifest",
+        "_migrate.lock",
+        ".migrate_staging",
+    ];
+    if CANONICAL.contains(&name) {
+        return false;
+    }
+    let lower = name.to_ascii_lowercase();
+    lower.contains("_rekey")
+        || lower.contains("rekey_staging")
+        || lower.contains("_migrate")
+        || lower.contains("migrate_staging")
+}
+
+/// Return `false` only when the directory entry itself is absent. Unlike
+/// `Path::try_exists`, this does not follow a dangling symlink and accidentally
+/// classify ambiguous provider materialization as absence.
+pub(crate) fn backing_entry_exists(path: &Path) -> std::io::Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+/// Refuse provider-generated alternate control names such as `_index 2.age`,
+/// `_index (conflicted copy).age`, `._index.age.icloud`, or conflicted recovery
+/// manifests. These files cannot be merged safely, and silently choosing one
+/// generation could strand otherwise valid blobs or discard committed recovery
+/// evidence. A stale durable-write temp is likewise evidence of an interrupted
+/// commit and must not be ignored.
+pub(crate) fn ensure_no_index_siblings(base_path: &Path) -> std::io::Result<()> {
+    let mut siblings = Vec::new();
+    for entry in fs::read_dir(base_path)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name.to_str().is_none_or(|name| {
+            is_possible_index_sibling_name(name)
+                || is_possible_kdf_sibling_name(name)
+                || is_possible_blob_sibling_name(name)
+                || is_possible_transaction_sibling_name(name)
+        }) {
+            siblings.push(name);
+            if siblings.len() == 5 {
+                break;
+            }
+        }
+    }
+    if siblings.is_empty() {
+        return Ok(());
+    }
+    siblings.sort();
+    Err(std::io::Error::other(format!(
+        "possible cloud-conflict backing file(s) found in {}: {:?}; refusing to choose, overwrite, or discard a data/metadata generation - stop synchronization, preserve every copy, and reconcile the store before mounting",
+        base_path.display(),
+        siblings
+    )))
+}
+
 // --- FUSE filesystem ---
 
 pub(crate) struct FsInner {
@@ -160,7 +748,12 @@ pub(crate) struct FsInner {
     pub(crate) open_counts: Mutex<HashMap<u64, u32>>,
     pub(crate) index_mtime: Mutex<Option<SystemTime>>,
     pub(crate) index_fingerprint: Mutex<Option<RecoveryFingerprint>>,
+    kdf_fingerprint: RecoveryFingerprint,
     pub(crate) read_only: AtomicBool,
+    /// Fatal cloud-generation conflict detected after mount. Once latched,
+    /// writes and persistence stay disabled until remount even if a provider
+    /// later hides the conflicting artifact again.
+    persistence_failure: Mutex<Option<String>>,
     /// Inodes whose open plaintext buffers differ from their durable blobs.
     /// Existing files start clean; only write/truncate makes them dirty. This
     /// prevents read-only opens from changing the random AEAD nonce and forcing
@@ -172,12 +765,52 @@ pub(crate) struct FsInner {
     pub(crate) persistence_mutex: Mutex<()>,
     /// Set by metadata-mutating ops; cleared by the debounce thread after flushing.
     index_dirty: AtomicBool,
+    dirty_timing: Mutex<Option<DirtyTiming>>,
     /// Signals the debounce thread to wake up (dirty flag set) or shut down (stop flag).
     debounce_notify: Condvar,
     debounce_mutex: Mutex<bool>, // value = stop requested
 }
 
 impl FsInner {
+    fn persistence_error(&self) -> Option<std::io::Error> {
+        match self.persistence_failure.lock() {
+            Ok(failure) => failure.as_ref().map(|message| {
+                std::io::Error::other(format!("persistence is disabled until remount: {message}"))
+            }),
+            Err(_) => Some(std::io::Error::other(
+                "persistence is disabled until remount: failure-state lock is poisoned",
+            )),
+        }
+    }
+
+    fn latch_persistence_failure(&self, error: std::io::Error) -> std::io::Error {
+        let incoming = error.to_string();
+        let message = match self.persistence_failure.lock() {
+            Ok(mut failure) => failure.get_or_insert(incoming).clone(),
+            Err(_) => "failure-state lock is poisoned".to_string(),
+        };
+        self.read_only.store(true, Ordering::SeqCst);
+        std::io::Error::other(format!("persistence is disabled until remount: {message}"))
+    }
+
+    /// Online maintenance may temporarily set `read_only`; it must never
+    /// clear a fatal cloud-conflict latch while restoring ordinary writes.
+    pub(crate) fn restore_writes_if_healthy(&self) {
+        if self.persistence_error().is_none() {
+            self.read_only.store(false, Ordering::SeqCst);
+        }
+    }
+
+    fn ensure_writable(&self) -> std::io::Result<()> {
+        if let Some(error) = self.persistence_error() {
+            return Err(error);
+        }
+        if self.read_only.load(Ordering::SeqCst) {
+            return Err(std::io::Error::from_raw_os_error(libc::EROFS));
+        }
+        Ok(())
+    }
+
     /// Record that a maintenance operation durably wrote the current open-file
     /// buffers and matching index. The caller must hold `persistence_mutex` and
     /// must have made the filesystem read-only before taking its snapshot.
@@ -190,25 +823,63 @@ impl FsInner {
         Ok(())
     }
 
+    pub(crate) fn dirty_inode_snapshot(&self) -> Result<HashSet<u64>, String> {
+        self.dirty_inodes
+            .lock()
+            .map_err(|_| "dirty-inode lock is poisoned".to_string())
+            .map(|dirty| dirty.clone())
+    }
+
     pub(crate) fn ensure_index_unchanged(&self) -> Result<(), std::io::Error> {
-        let expected = self.index_fingerprint.lock().unwrap().clone();
-        let Some(expected) = expected else {
-            return Ok(());
-        };
-        let index_path = self.base_path.join("_index.age");
-        let actual = ciphertext_fingerprint(&index_path).map_err(|e| {
-            std::io::Error::other(format!(
-                "cannot verify encrypted index {} before commit: {e}",
-                index_path.display()
-            ))
-        })?;
-        if actual != expected {
-            return Err(std::io::Error::other(format!(
-                "encrypted index {} changed externally; refusing to overwrite it - unmount and reconcile cloud synchronization first",
-                index_path.display()
-            )));
+        if let Some(error) = self.persistence_error() {
+            return Err(error);
         }
-        Ok(())
+        let result = (|| {
+            ensure_no_index_siblings(&self.base_path)?;
+            let kdf_path = self.base_path.join("_kdf.json");
+            let actual_kdf = exact_fingerprint(&kdf_path).map_err(|e| {
+                std::io::Error::other(format!(
+                    "cannot verify KDF metadata {} before commit: {e}",
+                    kdf_path.display()
+                ))
+            })?;
+            if actual_kdf != self.kdf_fingerprint {
+                return Err(std::io::Error::other(format!(
+                    "KDF metadata {} changed externally; refusing to write ciphertext under a key that may no longer match the store",
+                    kdf_path.display()
+                )));
+            }
+            let expected = self.index_fingerprint.lock().unwrap().clone();
+            let index_path = self.base_path.join(INDEX_FILE);
+            let Some(expected) = expected else {
+                return match fs::symlink_metadata(&index_path) {
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                    Err(e) => Err(std::io::Error::other(format!(
+                        "cannot verify that new-store index {} is still absent: {e}",
+                        index_path.display()
+                    ))),
+                    Ok(_) => Err(std::io::Error::other(format!(
+                        "encrypted index {} appeared externally while initializing a new store; refusing to overwrite it",
+                        index_path.display()
+                    ))),
+                };
+            };
+            let actual = ciphertext_fingerprint_bounded(&index_path, MAX_INDEX_CIPHERTEXT_LEN)
+                .map_err(|e| {
+                    std::io::Error::other(format!(
+                        "cannot verify encrypted index {} before commit: {e}",
+                        index_path.display()
+                    ))
+                })?;
+            if actual != expected {
+                return Err(std::io::Error::other(format!(
+                    "encrypted index {} changed externally; refusing to overwrite it - unmount and reconcile cloud synchronization first",
+                    index_path.display()
+                )));
+            }
+            Ok(())
+        })();
+        result.map_err(|error| self.latch_persistence_failure(error))
     }
 }
 
@@ -222,8 +893,13 @@ impl ZeroTrustFs {
     pub fn new(passphrase: &str, base_path: PathBuf) -> Self {
         fs::create_dir_all(&base_path).expect("failed to create base path");
 
-        let index_path = base_path.join("_index.age");
-        let index_exists = index_path.try_exists().unwrap_or_else(|e| {
+        ensure_no_index_siblings(&base_path).unwrap_or_else(|e| {
+            eprintln!("zerotrust-drive: error: {e}");
+            std::process::exit(1);
+        });
+
+        let index_path = base_path.join(INDEX_FILE);
+        let index_exists = backing_entry_exists(&index_path).unwrap_or_else(|e| {
             eprintln!(
                 "zerotrust-drive: error: cannot inspect {}: {e}",
                 index_path.display()
@@ -234,7 +910,7 @@ impl ZeroTrustFs {
             eprintln!("zerotrust-drive: error: {e}");
             std::process::exit(1);
         }
-        let stored_kdf = crate::crypto::load_kdf(&base_path).unwrap_or_else(|e| {
+        let stored_kdf = crate::crypto::load_kdf_with_fingerprint(&base_path).unwrap_or_else(|e| {
             eprintln!("zerotrust-drive: error: invalid KDF metadata: {e}");
             std::process::exit(1);
         });
@@ -255,12 +931,14 @@ impl ZeroTrustFs {
         }
         // Argon2id key derived from the drive's per-drive salt
         // (`_kdf.json`), created on first use for a brand-new drive.
-        let kdf = match stored_kdf {
-            Some(kdf) => kdf,
-            None => crate::crypto::load_or_create_kdf(&base_path).unwrap_or_else(|e| {
-                eprintln!("zerotrust-drive: error: cannot create KDF metadata: {e}");
-                std::process::exit(1);
-            }),
+        let (kdf, kdf_fingerprint) = match stored_kdf {
+            Some(loaded) => loaded,
+            None => {
+                crate::crypto::load_or_create_kdf_with_fingerprint(&base_path).unwrap_or_else(|e| {
+                    eprintln!("zerotrust-drive: error: cannot create KDF metadata: {e}");
+                    std::process::exit(1);
+                })
+            }
         };
         let key = crate::crypto::try_derive_key(passphrase, &kdf).unwrap_or_else(|e| {
             eprintln!("zerotrust-drive: error: cannot derive encryption key: {e}");
@@ -269,7 +947,13 @@ impl ZeroTrustFs {
 
         let mut initial_index_fingerprint = None;
         let state = if index_exists {
-            let ciphertext = fs::read(&index_path).expect("failed to read index");
+            let ciphertext = read_index_ciphertext(&index_path).unwrap_or_else(|e| {
+                eprintln!(
+                    "zerotrust-drive: error: cannot safely read encrypted index {}: {e}",
+                    index_path.display()
+                );
+                std::process::exit(1);
+            });
             initial_index_fingerprint = Some(
                 ciphertext_bytes_fingerprint(&ciphertext).unwrap_or_else(|e| {
                     eprintln!(
@@ -279,7 +963,7 @@ impl ZeroTrustFs {
                     std::process::exit(1);
                 }),
             );
-            let json = match decrypt_index(&key, &ciphertext) {
+            let json = match decrypt_index_owned(&key, ciphertext) {
                 Ok(j) => j,
                 Err(_) => {
                     eprintln!(
@@ -289,7 +973,13 @@ impl ZeroTrustFs {
                     std::process::exit(1);
                 }
             };
-            serde_json::from_slice(&json).expect("failed to parse index")
+            serde_json::from_slice(&json).unwrap_or_else(|e| {
+                eprintln!(
+                    "zerotrust-drive: error: encrypted index {} contains invalid metadata: {e}",
+                    index_path.display()
+                );
+                std::process::exit(1);
+            })
         } else {
             let uid = unsafe { libc::getuid() };
             let gid = unsafe { libc::getgid() };
@@ -323,6 +1013,21 @@ impl ZeroTrustFs {
             }
         };
 
+        validate_disk_index(&state).unwrap_or_else(|error| {
+            eprintln!(
+                "zerotrust-drive: error: encrypted index {} is structurally invalid: {error}",
+                index_path.display()
+            );
+            std::process::exit(1);
+        });
+        ensure_no_future_blob_collisions(&base_path, &state).unwrap_or_else(|error| {
+            eprintln!(
+                "zerotrust-drive: error: encrypted backing directory {} is ambiguous: {error}",
+                base_path.display()
+            );
+            std::process::exit(1);
+        });
+
         let initial_index_mtime = if index_exists {
             fs::metadata(&index_path)
                 .and_then(|meta| meta.modified())
@@ -338,10 +1043,13 @@ impl ZeroTrustFs {
             open_counts: Mutex::new(HashMap::new()),
             index_mtime: Mutex::new(initial_index_mtime),
             index_fingerprint: Mutex::new(initial_index_fingerprint),
+            kdf_fingerprint,
             read_only: AtomicBool::new(false),
+            persistence_failure: Mutex::new(None),
             dirty_inodes: Mutex::new(HashSet::new()),
             persistence_mutex: Mutex::new(()),
             index_dirty: AtomicBool::new(false),
+            dirty_timing: Mutex::new(None),
             debounce_notify: Condvar::new(),
             debounce_mutex: Mutex::new(false),
         });
@@ -349,21 +1057,30 @@ impl ZeroTrustFs {
         // Spawn debounce thread that coalesces frequent index writes
         let debounce_inner = Arc::clone(&inner);
         let debounce_thread = thread::spawn(move || {
-            const DEBOUNCE_INTERVAL: Duration = Duration::from_secs(5);
             let mut guard = debounce_inner.debounce_mutex.lock().unwrap();
             loop {
-                while !*guard && !debounce_inner.index_dirty.load(Ordering::Acquire) {
+                while !*guard
+                    && (!debounce_inner.index_dirty.load(Ordering::Acquire)
+                        || debounce_inner.persistence_error().is_some())
+                {
                     guard = debounce_inner.debounce_notify.wait(guard).unwrap();
                 }
                 if *guard {
                     break;
                 }
 
-                // Wait for a full quiet interval. Each new metadata mutation
-                // notifies the condition variable and restarts this interval.
+                // Flush after either a quiet interval or an absolute dirty-age
+                // deadline. Continuous writers cannot keep acknowledged data
+                // RAM-only forever by repeatedly resetting the quiet timer.
+                let wait_for = debounce_inner
+                    .dirty_timing
+                    .lock()
+                    .unwrap()
+                    .map(|timing| timing.next_wait(Instant::now()))
+                    .unwrap_or(DEBOUNCE_QUIET_INTERVAL);
                 let (next_guard, timeout) = debounce_inner
                     .debounce_notify
-                    .wait_timeout(guard, DEBOUNCE_INTERVAL)
+                    .wait_timeout(guard, wait_for)
                     .unwrap();
                 guard = next_guard;
                 if *guard {
@@ -374,16 +1091,20 @@ impl ZeroTrustFs {
                 }
 
                 drop(guard);
-                if debounce_inner.index_dirty.swap(false, Ordering::AcqRel) {
-                    let zfs = ZeroTrustFs {
-                        inner: Arc::clone(&debounce_inner),
-                        debounce_thread: None,
-                        mount_ready_notify: None,
-                    };
-                    if let Err(e) = zfs.flush_state() {
-                        debounce_inner.index_dirty.store(true, Ordering::Release);
-                        eprintln!("zerotrust-drive: ERROR: debounce flush failed: {e}");
-                    }
+                let zfs = ZeroTrustFs {
+                    inner: Arc::clone(&debounce_inner),
+                    debounce_thread: None,
+                    mount_ready_notify: None,
+                };
+                let flush_result = {
+                    // Consume the dirty marker only after taking the same gate
+                    // used by fsync. Otherwise fsync could observe "clean" and
+                    // return while this delayed write was still waiting.
+                    let _persistence = debounce_inner.persistence_mutex.lock().unwrap();
+                    zfs.flush_pending_state_locked(false)
+                };
+                if let Err(e) = flush_result {
+                    eprintln!("zerotrust-drive: ERROR: debounce flush failed: {e}");
                 }
                 guard = debounce_inner.debounce_mutex.lock().unwrap();
             }
@@ -397,9 +1118,9 @@ impl ZeroTrustFs {
         if !index_exists {
             let json = {
                 let state = zfs.inner.state.read().unwrap();
-                serde_json::to_vec(&*state).expect("failed to serialize index")
+                serialize_index_bounded(&state).expect("failed to serialize index")
             };
-            zfs.persist_index(&json)
+            zfs.persist_index(json)
                 .expect("failed to write initial index");
         }
         zfs
@@ -413,13 +1134,47 @@ impl ZeroTrustFs {
     }
 
     /// Encrypt and write pre-serialized JSON to _index.age. No locks held.
-    pub(crate) fn persist_index(&self, json: &[u8]) -> Result<(), std::io::Error> {
+    pub(crate) fn persist_index(&self, json: Vec<u8>) -> Result<(), std::io::Error> {
+        self.persist_index_with_limit(json, MAX_INDEX_CIPHERTEXT_LEN)
+    }
+
+    fn persist_index_with_limit(&self, json: Vec<u8>, max_len: u64) -> Result<(), std::io::Error> {
         self.inner.ensure_index_unchanged()?;
-        let index_path = self.inner.base_path.join("_index.age");
-        let encrypted =
-            encrypt_index(&self.inner.key.read().unwrap(), json).map_err(std::io::Error::other)?;
+        let prepared = {
+            let key = self.inner.key.read().unwrap();
+            Self::prepare_index_with_limit(&key, json, max_len)?
+        };
+        self.persist_prepared_index(prepared)
+    }
+
+    fn prepare_index_with_limit(
+        key: &[u8; 32],
+        json: Vec<u8>,
+        max_len: u64,
+    ) -> Result<(Vec<u8>, RecoveryFingerprint), std::io::Error> {
+        let expected_len = u64::try_from(json.len())
+            .map_err(|_| std::io::Error::from_raw_os_error(libc::EFBIG))?
+            .checked_add(V1_CIPHERTEXT_OVERHEAD)
+            .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EFBIG))?;
+        ensure_index_ciphertext_within_limit(expected_len, max_len)?;
+        let encrypted = encrypt_index_owned(key, json).map_err(std::io::Error::other)?;
+        ensure_index_ciphertext_within_limit(
+            u64::try_from(encrypted.len())
+                .map_err(|_| std::io::Error::from_raw_os_error(libc::EFBIG))?,
+            max_len,
+        )?;
         let fingerprint =
             ciphertext_bytes_fingerprint(&encrypted).map_err(std::io::Error::other)?;
+        Ok((encrypted, fingerprint))
+    }
+
+    fn persist_prepared_index(
+        &self,
+        (encrypted, fingerprint): (Vec<u8>, RecoveryFingerprint),
+    ) -> Result<(), std::io::Error> {
+        // Repeat the generation check immediately before replacing the index.
+        self.inner.ensure_index_unchanged()?;
+        let index_path = self.inner.base_path.join(INDEX_FILE);
         durable_write(&index_path, &encrypted)?;
         *self.inner.index_fingerprint.lock().unwrap() = Some(fingerprint);
         // Record mtime so we can detect external modifications
@@ -497,6 +1252,7 @@ impl ZeroTrustFs {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn write_encrypted_file(
         &self,
         disk_filename: &str,
@@ -507,12 +1263,25 @@ impl ZeroTrustFs {
         durable_write(&self.inner.base_path.join(disk_filename), &encrypted)
     }
 
+    #[cfg(test)]
     pub(crate) fn read_encrypted_file(
         &self,
         disk_filename: &str,
     ) -> Result<Vec<u8>, std::io::Error> {
-        let ciphertext = fs::read(self.inner.base_path.join(disk_filename))?;
-        decrypt_blob(&self.inner.key.read().unwrap(), disk_filename, &ciphertext)
+        self.read_encrypted_file_at_size(disk_filename, None)
+    }
+
+    fn read_encrypted_file_at_size(
+        &self,
+        disk_filename: &str,
+        expected_plaintext_len: Option<u64>,
+    ) -> Result<Vec<u8>, std::io::Error> {
+        let path = self.inner.base_path.join(disk_filename);
+        let ciphertext = match expected_plaintext_len {
+            Some(len) => read_v1_blob_ciphertext(&path, len)?,
+            None => read_bounded_backing_file(&path, u64::MAX)?,
+        };
+        decrypt_blob_owned(&self.inner.key.read().unwrap(), disk_filename, ciphertext)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     }
 
@@ -551,8 +1320,9 @@ impl ZeroTrustFs {
             > 0;
         if !already_open {
             let path = self.inner.base_path.join(&disk_filename);
-            let content = if !disk_filename.is_empty() && path.exists() {
-                self.read_encrypted_file(&disk_filename)?
+            let backing_exists = !disk_filename.is_empty() && backing_entry_exists(&path)?;
+            let content = if backing_exists {
+                self.read_encrypted_file_at_size(&disk_filename, Some(size))?
             } else if !disk_filename.is_empty() && size > 0 {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
@@ -634,8 +1404,16 @@ impl ZeroTrustFs {
     /// buffer is the source of truth; if it is closed, the on-disk blob is
     /// read-modify-written so a truncation of a closed file is actually
     /// persisted (it used to be silently dropped).
+    #[cfg(test)]
     pub(crate) fn truncate_inode(&self, ino: u64, new_size: u64) -> std::io::Result<()> {
         let _persistence = self.inner.persistence_mutex.lock().unwrap();
+        self.truncate_inode_locked(ino, new_size)
+    }
+
+    /// Caller must hold `persistence_mutex` so writability cannot change
+    /// between validation, content resize, and indexed metadata publication.
+    fn truncate_inode_locked(&self, ino: u64, new_size: u64) -> std::io::Result<()> {
+        self.inner.ensure_writable()?;
         let (disk_filename, old_size) = {
             let state = self.inner.state.read().unwrap();
             match state.inodes.get(&ino) {
@@ -655,6 +1433,10 @@ impl ZeroTrustFs {
                 if let Some(entry) = self.inner.state.write().unwrap().inodes.get_mut(&ino) {
                     entry.size = new_size;
                 }
+                // Size/content changed together. Wake the debounce worker so
+                // a long-lived open handle does not leave the only new copy in
+                // RAM indefinitely when the caller never issues fsync/flush.
+                self.mark_dirty();
                 return Ok(());
             }
         }
@@ -667,9 +1449,12 @@ impl ZeroTrustFs {
         if old_size == new_size {
             return Ok(());
         }
+        // Closed-file truncate replaces its blob immediately. Apply the same
+        // cloud-generation preflight as a normal commit before touching it.
+        self.inner.ensure_index_unchanged()?;
         let path = self.inner.base_path.join(&disk_filename);
-        let mut data = if path.exists() {
-            self.read_encrypted_file(&disk_filename)?
+        let mut data = if backing_entry_exists(&path)? {
+            self.read_encrypted_file_at_size(&disk_filename, Some(old_size))?
         } else if old_size > 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -679,7 +1464,9 @@ impl ZeroTrustFs {
             Vec::new()
         };
         Self::resize_content(&mut data, new_size)?;
-        self.write_encrypted_file(&disk_filename, &data)?;
+        let encrypted = encrypt_blob_owned(&self.inner.key.read().unwrap(), &disk_filename, data)
+            .map_err(std::io::Error::other)?;
+        durable_write(&self.inner.base_path.join(&disk_filename), &encrypted)?;
         if let Some(entry) = self.inner.state.write().unwrap().inodes.get_mut(&ino) {
             entry.size = new_size;
         }
@@ -705,6 +1492,7 @@ impl ZeroTrustFs {
             .checked_add(data.len())
             .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EFBIG))?;
         let _persistence = self.inner.persistence_mutex.lock().unwrap();
+        self.inner.ensure_writable()?;
         let new_size = {
             let mut open = self.inner.open_files.write().unwrap();
             let content = open
@@ -727,10 +1515,17 @@ impl ZeroTrustFs {
             .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
         entry.size = new_size;
         entry.mtime_secs = now_secs();
+        drop(state);
+        // Content writes also mutate indexed size/time metadata. Waking the
+        // debounce worker bounds how long dirty plaintext is RAM-only for a
+        // long-lived open file.
+        self.mark_dirty();
         Ok(written)
     }
 
-    /// Durably persist an inode's open content (if any) + the index.
+    /// Durably persist an inode's dirty open content and pending metadata.
+    /// A clean fsync is a no-op because the last committed generation is
+    /// already durable; re-encrypting it would create needless cloud churn.
     /// Backs the FUSE `fsync` handler.
     pub(crate) fn fsync_inode(&self, ino: u64) -> std::io::Result<()> {
         {
@@ -739,14 +1534,25 @@ impl ZeroTrustFs {
                 return Err(std::io::Error::from_raw_os_error(libc::ENOENT));
             }
         }
-        let _persistence = self.inner.persistence_mutex.lock().unwrap();
-        self.flush_pending_state_locked(true)
+        let _persistence = self
+            .inner
+            .persistence_mutex
+            .lock()
+            .map_err(|_| std::io::Error::other("persistence gate is poisoned"))?;
+        self.flush_pending_state_locked(false)
     }
 
     /// Mark the index as dirty so the debounce thread will flush it soon.
     /// Used by metadata-mutating ops instead of calling flush_state() directly.
     fn mark_dirty(&self) {
         self.inner.index_dirty.store(true, Ordering::Release);
+        let now = Instant::now();
+        let mut timing = self.inner.dirty_timing.lock().unwrap();
+        match timing.as_mut() {
+            Some(timing) => timing.last = now,
+            None => *timing = Some(DirtyTiming::new(now)),
+        }
+        drop(timing);
         self.inner.debounce_notify.notify_one();
     }
 
@@ -754,7 +1560,7 @@ impl ZeroTrustFs {
     /// it. Caller must hold `persistence_mutex`.
     fn flush_state_locked(&self) -> Result<(), std::io::Error> {
         // Refuse a conflicting cloud generation before touching any blob.
-        // persist_index repeats this check immediately before its atomic rename.
+        // persist_prepared_index repeats this immediately before its rename.
         self.inner.ensure_index_unchanged()?;
         let dirty: Vec<u64> = self
             .inner
@@ -764,10 +1570,13 @@ impl ZeroTrustFs {
             .iter()
             .copied()
             .collect();
-        let json = {
+        let prepared_index = {
             let state = self.inner.state.read().unwrap();
             let open = self.inner.open_files.read().unwrap();
             let key = self.inner.key.read().unwrap();
+            // Validate the entire pending set before replacing the first blob.
+            // An internally inconsistent later inode must not leave an earlier
+            // blob paired with the still-old index.
             for &ino in &dirty {
                 let entry = state.inodes.get(&ino).ok_or_else(|| {
                     std::io::Error::new(
@@ -797,14 +1606,37 @@ impl ZeroTrustFs {
                         ),
                     ));
                 }
+            }
+            // Serialize, bound, and encrypt the prospective index before the
+            // first blob replacement. Predictable index failures must leave
+            // the complete old generation untouched.
+            let index_json = serialize_index_bounded(&state).map_err(|error| {
+                if error.kind() == std::io::ErrorKind::InvalidData {
+                    self.inner.latch_persistence_failure(error)
+                } else {
+                    error
+                }
+            })?;
+            let prepared_index =
+                Self::prepare_index_with_limit(&key, index_json, MAX_INDEX_CIPHERTEXT_LEN)
+                    .map_err(|error| {
+                        if error.kind() == std::io::ErrorKind::InvalidData {
+                            self.inner.latch_persistence_failure(error)
+                        } else {
+                            error
+                        }
+                    })?;
+            for &ino in &dirty {
+                let entry = &state.inodes[&ino];
+                let content = &open[&ino];
                 let encrypted = encrypt_blob(&key, &entry.disk_filename, content)
                     .map_err(std::io::Error::other)?;
                 durable_write(&self.inner.base_path.join(&entry.disk_filename), &encrypted)?;
             }
-            serde_json::to_vec(&*state).map_err(std::io::Error::other)?
+            prepared_index
         };
 
-        self.persist_index(&json)?;
+        self.persist_prepared_index(prepared_index)?;
         let mut dirty_inodes = self.inner.dirty_inodes.lock().unwrap();
         for ino in dirty {
             dirty_inodes.remove(&ino);
@@ -815,21 +1647,30 @@ impl ZeroTrustFs {
     /// Flush pending content/index state, or force an index sync for fsync.
     /// Caller must hold `persistence_mutex`.
     fn flush_pending_state_locked(&self, force: bool) -> Result<(), std::io::Error> {
+        if let Some(error) = self.inner.persistence_error() {
+            return Err(error);
+        }
         let had_index_dirty = self.inner.index_dirty.swap(false, Ordering::AcqRel);
         let has_dirty_content = !self.inner.dirty_inodes.lock().unwrap().is_empty();
         if !force && !had_index_dirty && !has_dirty_content {
+            *self.inner.dirty_timing.lock().unwrap() = None;
             return Ok(());
         }
         if let Err(e) = self.flush_state_locked() {
             self.inner.index_dirty.store(true, Ordering::Release);
-            self.inner.debounce_notify.notify_one();
+            if self.inner.persistence_error().is_none() {
+                *self.inner.dirty_timing.lock().unwrap() = Some(DirtyTiming::new(Instant::now()));
+                self.inner.debounce_notify.notify_one();
+            }
             return Err(e);
         }
+        *self.inner.dirty_timing.lock().unwrap() = None;
         Ok(())
     }
 
     /// Serialize a complete blob+index commit against other persistence and
     /// online rekey operations.
+    #[cfg(test)]
     pub(crate) fn flush_state(&self) -> Result<(), std::io::Error> {
         let _persistence = self.inner.persistence_mutex.lock().unwrap();
         self.flush_pending_state_locked(true)
@@ -1017,10 +1858,15 @@ impl Filesystem for ZeroTrustFs {
             reply.error(fuser::Errno::EROFS);
             return;
         }
+        let persistence = self.inner.persistence_mutex.lock().unwrap();
+        if let Err(error) = self.inner.ensure_writable() {
+            reply.error(io_to_errno(&error));
+            return;
+        }
         if let Some(new_size) = size {
             // Validate and persist/dirty the content before publishing the new
             // size. A missing non-empty backing blob must not become zero data.
-            if let Err(e) = self.truncate_inode(ino.0, new_size) {
+            if let Err(e) = self.truncate_inode_locked(ino.0, new_size) {
                 reply.error(io_to_errno(&e));
                 return;
             }
@@ -1046,8 +1892,9 @@ impl Filesystem for ZeroTrustFs {
             entry.ctime_secs = now_secs();
             Self::inode_to_attr(ino.0, entry)
         };
-        reply.attr(&TTL, &attr);
         self.mark_dirty();
+        drop(persistence);
+        reply.attr(&TTL, &attr);
     }
 
     fn open(&self, _req: &Request, ino: INodeNo, _flags: fuser::OpenFlags, reply: ReplyOpen) {
@@ -1135,14 +1982,18 @@ impl Filesystem for ZeroTrustFs {
         _lock_owner: fuser::LockOwner,
         reply: ReplyEmpty,
     ) {
-        if self.inner.read_only.load(Ordering::Relaxed) {
-            reply.ok();
+        if let Some(error) = self.inner.persistence_error() {
+            eprintln!("zerotrust-drive: ERROR: flush inode {}: {error}", ino.0);
+            reply.error(io_to_errno(&error));
             return;
         }
         trace!("FUSE: flush ino={}", ino.0);
         let result = {
-            let _persistence = self.inner.persistence_mutex.lock().unwrap();
-            self.flush_pending_state_locked(false)
+            self.inner
+                .persistence_mutex
+                .lock()
+                .map_err(|_| std::io::Error::other("persistence gate is poisoned"))
+                .and_then(|_persistence| self.flush_pending_state_locked(false))
         };
         match result {
             Ok(()) => reply.ok(),
@@ -1181,8 +2032,9 @@ impl Filesystem for ZeroTrustFs {
         _datasync: bool,
         reply: ReplyEmpty,
     ) {
-        if self.inner.read_only.load(Ordering::Relaxed) {
-            reply.ok();
+        if let Some(error) = self.inner.persistence_error() {
+            eprintln!("zerotrust-drive: ERROR: fsync inode {}: {error}", ino.0);
+            reply.error(io_to_errno(&error));
             return;
         }
         trace!("FUSE: fsync ino={}", ino.0);
@@ -1230,6 +2082,10 @@ impl Filesystem for ZeroTrustFs {
             return;
         }
         let persistence = self.inner.persistence_mutex.lock().unwrap();
+        if let Err(error) = self.inner.ensure_writable() {
+            reply.error(io_to_errno(&error));
+            return;
+        }
         let (ino, attr) = {
             let mut state = self.inner.state.write().unwrap();
             match state.inodes.get(&parent.0) {
@@ -1241,6 +2097,11 @@ impl Filesystem for ZeroTrustFs {
             }
             if Self::find_child(&state, parent.0, name_str).is_some() {
                 reply.error(fuser::Errno::EEXIST);
+                return;
+            }
+            if let Err(error) = ensure_next_blob_slot_absent(&self.inner.base_path, &state) {
+                let error = self.inner.latch_persistence_failure(error);
+                reply.error(io_to_errno(&error));
                 return;
             }
             let ino = Self::allocate_inode(&mut state);
@@ -1304,6 +2165,10 @@ impl Filesystem for ZeroTrustFs {
             return;
         }
         let persistence = self.inner.persistence_mutex.lock().unwrap();
+        if let Err(error) = self.inner.ensure_writable() {
+            reply.error(io_to_errno(&error));
+            return;
+        }
 
         let (ino, attr, _disk_filename) = {
             let mut state = self.inner.state.write().unwrap();
@@ -1316,6 +2181,11 @@ impl Filesystem for ZeroTrustFs {
             }
             if Self::find_child(&state, parent.0, name_str).is_some() {
                 reply.error(fuser::Errno::EEXIST);
+                return;
+            }
+            if let Err(error) = ensure_next_blob_slot_absent(&self.inner.base_path, &state) {
+                let error = self.inner.latch_persistence_failure(error);
+                reply.error(io_to_errno(&error));
                 return;
             }
             let ino = Self::allocate_inode(&mut state);
@@ -1394,6 +2264,10 @@ impl Filesystem for ZeroTrustFs {
             return;
         }
         let persistence = self.inner.persistence_mutex.lock().unwrap();
+        if let Err(error) = self.inner.ensure_writable() {
+            reply.error(io_to_errno(&error));
+            return;
+        }
 
         let attr = {
             let mut state = self.inner.state.write().unwrap();
@@ -1455,6 +2329,10 @@ impl Filesystem for ZeroTrustFs {
         };
 
         let persistence = self.inner.persistence_mutex.lock().unwrap();
+        if let Err(error) = self.inner.ensure_writable() {
+            reply.error(io_to_errno(&error));
+            return;
+        }
         let previous_state;
         let (ino, disk_filename) = {
             let mut state = self.inner.state.write().unwrap();
@@ -1532,6 +2410,10 @@ impl Filesystem for ZeroTrustFs {
         };
 
         let persistence = self.inner.persistence_mutex.lock().unwrap();
+        if let Err(error) = self.inner.ensure_writable() {
+            reply.error(io_to_errno(&error));
+            return;
+        }
         {
             let mut state = self.inner.state.write().unwrap();
             let ino = match Self::find_child(&state, parent.0, name_str) {
@@ -1604,6 +2486,10 @@ impl Filesystem for ZeroTrustFs {
             return;
         }
         let persistence = self.inner.persistence_mutex.lock().unwrap();
+        if let Err(error) = self.inner.ensure_writable() {
+            reply.error(io_to_errno(&error));
+            return;
+        }
         let previous_state: Option<DiskIndex>;
         let (disk_file_to_remove, overwritten_ino) = {
             let mut state = self.inner.state.write().unwrap();
@@ -1827,13 +2713,17 @@ impl Filesystem for ZeroTrustFs {
         _datasync: bool,
         reply: ReplyEmpty,
     ) {
-        if self.inner.read_only.load(Ordering::Relaxed) {
-            reply.ok();
+        if let Some(error) = self.inner.persistence_error() {
+            eprintln!("zerotrust-drive: ERROR: fsyncdir failed: {error}");
+            reply.error(io_to_errno(&error));
             return;
         }
         let result = {
-            let _persistence = self.inner.persistence_mutex.lock().unwrap();
-            self.flush_pending_state_locked(true)
+            self.inner
+                .persistence_mutex
+                .lock()
+                .map_err(|_| std::io::Error::other("persistence gate is poisoned"))
+                .and_then(|_persistence| self.flush_pending_state_locked(false))
         };
         match result {
             Ok(()) => reply.ok(),
@@ -1890,6 +2780,186 @@ mod tests {
                 p_cost: 1,
             },
         )
+    }
+
+    fn structurally_valid_index() -> DiskIndex {
+        let root = InodeEntry {
+            name: String::new(),
+            kind: InodeKind::Directory,
+            disk_filename: String::new(),
+            size: 0,
+            perm: 0o755,
+            uid: 501,
+            gid: 20,
+            atime_secs: 1,
+            mtime_secs: 1,
+            ctime_secs: 1,
+            nlink: 2,
+            parent: 1,
+        };
+        let directory = InodeEntry {
+            name: "docs".to_string(),
+            kind: InodeKind::Directory,
+            disk_filename: String::new(),
+            parent: 1,
+            ..root.clone()
+        };
+        let file = InodeEntry {
+            name: "note.txt".to_string(),
+            kind: InodeKind::File,
+            disk_filename: "000001.age".to_string(),
+            size: 4,
+            nlink: 1,
+            parent: 2,
+            ..root.clone()
+        };
+        DiskIndex {
+            next_inode: 4,
+            next_file_id: 2,
+            inodes: HashMap::from([(1, root), (2, directory), (3, file)]),
+            children: HashMap::from([
+                (
+                    1,
+                    vec![DirChild {
+                        name: "docs".to_string(),
+                        inode: 2,
+                    }],
+                ),
+                (
+                    2,
+                    vec![DirChild {
+                        name: "note.txt".to_string(),
+                        inode: 3,
+                    }],
+                ),
+            ]),
+        }
+    }
+
+    #[test]
+    fn validates_index_graph_blob_identity_and_allocation_counters() {
+        let valid = structurally_valid_index();
+        validate_disk_index(&valid).unwrap();
+
+        let assert_invalid = |index: DiskIndex| assert!(validate_disk_index(&index).is_err());
+
+        let mut index = valid.clone();
+        index.inodes.remove(&1);
+        assert_invalid(index);
+
+        let mut index = valid.clone();
+        index.inodes.get_mut(&1).unwrap().parent = 2;
+        assert_invalid(index);
+
+        let mut index = valid.clone();
+        index.children.get_mut(&1).unwrap().push(DirChild {
+            name: "missing".to_string(),
+            inode: 99,
+        });
+        assert_invalid(index);
+
+        let mut index = valid.clone();
+        index.children.get_mut(&1).unwrap().push(DirChild {
+            name: "docs".to_string(),
+            inode: 3,
+        });
+        assert_invalid(index);
+
+        let mut index = valid.clone();
+        index.children.get_mut(&1).unwrap().push(DirChild {
+            name: "alias".to_string(),
+            inode: 3,
+        });
+        assert_invalid(index);
+
+        let mut index = valid.clone();
+        index.inodes.get_mut(&3).unwrap().parent = 1;
+        assert_invalid(index);
+
+        let mut index = valid.clone();
+        index.children.insert(3, Vec::new());
+        assert_invalid(index);
+
+        let mut index = valid.clone();
+        let template = index.inodes.get(&2).unwrap().clone();
+        index.inodes.insert(
+            4,
+            InodeEntry {
+                name: "cycle-a".to_string(),
+                parent: 5,
+                ..template.clone()
+            },
+        );
+        index.inodes.insert(
+            5,
+            InodeEntry {
+                name: "cycle-b".to_string(),
+                parent: 4,
+                ..template
+            },
+        );
+        index.children.insert(
+            4,
+            vec![DirChild {
+                name: "cycle-b".to_string(),
+                inode: 5,
+            }],
+        );
+        index.children.insert(
+            5,
+            vec![DirChild {
+                name: "cycle-a".to_string(),
+                inode: 4,
+            }],
+        );
+        index.next_inode = 6;
+        assert_invalid(index);
+
+        let mut index = valid.clone();
+        let duplicate_blob = InodeEntry {
+            name: "copy.txt".to_string(),
+            parent: 1,
+            ..index.inodes.get(&3).unwrap().clone()
+        };
+        index.inodes.insert(4, duplicate_blob);
+        index.children.get_mut(&1).unwrap().push(DirChild {
+            name: "copy.txt".to_string(),
+            inode: 4,
+        });
+        index.next_inode = 5;
+        assert_invalid(index);
+
+        let mut index = valid.clone();
+        index.inodes.get_mut(&3).unwrap().disk_filename = "1.age".to_string();
+        assert_invalid(index);
+
+        let mut index = valid.clone();
+        index.next_inode = 3;
+        assert_invalid(index);
+
+        let mut index = valid;
+        index.next_file_id = 1;
+        assert_invalid(index);
+    }
+
+    #[test]
+    fn canonical_orphan_blob_is_never_reused_or_overwritten() {
+        let dir = PathBuf::from("target/test-orphan-blob-collision");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let mut index = structurally_valid_index();
+        fs::write(dir.join("000002.age"), b"crash evidence").unwrap();
+
+        assert!(ensure_no_future_blob_collisions(&dir, &index).is_err());
+        assert!(ensure_next_blob_slot_absent(&dir, &index).is_err());
+        assert_eq!(fs::read(dir.join("000002.age")).unwrap(), b"crash evidence");
+
+        // Historical deletion orphans below the monotonic counter are not a
+        // future allocation collision and remain tolerated for compatibility.
+        index.next_file_id = 3;
+        ensure_no_future_blob_collisions(&dir, &index).unwrap();
+        ensure_next_blob_slot_absent(&dir, &index).unwrap();
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -2322,6 +3392,20 @@ mod tests {
     }
 
     #[test]
+    fn continuous_notifications_still_honor_maximum_dirty_age() {
+        let start = Instant::now();
+        let timing = DirtyTiming {
+            first: start,
+            last: start + Duration::from_secs(29),
+        };
+        assert_eq!(
+            timing.next_wait(start + Duration::from_secs(29)),
+            Duration::from_secs(1)
+        );
+        assert_eq!(timing.next_wait(start + MAX_DIRTY_INTERVAL), Duration::ZERO);
+    }
+
+    #[test]
     fn conflict_detection_on_external_index_modification() {
         let dir = PathBuf::from("target/test-conflict");
         let _ = fs::remove_dir_all(&dir);
@@ -2352,13 +3436,207 @@ mod tests {
             original_blob,
             "conflict must be detected before a dirty blob is overwritten"
         );
+        assert!(ztfs.inner.read_only.load(Ordering::SeqCst));
 
-        // Restore the known generation so the dirty buffer can be committed
-        // and the test filesystem can shut down cleanly.
+        // A provider making the conflict disappear must not silently resume
+        // this mount. Restoring the known generation still requires remount.
         fs::write(&index_path, original_index).unwrap();
-        ztfs.flush_state().unwrap();
-        ztfs.release_inode(ino).unwrap();
+        let latched = ztfs.flush_state().unwrap_err();
+        assert!(
+            latched.to_string().contains("disabled until remount"),
+            "unexpected error: {latched}"
+        );
+        drop(ztfs);
 
+        let reopened = ZeroTrustFs::new("conflict-pw", dir.clone());
+        assert_eq!(
+            reopened.read_encrypted_file(&disk_filename).unwrap(),
+            b"before"
+        );
+        drop(reopened);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn canonical_kdf_replacement_latches_before_touching_dirty_generation() {
+        let dir = PathBuf::from("target/test-kdf-conflict");
+        let _ = fs::remove_dir_all(&dir);
+        let ztfs = ZeroTrustFs::new("conflict-pw", dir.clone());
+        let (ino, disk_filename) = add_file(&ztfs, "data.txt");
+        ztfs.open_inode(ino).unwrap();
+        ztfs.write_inode_content(ino, 0, b"before").unwrap();
+        ztfs.flush_state().unwrap();
+        let index_before = fs::read(dir.join(INDEX_FILE)).unwrap();
+        let blob_before = fs::read(dir.join(&disk_filename)).unwrap();
+        let kdf_before = fs::read(dir.join("_kdf.json")).unwrap();
+
+        ztfs.write_inode_content(ino, 0, b"after!").unwrap();
+        fs::write(dir.join("_kdf.json"), b"provider replacement").unwrap();
+        let error = ztfs.flush_state().unwrap_err();
+        assert!(
+            error.to_string().contains("KDF metadata")
+                && error.to_string().contains("changed externally"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(fs::read(dir.join(INDEX_FILE)).unwrap(), index_before);
+        assert_eq!(fs::read(dir.join(&disk_filename)).unwrap(), blob_before);
+        assert!(ztfs.inner.read_only.load(Ordering::SeqCst));
+
+        fs::write(dir.join("_kdf.json"), kdf_before).unwrap();
+        assert!(
+            ztfs.flush_state()
+                .unwrap_err()
+                .to_string()
+                .contains("disabled until remount")
+        );
+        drop(ztfs);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn persistence_gate_rechecks_latched_writability_before_mutation() {
+        let dir = PathBuf::from("target/test-gated-conflict-race");
+        let _ = fs::remove_dir_all(&dir);
+        let ztfs = ZeroTrustFs::new("conflict-pw", dir.clone());
+        let next_inode = ztfs.inner.state.read().unwrap().next_inode;
+        let held_gate = ztfs.inner.persistence_mutex.lock().unwrap();
+        let inner = Arc::clone(&ztfs.inner);
+        let mutation = thread::spawn(move || -> std::io::Result<()> {
+            let _gate = inner.persistence_mutex.lock().unwrap();
+            inner.ensure_writable()?;
+            inner.state.write().unwrap().next_inode += 1;
+            Ok(())
+        });
+
+        ztfs.inner
+            .latch_persistence_failure(std::io::Error::other("simulated cloud conflict"));
+        drop(held_gate);
+        assert!(mutation.join().unwrap().is_err());
+        assert_eq!(ztfs.inner.state.read().unwrap().next_inode, next_inode);
+
+        drop(ztfs);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn new_store_precondition_refuses_an_index_that_appeared_late() {
+        let dir = PathBuf::from("target/test-new-store-late-index");
+        let _ = fs::remove_dir_all(&dir);
+        let ztfs = ZeroTrustFs::new("conflict-pw", dir.clone());
+
+        // Recreate the initialization precondition after construction, then
+        // model a provider materializing the canonical index before publish.
+        *ztfs.inner.index_fingerprint.lock().unwrap() = None;
+        let error = ztfs.inner.ensure_index_unchanged().unwrap_err();
+        assert!(
+            error.to_string().contains("appeared externally"),
+            "unexpected error: {error}"
+        );
+        assert!(ztfs.inner.read_only.load(Ordering::SeqCst));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn detects_provider_generated_and_interrupted_index_siblings() {
+        let dir = PathBuf::from("target/test-index-sibling-names");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(INDEX_FILE), b"canonical").unwrap();
+        ensure_no_index_siblings(&dir).unwrap();
+
+        assert!(!is_possible_index_sibling_name(INDEX_FILE));
+        assert!(is_possible_index_sibling_name("._index.age.123.456.tmp"));
+        assert!(!is_possible_kdf_sibling_name("_kdf.json"));
+        assert!(is_possible_kdf_sibling_name("_kdf 2.json"));
+        assert!(!is_possible_blob_sibling_name("000001.age"));
+        assert!(is_possible_blob_sibling_name(
+            "000001 (conflicted copy).age"
+        ));
+        assert!(!is_possible_transaction_sibling_name("_rekey.manifest"));
+        assert!(!is_possible_transaction_sibling_name(".migrate_staging"));
+
+        for sibling in [
+            "_index 2.age",
+            "_index (conflicted copy).age",
+            "_INDEX.AGE",
+            "._index.age.icloud",
+            "._index.age.123.456.tmp",
+            "Copy of _index.age",
+            "_kdf 2.json",
+            "._kdf.json.icloud",
+            "._kdf.json.123.456.tmp",
+            "_rekey 2.manifest",
+            "_rekey (conflicted copy).lock",
+            ".rekey_staging 2",
+            "_migrate 2.manifest",
+            "._migrate.manifest.123.tmp",
+            ".migrate_staging (conflicted copy)",
+            "000001 (conflicted copy).age",
+            ".000001.age.123.456.tmp",
+            "Copy of 000001.age",
+        ] {
+            assert!(
+                is_possible_index_sibling_name(sibling)
+                    || is_possible_kdf_sibling_name(sibling)
+                    || is_possible_blob_sibling_name(sibling)
+                    || is_possible_transaction_sibling_name(sibling),
+                "missed {sibling}"
+            );
+        }
+
+        let sibling = "_index 2.age";
+        fs::write(dir.join(sibling), b"alternate generation").unwrap();
+        let error = ensure_no_index_siblings(&dir).unwrap_err();
+        assert!(
+            error.to_string().contains(sibling),
+            "unexpected error: {error}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sibling_index_refuses_commit_before_dirty_blob_is_touched() {
+        let dir = PathBuf::from("target/test-index-sibling-conflict");
+        let _ = fs::remove_dir_all(&dir);
+        let ztfs = ZeroTrustFs::new("conflict-pw", dir.clone());
+        let (ino, disk_filename) = add_file(&ztfs, "data.txt");
+        ztfs.open_inode(ino).unwrap();
+        ztfs.write_inode_content(ino, 0, b"before").unwrap();
+        ztfs.flush_state().unwrap();
+        let original_index = fs::read(dir.join(INDEX_FILE)).unwrap();
+        let original_blob = fs::read(dir.join(&disk_filename)).unwrap();
+
+        ztfs.write_inode_content(ino, 0, b"after!").unwrap();
+        let sibling = dir.join("_index 2.age");
+        fs::write(&sibling, b"provider conflict").unwrap();
+
+        let error = ztfs.flush_state().unwrap_err();
+        assert!(
+            error.to_string().contains("cloud-conflict backing"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(fs::read(dir.join(INDEX_FILE)).unwrap(), original_index);
+        assert_eq!(
+            fs::read(dir.join(&disk_filename)).unwrap(),
+            original_blob,
+            "sibling conflict must be detected before a dirty blob is overwritten"
+        );
+        assert!(ztfs.inner.read_only.load(Ordering::SeqCst));
+
+        fs::remove_file(sibling).unwrap();
+        let latched = ztfs.flush_state().unwrap_err();
+        assert!(latched.to_string().contains("disabled until remount"));
+        drop(ztfs);
+
+        let reopened = ZeroTrustFs::new("conflict-pw", dir.clone());
+        assert_eq!(
+            reopened.read_encrypted_file(&disk_filename).unwrap(),
+            b"before"
+        );
+        drop(reopened);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -2388,6 +3666,128 @@ mod tests {
             .map(|entry| entry.unwrap().file_name())
             .collect();
         assert_eq!(entries, vec![std::ffi::OsString::from("test.dat")]);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn durable_create_new_never_replaces_a_concurrent_target() {
+        let dir = PathBuf::from("target/test-durable-create-new-conflict");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("_rekey.manifest");
+        fs::write(&path, b"provider generation").unwrap();
+
+        assert!(durable_create_new(&path, b"local generation").is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"provider generation");
+        assert!(
+            fs::read_dir(&dir).unwrap().count() >= 2,
+            "the complete local temp must be preserved as conflict evidence"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bounded_read_rejects_sparse_oversized_cloud_file() {
+        let dir = PathBuf::from("target/test-bounded-cloud-read");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("oversized.age");
+        fs::File::create(&path)
+            .unwrap()
+            .set_len(1024 * 1024 * 1024)
+            .unwrap();
+
+        let error = read_bounded_file(&path, None, 1024).unwrap_err();
+        assert!(
+            error.to_string().contains("unexpectedly large"),
+            "unexpected error: {error}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn index_output_limit_prevents_creating_an_unmountable_store() {
+        ensure_index_ciphertext_within_limit(MAX_INDEX_CIPHERTEXT_LEN, MAX_INDEX_CIPHERTEXT_LEN)
+            .unwrap();
+        let error = ensure_index_ciphertext_within_limit(
+            MAX_INDEX_CIPHERTEXT_LEN + 1,
+            MAX_INDEX_CIPHERTEXT_LEN,
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("encrypted index is too large"),
+            "unexpected error: {error}"
+        );
+
+        let maximum_plaintext =
+            usize::try_from(MAX_INDEX_CIPHERTEXT_LEN - V1_CIPHERTEXT_OVERHEAD).unwrap();
+        ensure_index_plaintext_within_limit(maximum_plaintext).unwrap();
+        assert!(ensure_index_plaintext_within_limit(maximum_plaintext + 1).is_err());
+    }
+
+    #[test]
+    fn rejected_oversized_index_does_not_replace_committed_generation() {
+        let dir = PathBuf::from("target/test-index-output-limit");
+        let _ = fs::remove_dir_all(&dir);
+        let ztfs = ZeroTrustFs::new("pw", dir.clone());
+        let index_path = dir.join(INDEX_FILE);
+        let committed = fs::read(&index_path).unwrap();
+
+        let error = ztfs
+            .persist_index_with_limit(b"too large for test limit".to_vec(), 40)
+            .unwrap_err();
+        assert!(error.to_string().contains("encrypted index is too large"));
+        assert_eq!(fs::read(&index_path).unwrap(), committed);
+
+        drop(ztfs);
+        let _reopened = ZeroTrustFs::new("pw", dir.clone());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_read_refuses_backing_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = PathBuf::from("target/test-bounded-symlink-read");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("real.age"), b"ciphertext").unwrap();
+        let link = dir.join("linked.age");
+        symlink("real.age", &link).unwrap();
+
+        assert!(read_bounded_file(&link, None, 1024).is_err());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_rejects_blob_length_that_disagrees_with_index() {
+        let dir = PathBuf::from("target/test-indexed-blob-length");
+        let _ = fs::remove_dir_all(&dir);
+        let ztfs = ZeroTrustFs::new("pw", dir.clone());
+        let (ino, disk_filename) = add_file(&ztfs, "oversized.bin");
+        ztfs.inner
+            .state
+            .write()
+            .unwrap()
+            .inodes
+            .get_mut(&ino)
+            .unwrap()
+            .size = 4;
+        fs::File::create(dir.join(&disk_filename))
+            .unwrap()
+            .set_len(1024 * 1024 * 1024)
+            .unwrap();
+
+        let error = ztfs.open_inode(ino).unwrap_err();
+        assert!(
+            error.to_string().contains("maximum 44"),
+            "unexpected error: {error}"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -2509,6 +3909,20 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn zero_size_open_refuses_a_dangling_backing_symlink() {
+        let dir = PathBuf::from("target/test-open-zero-dangling-symlink");
+        let _ = fs::remove_dir_all(&dir);
+        let ztfs = ZeroTrustFs::new("pw", dir.clone());
+        let (ino, disk_filename) = add_file(&ztfs, "fresh.txt");
+        std::os::unix::fs::symlink("missing-provider-target", dir.join(&disk_filename)).unwrap();
+
+        assert!(ztfs.open_inode(ino).is_err());
+        assert!(fs::symlink_metadata(dir.join(&disk_filename)).is_ok());
+        let _ = fs::remove_dir_all(dir);
+    }
+
     /// A non-empty file whose backing blob vanished is genuine data loss
     /// and must error on open.
     #[test]
@@ -2627,6 +4041,36 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn closed_truncate_refuses_sibling_before_touching_blob() {
+        let dir = PathBuf::from("target/test-truncate-sibling-conflict");
+        let _ = fs::remove_dir_all(&dir);
+        let ztfs = ZeroTrustFs::new("pw", dir.clone());
+        let (ino, disk_filename) = add_file(&ztfs, "data.txt");
+        ztfs.write_encrypted_file(&disk_filename, b"original")
+            .unwrap();
+        ztfs.inner
+            .state
+            .write()
+            .unwrap()
+            .inodes
+            .get_mut(&ino)
+            .unwrap()
+            .size = 8;
+        ztfs.flush_state().unwrap();
+        let blob_before = fs::read(dir.join(&disk_filename)).unwrap();
+        let index_before = fs::read(dir.join(INDEX_FILE)).unwrap();
+        let sibling = dir.join("_index 2.age");
+        fs::write(&sibling, b"provider conflict").unwrap();
+
+        assert!(ztfs.truncate_inode(ino, 4).is_err());
+        assert_eq!(fs::read(dir.join(&disk_filename)).unwrap(), blob_before);
+        assert_eq!(fs::read(dir.join(INDEX_FILE)).unwrap(), index_before);
+
+        fs::remove_file(sibling).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// Truncating an OPEN file resizes the in-memory buffer.
     #[test]
     fn truncate_open_file_resizes_buffer() {
@@ -2641,6 +4085,10 @@ mod tests {
             .unwrap()
             .insert(ino, b"abcdef".to_vec());
         ztfs.truncate_inode(ino, 3).unwrap();
+        assert!(
+            ztfs.inner.index_dirty.load(Ordering::Acquire),
+            "an open-file truncate must wake the debounce persistence path"
+        );
         assert_eq!(
             ztfs.inner.open_files.read().unwrap().get(&ino).unwrap(),
             b"abc"
@@ -2657,8 +4105,101 @@ mod tests {
         let (ino, df) = add_file(&ztfs, "data.txt");
         ztfs.open_inode(ino).unwrap();
         ztfs.write_inode_content(ino, 0, b"synced").unwrap();
+        assert!(
+            ztfs.inner.index_dirty.load(Ordering::Acquire),
+            "a content write must wake the debounce persistence path"
+        );
         ztfs.fsync_inode(ino).unwrap();
         assert_eq!(ztfs.read_encrypted_file(&df).unwrap(), b"synced");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn temporary_read_only_mode_does_not_turn_fsync_into_false_success() {
+        let dir = PathBuf::from("target/test-fsync-temporary-read-only");
+        let _ = fs::remove_dir_all(&dir);
+        let ztfs = ZeroTrustFs::new("pw", dir.clone());
+        let (ino, disk_filename) = add_file(&ztfs, "data.txt");
+        ztfs.open_inode(ino).unwrap();
+        ztfs.write_inode_content(ino, 0, b"must persist").unwrap();
+
+        // Online rekey uses this flag temporarily while taking its snapshot.
+        // Persistence calls must wait on the gate and flush, never claim that
+        // RAM-only bytes are durable merely because ordinary writes are paused.
+        ztfs.inner.read_only.store(true, Ordering::SeqCst);
+        ztfs.fsync_inode(ino).unwrap();
+        assert_eq!(
+            ztfs.read_encrypted_file(&disk_filename).unwrap(),
+            b"must persist"
+        );
+        ztfs.inner.restore_writes_if_healthy();
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn fsync_persists_pending_metadata_without_a_forced_clean_rewrite() {
+        let dir = PathBuf::from("target/test-fsync-metadata");
+        let _ = fs::remove_dir_all(&dir);
+        let ino;
+        {
+            let ztfs = ZeroTrustFs::new("pw", dir.clone());
+            (ino, _) = add_file(&ztfs, "metadata.txt");
+            ztfs.flush_state().unwrap();
+            ztfs.inner
+                .state
+                .write()
+                .unwrap()
+                .inodes
+                .get_mut(&ino)
+                .unwrap()
+                .perm = 0o600;
+            ztfs.mark_dirty();
+            ztfs.fsync_inode(ino).unwrap();
+        }
+
+        let reopened = ZeroTrustFs::new("pw", dir.clone());
+        assert_eq!(
+            reopened
+                .inner
+                .state
+                .read()
+                .unwrap()
+                .inodes
+                .get(&ino)
+                .unwrap()
+                .perm,
+            0o600
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn clean_fsync_preserves_blob_and_index_ciphertext() {
+        let dir = PathBuf::from("target/test-clean-fsync");
+        let _ = fs::remove_dir_all(&dir);
+        let ztfs = ZeroTrustFs::new("pw", dir.clone());
+        let (ino, disk_filename) = add_file(&ztfs, "clean.txt");
+        ztfs.write_encrypted_file(&disk_filename, b"unchanged")
+            .unwrap();
+        ztfs.inner
+            .state
+            .write()
+            .unwrap()
+            .inodes
+            .get_mut(&ino)
+            .unwrap()
+            .size = 9;
+        ztfs.flush_state().unwrap();
+        ztfs.open_inode(ino).unwrap();
+        let blob_before = fs::read(dir.join(&disk_filename)).unwrap();
+        let index_before = fs::read(dir.join(INDEX_FILE)).unwrap();
+
+        ztfs.fsync_inode(ino).unwrap();
+
+        assert_eq!(fs::read(dir.join(&disk_filename)).unwrap(), blob_before);
+        assert_eq!(fs::read(dir.join(INDEX_FILE)).unwrap(), index_before);
+        ztfs.release_inode(ino).unwrap();
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -10,6 +10,8 @@ Offer iCloud Drive as a beta backend on macOS, with the complete store folder ma
 
 This recommendation is about filesystem behavior, diagnostics, and portability rather than a claim that Google has better cloud-service uptime. Google Mirror mode gives `zerotrust-drive` ordinary, permanently local files, which best match its POSIX and FUSE assumptions. iCloud has lower onboarding friction for an Apple-only user, but it always uses Apple's File Provider model and therefore has more placeholder, materialization, and coordination behavior to account for.
 
+On macOS, Google storage also creates a useful organizational split: Apple controls the operating system, Google stores ciphertext, and an independent open-source project handles client-side encryption. iCloud still keeps storage separate from the encryption project, but Apple controls both the OS and storage surface. In either case, the important boundary is that the storage provider does not also supply the only opaque client and update channel that handles the encryption key. A vendor privacy promise is not a substitute for that technical and organizational separation.
+
 Neither backend is a database, a shared POSIX filesystem, or a backup. One store must have only one active writer at a time.
 
 ## Vendor-documented facts
@@ -82,11 +84,11 @@ iCloud's strengths are:
 Its limitations for this implementation are:
 
 - iCloud Drive is File Provider-managed. Without Keep Downloaded, reads may encounter placeholders and network materialization.
-- Apple recommends coordinated access through `NSFileCoordinator` for shared and iCloud locations. The current Rust implementation uses POSIX file operations and does not participate in that native coordination mechanism.
+- Apple recommends coordinated access through `NSFileCoordinator` for shared and iCloud locations. The current Rust implementation uses POSIX file operations and does not yet participate in that native coordination mechanism. Correct integration must cover every exact index, blob, manifest, staging, rename, and deletion path; coordinating only the parent directory or `_index.age` would be misleading.
 - Apple provides native clients for its platforms and Windows, but no general iCloud Drive REST API or native Linux filesystem client.
 - Finder exposes current per-item state, but troubleshooting and historical incident information are less detailed than Google's.
 
-Apple documents numbered filenames and explicit version selection when offline edits conflict. Such a generated `_index 2.age` cannot be merged meaningfully and may be ignored by the current store loader.
+Apple documents numbered filenames and explicit version selection when offline edits conflict. Such a generated `_index 2.age` cannot be merged meaningfully. The client now scans for provider-generated siblings of blobs, the index, KDF metadata, and migration/rekey controls; iCloud index-placeholder names; unexpected staging entries; and stale write temps both before startup recovery and before each commit. It fails closed while preserving the artifacts for manual reconciliation.
 
 - [Apple: Resolve document conflicts](https://support.apple.com/en-gb/guide/mac-help/mh40780/26/mac/26)
 - [Apple Technical Note TN2336: File conflicts](https://developer.apple.com/library/archive/technotes/tn2336/)
@@ -140,7 +142,11 @@ A broader May 2025 Mac discussion contains both favorable and unfavorable experi
 
 Only one mounted `zerotrust-drive` instance may write a store at a time. Before moving to another computer, the user must unmount the first instance and wait until the provider explicitly reports that synchronization is complete.
 
-Provider conflict resolution is not a concurrency mechanism. Encrypted index versions cannot be merged, and provider-generated sibling index files can strand otherwise valid encrypted blobs. The application now fingerprints the active `_index.age` and refuses a local commit when that generation changes externally. It does not yet detect provider-generated sibling index files, so the one-writer rule remains mandatory.
+Provider conflict resolution is not a concurrency mechanism. Encrypted index versions cannot be merged, and provider-generated sibling index files can strand otherwise valid encrypted blobs. The application fingerprints the complete active `_index.age` and exact `_kdf.json`, scans for alternate control artifacts, and refuses a local commit when a check indicates a competing or interrupted generation. Maintenance locks contain a hashed operating-system machine identity and PID so a lock synchronized from another device is not declared stale by probing its PID on the wrong host. These controls are detection, not a cross-machine lease or remote transaction, so the one-writer rule remains mandatory.
+
+After a mounted instance detects such a conflict, it latches persistence off until remount. Writes return read-only errors and flush/fsync report the stored conflict even if the provider later removes or hides the sibling. This prevents an apparently self-healing sync state from silently resuming commits before a human has reconciled the generations.
+
+The visible lock itself is also eventually synchronized. Two offline or partitioned machines can each believe they created it first, so machine-bound ownership does not make simultaneous maintenance safe. Foreign, legacy PID-only, and malformed locks are preserved for manual reconciliation rather than deleted automatically.
 
 ### Not a backup
 

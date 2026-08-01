@@ -4,6 +4,7 @@ mod crypto;
 mod fs;
 mod migrate;
 mod rekey;
+mod transaction_lock;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
@@ -103,7 +104,7 @@ fn ensure_disjoint_paths(encrypted_dir: &Path, decrypted_dir: &Path) -> Result<(
 
 fn ensure_recovery_manifest_cleared(base_path: &Path, manifest_name: &str) -> Result<(), String> {
     let manifest = base_path.join(manifest_name);
-    match manifest.try_exists() {
+    match fs::backing_entry_exists(&manifest) {
         Ok(false) => Ok(()),
         Ok(true) => Err(format!(
             "recovery remains incomplete; refusing to modify {} while {manifest_name} is unresolved",
@@ -291,14 +292,18 @@ fn main() {
     let _drive_operation_lock =
         DriveOperationLock::acquire(&base_path).unwrap_or_else(|e| exit_with_error(e));
 
+    // Cloud providers can preserve conflicting copies under sibling names
+    // such as `_index 2.age`. There is no safe automatic merge for an
+    // encrypted index, so detect them before recovery or any other write.
+    fs::ensure_no_index_siblings(&base_path).unwrap_or_else(|e| exit_with_error(e));
+
     // Footgun guard: refuse to CREATE a brand-new drive under the
     // built-in demo passphrase — that would store data under a
     // publicly-known key (effectively plaintext). Existing drives are
     // left alone (the operator may legitimately be opening a demo drive,
     // and refusing would lock them out).
-    let index_exists = base_path
-        .join("_index.age")
-        .try_exists()
+    let index_path = base_path.join("_index.age");
+    let index_exists = fs::backing_entry_exists(&index_path)
         .unwrap_or_else(|e| exit_with_error(format!("cannot inspect encrypted index: {e}")));
     if using_insecure_passphrase && !index_exists && !cli.allow_default_passphrase {
         eprintln!(
@@ -353,7 +358,7 @@ fn main() {
             }
             Err(e) => {
                 eprintln!("zerotrust-drive: error: migration failed: {e}");
-                match base_path.join("_migrate.manifest").try_exists() {
+                match fs::backing_entry_exists(&base_path.join("_migrate.manifest")) {
                     Ok(true) => eprintln!(
                         "zerotrust-drive: migration crossed its commit point; keep recovery artifacts and restart the command to complete recovery"
                     ),

@@ -24,14 +24,20 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::io::Read;
 
 use crate::crypto::{
-    KdfParams, RecoveryFingerprint, ciphertext_fingerprint, decrypt_bytes_legacy,
-    derive_key_legacy, derive_key_legacy_tagged, encrypt_blob, encrypt_index, exact_fingerprint,
-    load_kdf, try_derive_key,
+    KdfParams, RecoveryFingerprint, ciphertext_fingerprint, ciphertext_fingerprint_bounded,
+    ciphertext_fingerprint_expected, decrypt_bytes_legacy, derive_key_legacy,
+    derive_key_legacy_tagged, encrypt_blob_owned, encrypt_index, exact_fingerprint, load_kdf,
+    try_derive_key,
 };
-use crate::fs::{DiskIndex, InodeKind, durable_write};
+use crate::fs::{
+    DiskIndex, InodeKind, backing_entry_exists, durable_create_new, durable_write,
+    ensure_index_plaintext_within_limit, ensure_no_index_siblings, ensure_real_directory,
+    read_bounded_backing_file, read_index_ciphertext, read_legacy_blob_ciphertext,
+    validate_disk_index,
+};
+use crate::transaction_lock::{lock_owner_is_active, prepare_lock_owner, write_lock_owner};
 
 const STAGING: &str = ".migrate_staging";
 const MANIFEST: &str = "_migrate.manifest";
@@ -39,7 +45,30 @@ const LOCK: &str = "_migrate.lock";
 const KDF_FILE: &str = "_kdf.json";
 const INDEX_FILE: &str = "_index.age";
 const MAX_MANIFEST_FILE_LEN: u64 = 64 * 1024 * 1024;
+const MAX_INDEX_CIPHERTEXT_LEN: u64 = 64 * 1024 * 1024;
 const MAX_MANIFEST_ENTRIES: usize = 100_000;
+
+#[derive(PartialEq, Eq)]
+struct LegacyIndexFingerprint {
+    len: u64,
+    nonce: [u8; 12],
+    tag: [u8; 16],
+}
+
+fn legacy_index_fingerprint(bytes: &[u8]) -> Result<LegacyIndexFingerprint, String> {
+    if bytes.len() < 28 {
+        return Err("legacy encrypted index is too short".to_string());
+    }
+    let mut nonce = [0u8; 12];
+    nonce.copy_from_slice(&bytes[..12]);
+    let mut tag = [0u8; 16];
+    tag.copy_from_slice(&bytes[bytes.len() - 16..]);
+    Ok(LegacyIndexFingerprint {
+        len: bytes.len() as u64,
+        nonce,
+        tag,
+    })
+}
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct ManifestEntry {
@@ -135,6 +164,15 @@ fn validate_manifest(entries: &[ManifestEntry]) -> Result<(), String> {
                 entry.filename
             ));
         }
+        if is_index
+            && entry
+                .fingerprint
+                .as_ref()
+                .and_then(RecoveryFingerprint::ciphertext_len)
+                .is_some_and(|len| len > MAX_INDEX_CIPHERTEXT_LEN)
+        {
+            return Err("migration manifest index exceeds the live index-size limit".to_string());
+        }
     }
     Ok(())
 }
@@ -159,40 +197,23 @@ fn remove_file_if_exists(path: &std::path::Path) -> Result<(), String> {
 }
 
 fn remove_dir_if_exists(path: &std::path::Path) -> Result<(), String> {
-    match std::fs::remove_dir_all(path) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(format!("remove {}: {e}", path.display())),
+    match std::fs::symlink_metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(format!("inspect {}: {e}", path.display())),
+        Ok(_) => {}
     }
+    ensure_real_directory(path).map_err(|e| e.to_string())?;
+    std::fs::remove_dir_all(path).map_err(|e| format!("remove {}: {e}", path.display()))
 }
 
-#[cfg(unix)]
-fn pid_is_live(pid: u32) -> bool {
-    if pid > i32::MAX as u32 {
-        return false;
+fn remove_empty_dir_if_exists(path: &std::path::Path) -> Result<(), String> {
+    match std::fs::symlink_metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(format!("inspect {}: {e}", path.display())),
+        Ok(_) => {}
     }
-    let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
-    result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-}
-
-#[cfg(not(unix))]
-fn pid_is_live(pid: u32) -> bool {
-    pid == std::process::id()
-}
-
-fn lock_owner_is_live(lock_path: &std::path::Path) -> Result<bool, String> {
-    if !lock_path
-        .try_exists()
-        .map_err(|e| format!("check {}: {e}", lock_path.display()))?
-    {
-        return Ok(false);
-    }
-    let value = std::fs::read_to_string(lock_path)
-        .map_err(|e| format!("read migration lock {}: {e}", lock_path.display()))?;
-    let Ok(pid) = value.trim().parse::<u32>() else {
-        return Ok(false);
-    };
-    Ok(pid_is_live(pid))
+    ensure_real_directory(path).map_err(|e| e.to_string())?;
+    std::fs::remove_dir(path).map_err(|e| format!("remove empty {}: {e}", path.display()))
 }
 
 fn fingerprint_for(filename: &str, path: &std::path::Path) -> Result<RecoveryFingerprint, String> {
@@ -200,6 +221,21 @@ fn fingerprint_for(filename: &str, path: &std::path::Path) -> Result<RecoveryFin
         exact_fingerprint(path)
     } else {
         ciphertext_fingerprint(path)
+    }
+}
+
+fn fingerprint_for_expected(
+    filename: &str,
+    path: &std::path::Path,
+    expected: &RecoveryFingerprint,
+) -> Result<RecoveryFingerprint, String> {
+    if filename == KDF_FILE {
+        exact_fingerprint(path)
+    } else {
+        let expected_len = expected.ciphertext_len().ok_or_else(|| {
+            format!("migration entry {filename} has a non-ciphertext fingerprint")
+        })?;
+        ciphertext_fingerprint_expected(path, expected_len)
     }
 }
 
@@ -216,28 +252,27 @@ fn write_manifest(path: &std::path::Path, entries: &[ManifestEntry]) -> Result<(
     durable_write_checked(path, &json)
 }
 
-fn read_manifest(path: &std::path::Path) -> Result<Vec<ManifestEntry>, String> {
-    let file = std::fs::File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
-    let len = file
-        .metadata()
-        .map_err(|e| format!("stat {}: {e}", path.display()))?
-        .len();
-    if len > MAX_MANIFEST_FILE_LEN {
-        return Err(format!(
-            "{} is too large ({len} bytes; maximum {MAX_MANIFEST_FILE_LEN})",
-            path.display()
-        ));
-    }
-    let mut json = Vec::with_capacity(len as usize);
-    file.take(MAX_MANIFEST_FILE_LEN + 1)
-        .read_to_end(&mut json)
-        .map_err(|e| format!("read {}: {e}", path.display()))?;
+fn create_manifest(path: &std::path::Path, entries: &[ManifestEntry]) -> Result<(), String> {
+    validate_manifest(entries)?;
+    let json =
+        serde_json::to_vec(entries).map_err(|e| format!("serialize migration manifest: {e}"))?;
     if json.len() as u64 > MAX_MANIFEST_FILE_LEN {
         return Err(format!(
-            "{} grew beyond the {MAX_MANIFEST_FILE_LEN}-byte maximum while being read",
-            path.display()
+            "migration manifest is too large ({} bytes; maximum {MAX_MANIFEST_FILE_LEN})",
+            json.len()
         ));
     }
+    durable_create_new(path, &json).map_err(|error| {
+        format!(
+            "publish new migration manifest {} without replacement: {error}",
+            path.display()
+        )
+    })
+}
+
+fn read_manifest(path: &std::path::Path) -> Result<Vec<ManifestEntry>, String> {
+    let json = read_bounded_backing_file(path, MAX_MANIFEST_FILE_LEN)
+        .map_err(|e| format!("read {}: {e}", path.display()))?;
     let entries: Vec<ManifestEntry> =
         serde_json::from_slice(&json).map_err(|e| format!("parse migration manifest: {e}"))?;
     validate_manifest(&entries)?;
@@ -252,16 +287,23 @@ fn upgrade_manifest_fingerprints(
 ) -> Result<(), String> {
     let mut changed = false;
     for entry in entries.iter_mut() {
-        if entry.fingerprint.is_some() {
+        if entry
+            .fingerprint
+            .as_ref()
+            .is_some_and(RecoveryFingerprint::has_full_content_identity)
+        {
             continue;
         }
         let staged = staging.join(&entry.filename);
-        let source = if staged
-            .try_exists()
+        let source = if entry.renamed {
+            base_path.join(&entry.filename)
+        } else if backing_entry_exists(&staged)
             .map_err(|e| format!("check {}: {e}", staged.display()))?
         {
             staged
-        } else if entry.renamed {
+        } else if entry.fingerprint.is_some() {
+            // Fingerprint-backed manifests are immutable. A matching target
+            // can prove a rename that completed immediately before a crash.
             base_path.join(&entry.filename)
         } else {
             return Err(format!(
@@ -269,11 +311,59 @@ fn upgrade_manifest_fingerprints(
                 entry.filename
             ));
         };
-        entry.fingerprint = Some(fingerprint_for(&entry.filename, &source)?);
+        let upgraded = match &entry.fingerprint {
+            Some(existing) => fingerprint_for_expected(&entry.filename, &source, existing)?,
+            None if entry.filename == INDEX_FILE => {
+                ciphertext_fingerprint_bounded(&source, MAX_INDEX_CIPHERTEXT_LEN)?
+            }
+            None => fingerprint_for(&entry.filename, &source)?,
+        };
+        if let Some(existing) = &entry.fingerprint
+            && !existing.has_same_legacy_identity(&upgraded)
+        {
+            return Err(format!(
+                "cannot upgrade migration manifest fingerprint for {} because the staged/target identity changed",
+                entry.filename
+            ));
+        }
+        entry.fingerprint = Some(upgraded);
         changed = true;
     }
     if changed {
         write_manifest(manifest_path, entries)?;
+    }
+    Ok(())
+}
+
+fn ensure_staging_unambiguous(
+    staging: &std::path::Path,
+    entries: &[ManifestEntry],
+) -> Result<(), String> {
+    if !backing_entry_exists(staging).map_err(|e| format!("check {}: {e}", staging.display()))? {
+        return Ok(());
+    }
+    ensure_real_directory(staging).map_err(|e| e.to_string())?;
+    let allowed: HashSet<&str> = entries
+        .iter()
+        .map(|entry| entry.filename.as_str())
+        .collect();
+    for entry in std::fs::read_dir(staging)
+        .map_err(|e| format!("read staging directory {}: {e}", staging.display()))?
+    {
+        let entry = entry.map_err(|e| format!("read staging entry: {e}"))?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            return Err(format!(
+                "migration staging {} contains a non-UTF-8 entry; preserving it for reconciliation",
+                staging.display()
+            ));
+        };
+        if !allowed.contains(name) {
+            return Err(format!(
+                "migration staging {} contains unexpected provider/interrupted artifact {name:?}; preserving all recovery evidence",
+                staging.display()
+            ));
+        }
     }
     Ok(())
 }
@@ -283,6 +373,10 @@ fn commit_manifest(
     staging: &std::path::Path,
     entries: &[ManifestEntry],
 ) -> Result<(), String> {
+    if backing_entry_exists(staging).map_err(|e| format!("check {}: {e}", staging.display()))? {
+        ensure_real_directory(staging).map_err(|e| e.to_string())?;
+    }
+    ensure_staging_unambiguous(staging, entries)?;
     for entry in entries {
         let expected = entry.fingerprint.as_ref().ok_or_else(|| {
             format!(
@@ -290,13 +384,16 @@ fn commit_manifest(
                 entry.filename
             )
         })?;
+        if !expected.has_full_content_identity() {
+            return Err(format!(
+                "migration manifest entry {} has no full-content fingerprint",
+                entry.filename
+            ));
+        }
         let staged = staging.join(&entry.filename);
         let original = base_path.join(&entry.filename);
-        if staged
-            .try_exists()
-            .map_err(|e| format!("check {}: {e}", staged.display()))?
-        {
-            let actual = fingerprint_for(&entry.filename, &staged)?;
+        if backing_entry_exists(&staged).map_err(|e| format!("check {}: {e}", staged.display()))? {
+            let actual = fingerprint_for_expected(&entry.filename, &staged, expected)?;
             if &actual != expected {
                 return Err(format!(
                     "staged {} does not match its migration manifest",
@@ -310,7 +407,7 @@ fn commit_manifest(
             sync_dir(staging)?;
             sync_dir(base_path)?;
         } else {
-            let actual = fingerprint_for(&entry.filename, &original).map_err(|e| {
+            let actual = fingerprint_for_expected(&entry.filename, &original, expected).map_err(|e| {
                 format!(
                     "migration entry {} is missing from staging and target does not verify: {e}",
                     entry.filename
@@ -328,7 +425,9 @@ fn commit_manifest(
 }
 
 fn cleanup_transaction(base_path: &std::path::Path) -> Result<(), String> {
-    remove_dir_if_exists(&base_path.join(STAGING))?;
+    // A nonempty directory at this point contains an unexpected artifact that
+    // appeared after the commit pre-scan. Preserve it and the manifest.
+    remove_empty_dir_if_exists(&base_path.join(STAGING))?;
     remove_file_if_exists(&base_path.join(LOCK))?;
     // Manifest is removed last. If cleanup is interrupted before this point,
     // fingerprint recovery remains able to verify the fully committed target.
@@ -344,8 +443,7 @@ fn cleanup_transaction(base_path: &std::path::Path) -> Result<(), String> {
 /// completed rather than misclassified.
 pub fn needs_migration(base_path: &std::path::Path) -> Result<bool, String> {
     let index_path = base_path.join(INDEX_FILE);
-    if !index_path
-        .try_exists()
+    if !backing_entry_exists(&index_path)
         .map_err(|e| format!("check {}: {e}", index_path.display()))?
     {
         return Ok(false);
@@ -370,9 +468,11 @@ pub fn recover_interrupted_migration(base_path: &std::path::Path) -> bool {
 pub(crate) fn recover_interrupted_migration_result(
     base_path: &std::path::Path,
 ) -> Result<bool, String> {
+    ensure_no_index_siblings(base_path).map_err(|e| {
+        format!("refuse migration recovery while control metadata is ambiguous: {e}")
+    })?;
     let manifest_path = base_path.join(MANIFEST);
-    if !manifest_path
-        .try_exists()
+    if !backing_entry_exists(&manifest_path)
         .map_err(|e| format!("check {}: {e}", manifest_path.display()))?
     {
         // No manifest means the commit point was not crossed. Refuse to touch
@@ -380,13 +480,11 @@ pub(crate) fn recover_interrupted_migration_result(
         // artifacts (the lock can exist before staging is created).
         let staging = base_path.join(STAGING);
         let lock_path = base_path.join(LOCK);
-        let staging_exists = staging
-            .try_exists()
+        let staging_exists = backing_entry_exists(&staging)
             .map_err(|e| format!("check {}: {e}", staging.display()))?;
-        let lock_exists = lock_path
-            .try_exists()
+        let lock_exists = backing_entry_exists(&lock_path)
             .map_err(|e| format!("check {}: {e}", lock_path.display()))?;
-        if lock_exists && lock_owner_is_live(&lock_path)? {
+        if lock_exists && lock_owner_is_active(&lock_path, "migration")? {
             return Err(format!(
                 "refusing to clean migration state owned by a live process ({})",
                 lock_path.display()
@@ -409,7 +507,7 @@ pub(crate) fn recover_interrupted_migration_result(
         return Ok(false);
     }
     let lock_path = base_path.join(LOCK);
-    if lock_owner_is_live(&lock_path)? {
+    if lock_owner_is_active(&lock_path, "migration")? {
         return Err(format!(
             "refusing to recover migration owned by a live process ({})",
             lock_path.display()
@@ -440,8 +538,8 @@ pub fn migrate_v0_to_v1(passphrase: &str, base_path: &std::path::Path) -> Result
 
     // Lock out concurrent mounts/migrations.
     let lock_path = base_path.join(LOCK);
+    let lock_record = prepare_lock_owner("migration")?;
     {
-        use std::io::Write;
         let mut lock_file = std::fs::OpenOptions::new()
             .create_new(true)
             .write(true)
@@ -452,8 +550,17 @@ pub fn migrate_v0_to_v1(passphrase: &str, base_path: &std::path::Path) -> Result
                     lock_path.display()
                 )
             })?;
-        write!(lock_file, "{}", std::process::id())
-            .map_err(|e| format!("write migration lock {}: {e}", lock_path.display()))?;
+        if let Err(error) = write_lock_owner(&mut lock_file, &lock_record, &lock_path, "migration")
+        {
+            drop(lock_file);
+            let cleanup = remove_file_if_exists(&lock_path).and_then(|()| sync_dir(base_path));
+            return match cleanup {
+                Ok(()) => Err(error),
+                Err(cleanup_error) => Err(format!(
+                    "{error}; additionally failed to remove the new incomplete lock: {cleanup_error}"
+                )),
+            };
+        }
         lock_file
             .sync_all()
             .map_err(|e| format!("sync migration lock {}: {e}", lock_path.display()))?;
@@ -462,9 +569,7 @@ pub fn migrate_v0_to_v1(passphrase: &str, base_path: &std::path::Path) -> Result
 
     let result = migrate_inner(passphrase, base_path);
     if let Err(original_error) = &result
-        && !base_path
-            .join(MANIFEST)
-            .try_exists()
+        && !backing_entry_exists(&base_path.join(MANIFEST))
             .map_err(|e| format!("check migration manifest after failure: {e}"))?
     {
         // Staging never reached the manifest commit point, so the v0
@@ -499,6 +604,9 @@ fn decrypt_v0_index(
         };
         let index: DiskIndex = serde_json::from_slice(&index_json)
             .map_err(|e| format!("authenticated {variant} index is invalid JSON: {e}"))?;
+        validate_disk_index(&index).map_err(|error| {
+            format!("authenticated {variant} index is structurally invalid: {error}")
+        })?;
         eprintln!("zerotrust-drive: detected {variant} legacy key format");
         return Ok((key, index_json, index));
     }
@@ -511,7 +619,9 @@ fn decrypt_v0_index(
 fn migrate_inner(passphrase: &str, base_path: &std::path::Path) -> Result<(), String> {
     // 1. Read + decrypt the v0 index with the legacy key.
     let index_path = base_path.join(INDEX_FILE);
-    let index_ct = std::fs::read(&index_path).map_err(|e| format!("read {INDEX_FILE}: {e}"))?;
+    let index_ct =
+        read_index_ciphertext(&index_path).map_err(|e| format!("read {INDEX_FILE}: {e}"))?;
+    let expected_index_fingerprint = legacy_index_fingerprint(&index_ct)?;
     let (old_key, index_json, index) = decrypt_v0_index(passphrase, &index_ct)?;
 
     // 2. New v1 key material.
@@ -532,6 +642,7 @@ fn migrate_inner(passphrase: &str, base_path: &std::path::Path) -> Result<(), St
 
     let staging = base_path.join(STAGING);
     std::fs::create_dir_all(&staging).map_err(|e| format!("create staging: {e}"))?;
+    ensure_real_directory(&staging).map_err(|e| e.to_string())?;
 
     let total = disk_files.len() + 2; // + index + kdf
     eprintln!(
@@ -540,9 +651,10 @@ fn migrate_inner(passphrase: &str, base_path: &std::path::Path) -> Result<(), St
     );
 
     // 3. Stage every blob: legacy-decrypt → v1-encrypt.
+    let mut staged_blob_fingerprints = Vec::with_capacity(disk_files.len());
     for (i, blob) in disk_files.iter().enumerate() {
         let filename = &blob.filename;
-        let ct = match std::fs::read(base_path.join(filename)) {
+        let ct = match read_legacy_blob_ciphertext(&base_path.join(filename), blob.size) {
             Ok(ct) => Some(ct),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound && blob.size == 0 => None,
             Err(e) => return Err(format!("read {filename}: {e}")),
@@ -552,8 +664,12 @@ fn migrate_inner(passphrase: &str, base_path: &std::path::Path) -> Result<(), St
                 .map_err(|_| format!("failed to decrypt {filename} — data may be corrupted"))?,
             None => Vec::new(),
         };
-        let new_ct = encrypt_blob(&new_key, filename, &pt)?;
+        let new_ct = encrypt_blob_owned(&new_key, filename, pt)?;
         durable_write_checked(&staging.join(filename), &new_ct)?;
+        staged_blob_fingerprints.push((
+            filename.clone(),
+            crate::crypto::ciphertext_bytes_fingerprint(&new_ct)?,
+        ));
         eprintln!(
             "zerotrust-drive: [{}/{}] migrated {}",
             i + 1,
@@ -563,6 +679,11 @@ fn migrate_inner(passphrase: &str, base_path: &std::path::Path) -> Result<(), St
     }
 
     // 4. Stage the index (v1-encrypted) and the new _kdf.json (plaintext).
+    // v1 adds 12 more bytes of nonce overhead than v0. Reject a legacy index
+    // at that narrow boundary instead of producing a store the next mount
+    // would refuse as oversized.
+    ensure_index_plaintext_within_limit(index_json.len())
+        .map_err(|e| format!("legacy index cannot be migrated safely: {e}"))?;
     let new_index_ct = encrypt_index(&new_key, &index_json)?;
     durable_write_checked(&staging.join(INDEX_FILE), &new_index_ct)?;
     eprintln!(
@@ -577,22 +698,51 @@ fn migrate_inner(passphrase: &str, base_path: &std::path::Path) -> Result<(), St
 
     // 5. Manifest (commit point). Order matters: blobs, then index,
     //    then _kdf.json LAST — its rename is the true completion marker.
-    let manifest: Vec<ManifestEntry> = disk_files
-        .iter()
-        .map(|blob| blob.filename.clone())
-        .chain([INDEX_FILE.to_string(), KDF_FILE.to_string()])
-        .map(|filename| {
-            let fingerprint = fingerprint_for(&filename, &staging.join(&filename))?;
-            Ok(ManifestEntry {
-                filename,
-                renamed: false,
-                fingerprint: Some(fingerprint),
-            })
+    let mut manifest: Vec<ManifestEntry> = staged_blob_fingerprints
+        .into_iter()
+        .map(|(filename, fingerprint)| ManifestEntry {
+            filename,
+            renamed: false,
+            fingerprint: Some(fingerprint),
         })
-        .collect::<Result<_, String>>()?;
+        .collect();
+    manifest.push(ManifestEntry {
+        filename: INDEX_FILE.to_string(),
+        renamed: false,
+        fingerprint: Some(ciphertext_fingerprint_bounded(
+            &staging.join(INDEX_FILE),
+            MAX_INDEX_CIPHERTEXT_LEN,
+        )?),
+    });
+    manifest.push(ManifestEntry {
+        filename: KDF_FILE.to_string(),
+        renamed: false,
+        fingerprint: Some(exact_fingerprint(&staging.join(KDF_FILE))?),
+    });
     validate_manifest(&manifest)?;
+    ensure_no_index_siblings(base_path).map_err(|e| format!("refuse migration commit: {e}"))?;
+    let current_index =
+        read_index_ciphertext(&index_path).map_err(|e| format!("re-read {INDEX_FILE}: {e}"))?;
+    if legacy_index_fingerprint(&current_index)? != expected_index_fingerprint {
+        return Err(
+            "encrypted index changed during migration staging; refusing to commit".to_string(),
+        );
+    }
+    match std::fs::symlink_metadata(base_path.join(KDF_FILE)) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(format!(
+                "cannot verify that {KDF_FILE} is still absent before migration commit: {e}"
+            ));
+        }
+        Ok(_) => {
+            return Err(format!(
+                "{KDF_FILE} appeared during migration staging; refusing to overwrite it"
+            ));
+        }
+    }
     let manifest_path = base_path.join(MANIFEST);
-    write_manifest(&manifest_path, &manifest)?;
+    create_manifest(&manifest_path, &manifest)?;
 
     // 6. Fingerprint-backed rename pass. The immutable manifest lets
     // recovery infer completed renames without an O(N^2) progress rewrite.
@@ -612,6 +762,7 @@ mod tests {
     use super::*;
     use crate::crypto::{decrypt_index, derive_key_at};
     use crate::fs::{DirChild, InodeEntry, ZeroTrustFs};
+    use crate::transaction_lock::local_lock_record_for_test;
     use std::collections::HashMap;
     use std::path::PathBuf;
 
@@ -762,19 +913,49 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let lock = dir.join(LOCK);
 
-        std::fs::write(&lock, u32::MAX.to_string()).unwrap();
+        std::fs::write(&lock, local_lock_record_for_test(i32::MAX as u32)).unwrap();
         assert_eq!(recover_interrupted_migration_result(&dir), Ok(false));
         assert!(
             !lock.exists(),
             "stale lock-only crash state must be cleared"
         );
 
-        std::fs::write(&lock, std::process::id().to_string()).unwrap();
+        std::fs::write(&lock, local_lock_record_for_test(std::process::id())).unwrap();
         assert!(recover_interrupted_migration_result(&dir).is_err());
         assert_eq!(
-            std::fs::read_to_string(&lock).unwrap(),
-            std::process::id().to_string()
+            std::fs::read(&lock).unwrap(),
+            local_lock_record_for_test(std::process::id())
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn committed_migration_refuses_unexpected_staging_artifacts() {
+        let dir = PathBuf::from("target/test-migrate-staging-conflict");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(STAGING)).unwrap();
+        let conflict = dir.join(STAGING).join("_index 2.age");
+        std::fs::write(&conflict, b"provider artifact").unwrap();
+
+        let error = commit_manifest(&dir, &dir.join(STAGING), &[]).unwrap_err();
+        assert!(error.contains("unexpected provider/interrupted artifact"));
+        assert!(conflict.exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn committed_migration_cleanup_preserves_late_staging_artifact_and_manifest() {
+        let dir = PathBuf::from("target/test-migrate-late-staging-conflict");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(STAGING)).unwrap();
+        std::fs::write(dir.join(STAGING).join("late-conflict"), b"evidence").unwrap();
+        std::fs::write(dir.join(MANIFEST), b"manifest evidence").unwrap();
+        std::fs::write(dir.join(LOCK), b"lock evidence").unwrap();
+
+        assert!(cleanup_transaction(&dir).is_err());
+        assert!(dir.join(STAGING).join("late-conflict").exists());
+        assert!(dir.join(MANIFEST).exists());
+        assert!(dir.join(LOCK).exists());
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -911,7 +1092,7 @@ mod tests {
             },
         ];
         std::fs::write(dir.join(MANIFEST), serde_json::to_vec(&manifest).unwrap()).unwrap();
-        std::fs::write(dir.join(LOCK), u32::MAX.to_string()).unwrap();
+        std::fs::write(dir.join(LOCK), local_lock_record_for_test(i32::MAX as u32)).unwrap();
 
         assert!(recover_interrupted_migration(&dir));
         assert_eq!(std::fs::read(dir.join(INDEX_FILE)).unwrap(), index_bytes);
@@ -952,6 +1133,69 @@ mod tests {
         assert!(dir.join(KDF_FILE).exists());
         assert!(!dir.join(MANIFEST).exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_renamed_migration_entry_never_prefers_resurrected_staging_content() {
+        let dir = PathBuf::from("target/test-migrate-renamed-stale-staging");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(STAGING)).unwrap();
+        let key = derive_key_at(&dir, "pw");
+        let committed = encrypt_index(&key, b"committed-index").unwrap();
+        let resurrected = encrypt_index(&key, b"stale-index").unwrap();
+        std::fs::write(dir.join(INDEX_FILE), &committed).unwrap();
+        std::fs::write(dir.join(STAGING).join(INDEX_FILE), &resurrected).unwrap();
+        let manifest = vec![
+            ManifestEntry {
+                filename: INDEX_FILE.to_string(),
+                renamed: true,
+                fingerprint: None,
+            },
+            ManifestEntry {
+                filename: KDF_FILE.to_string(),
+                renamed: true,
+                fingerprint: None,
+            },
+        ];
+        std::fs::write(dir.join(MANIFEST), serde_json::to_vec(&manifest).unwrap()).unwrap();
+        std::fs::write(dir.join(LOCK), local_lock_record_for_test(i32::MAX as u32)).unwrap();
+
+        let error = recover_interrupted_migration_result(&dir).unwrap_err();
+        assert!(!error.is_empty());
+        assert_eq!(std::fs::read(dir.join(INDEX_FILE)).unwrap(), committed);
+        assert!(dir.join(STAGING).join(INDEX_FILE).exists());
+        assert!(dir.join(MANIFEST).exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn recovery_accepts_fully_committed_manifest_after_staging_cleanup() {
+        let dir = PathBuf::from("target/test-migrate-recover-after-staging-cleanup");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = derive_key_at(&dir, "pw");
+        let index = encrypt_index(&key, b"committed-index").unwrap();
+        std::fs::write(dir.join(INDEX_FILE), &index).unwrap();
+        let manifest = vec![
+            ManifestEntry {
+                filename: INDEX_FILE.to_string(),
+                renamed: false,
+                fingerprint: Some(crate::crypto::ciphertext_bytes_fingerprint(&index).unwrap()),
+            },
+            ManifestEntry {
+                filename: KDF_FILE.to_string(),
+                renamed: false,
+                fingerprint: Some(exact_fingerprint(&dir.join(KDF_FILE)).unwrap()),
+            },
+        ];
+        std::fs::write(dir.join(MANIFEST), serde_json::to_vec(&manifest).unwrap()).unwrap();
+        std::fs::write(dir.join(LOCK), local_lock_record_for_test(i32::MAX as u32)).unwrap();
+
+        assert_eq!(recover_interrupted_migration_result(&dir), Ok(true));
+        assert_eq!(std::fs::read(dir.join(INDEX_FILE)).unwrap(), index);
+        assert!(!dir.join(MANIFEST).exists());
+        assert!(!dir.join(LOCK).exists());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

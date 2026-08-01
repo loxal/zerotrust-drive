@@ -29,12 +29,16 @@
 //! can read existing drives during the one-time format upgrade.
 
 use argon2::{Algorithm, Argon2, Params, Version};
+use blake2::{Blake2s256, Digest};
+#[cfg(test)]
+use chacha20poly1305::aead::Payload;
 use chacha20poly1305::{
     ChaCha20Poly1305, Nonce, XChaCha20Poly1305, XNonce,
-    aead::{Aead, KeyInit, OsRng, Payload, rand_core::RngCore},
+    aead::{Aead, AeadInPlace, KeyInit, OsRng, rand_core::RngCore},
 };
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Seek, SeekFrom};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// On-disk format version recorded in `_kdf.json`. Bump only on a
 /// breaking change to the KDF or AEAD; the presence/absence of
@@ -59,12 +63,19 @@ const XNONCE_LEN: usize = 24;
 /// Poly1305 authentication-tag length appended to every ciphertext.
 const TAG_LEN: usize = 16;
 
+/// Bytes added to each v1 plaintext: 24-byte nonce + 16-byte tag.
+pub(crate) const V1_CIPHERTEXT_OVERHEAD: u64 = (XNONCE_LEN + TAG_LEN) as u64;
+
 /// `_kdf.json` is tiny. This bound prevents a malformed recovery manifest
 /// from making startup retain an unexpectedly large exact fingerprint.
 const MAX_EXACT_FINGERPRINT_LEN: u64 = 64 * 1024;
+static KDF_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Legacy (v0) ChaCha20-Poly1305 nonce length (96-bit).
 const LEGACY_NONCE_LEN: usize = 12;
+
+/// Bytes added to each legacy v0 plaintext: 12-byte nonce + 16-byte tag.
+pub(crate) const LEGACY_CIPHERTEXT_OVERHEAD: u64 = (LEGACY_NONCE_LEN + TAG_LEN) as u64;
 
 /// Argon2id parameters + per-drive salt, persisted unencrypted as
 /// `_kdf.json`. The salt is not secret — its job is to defeat
@@ -136,19 +147,34 @@ pub fn kdf_path(base_path: &std::path::Path) -> std::path::PathBuf {
 
 /// Read `_kdf.json` if present. `Ok(None)` means the drive has no KDF
 /// file — i.e. it is brand-new or a pre-0.7 (v0) drive.
-pub fn load_kdf(base_path: &std::path::Path) -> Result<Option<KdfParams>, String> {
+pub(crate) fn load_kdf_with_fingerprint(
+    base_path: &std::path::Path,
+) -> Result<Option<(KdfParams, RecoveryFingerprint)>, String> {
     let path = kdf_path(base_path);
-    if !path
-        .try_exists()
-        .map_err(|e| format!("check {}: {e}", path.display()))?
-    {
-        return Ok(None);
-    }
-    let file = std::fs::File::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
-    let len = file
+    let file = {
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW);
+        }
+        match options.open(&path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(format!("open {}: {e}", path.display())),
+        }
+    };
+    let metadata = file
         .metadata()
-        .map_err(|e| format!("stat {}: {e}", path.display()))?
-        .len();
+        .map_err(|e| format!("stat {}: {e}", path.display()))?;
+    if !metadata.is_file() {
+        return Err(format!(
+            "{} is not a regular KDF metadata file",
+            path.display()
+        ));
+    }
+    let len = metadata.len();
     if len > MAX_KDF_FILE_LEN {
         return Err(format!(
             "{} is unexpectedly large ({len} bytes; maximum {MAX_KDF_FILE_LEN})",
@@ -170,28 +196,94 @@ pub fn load_kdf(base_path: &std::path::Path) -> Result<Option<KdfParams>, String
     params
         .validate()
         .map_err(|e| format!("validate {}: {e}", path.display()))?;
-    Ok(Some(params))
+    let fingerprint = RecoveryFingerprint::Exact { bytes };
+    Ok(Some((params, fingerprint)))
 }
 
-/// Persist KDF params with an atomic temp-write + rename + parent
-/// fsync. Inlined here (rather than reusing `fs::durable_write`) to
-/// avoid a crypto→fs dependency direction.
+pub fn load_kdf(base_path: &std::path::Path) -> Result<Option<KdfParams>, String> {
+    load_kdf_with_fingerprint(base_path).map(|loaded| loaded.map(|(params, _fingerprint)| params))
+}
+
+/// Persist brand-new KDF params without ever replacing an existing salt.
+/// A delayed cloud copy appearing during initialization must win rather than
+/// becoming undecryptable. A hard-link publication keeps the fully fsynced
+/// temp atomic; filesystems without hard links use `create_new` and fail
+/// closed with a partial target after a crash.
 pub fn save_kdf(base_path: &std::path::Path, params: &KdfParams) -> Result<(), String> {
     use std::io::Write;
     params.validate()?;
     let path = kdf_path(base_path);
     let json = serde_json::to_vec_pretty(params).map_err(|e| e.to_string())?;
-    let tmp = path.with_extension("json.tmp");
-    let mut f =
-        std::fs::File::create(&tmp).map_err(|e| format!("create {}: {e}", tmp.display()))?;
-    f.write_all(&json).map_err(|e| e.to_string())?;
-    f.sync_all().map_err(|e| e.to_string())?;
-    std::fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
-    std::fs::File::open(base_path)
-        .map_err(|e| format!("open KDF parent {}: {e}", base_path.display()))?
-        .sync_all()
-        .map_err(|e| format!("sync KDF parent {}: {e}", base_path.display()))?;
-    Ok(())
+    let (tmp, mut f) = loop {
+        let sequence = KDF_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let tmp = base_path.join(format!("._kdf.json.{}.{sequence}.tmp", std::process::id()));
+        let mut options = std::fs::OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW);
+        }
+        match options.open(&tmp) {
+            Ok(file) => break (tmp, file),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("create {}: {e}", tmp.display())),
+        }
+    };
+    let mut preserve_temp_on_error = false;
+    let sync_parent = || {
+        std::fs::File::open(base_path)
+            .map_err(|e| format!("open KDF parent {}: {e}", base_path.display()))?
+            .sync_all()
+            .map_err(|e| format!("sync KDF parent {}: {e}", base_path.display()))
+    };
+    let result = (|| -> Result<(), String> {
+        f.write_all(&json).map_err(|e| e.to_string())?;
+        f.sync_all().map_err(|e| e.to_string())?;
+        drop(f);
+        // Make the complete temp name durable before attempting publication.
+        sync_parent()?;
+        preserve_temp_on_error = true;
+        match std::fs::hard_link(&tmp, &path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(format!(
+                    "refusing to replace KDF metadata that appeared at {}",
+                    path.display()
+                ));
+            }
+            Err(link_error) => {
+                let mut options = std::fs::OpenOptions::new();
+                options.create_new(true).write(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    options.custom_flags(libc::O_NOFOLLOW);
+                }
+                let mut target = options.open(&path).map_err(|e| {
+                    format!(
+                        "publish new KDF metadata {} after hard-link publication failed ({link_error}): {e}",
+                        path.display()
+                    )
+                })?;
+                target
+                    .write_all(&json)
+                    .map_err(|e| format!("write new KDF metadata {}: {e}", path.display()))?;
+                target
+                    .sync_all()
+                    .map_err(|e| format!("sync new KDF metadata {}: {e}", path.display()))?;
+            }
+        }
+        // Persist the canonical publication before dropping its recovery name.
+        sync_parent()?;
+        std::fs::remove_file(&tmp)
+            .map_err(|e| format!("remove published KDF temp {}: {e}", tmp.display()))?;
+        sync_parent()
+    })();
+    if result.is_err() && !preserve_temp_on_error {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
 }
 
 /// Load the drive's KDF params, creating + persisting fresh random
@@ -203,12 +295,23 @@ pub fn save_kdf(base_path: &std::path::Path, params: &KdfParams) -> Result<(), S
 /// v0 drives must go through `migrate.rs` first. `ZeroTrustFs::new`
 /// and `main` enforce that ordering.
 pub fn load_or_create_kdf(base_path: &std::path::Path) -> Result<KdfParams, String> {
-    if let Some(p) = load_kdf(base_path)? {
-        return Ok(p);
+    load_or_create_kdf_with_fingerprint(base_path).map(|(params, _fingerprint)| params)
+}
+
+pub(crate) fn load_or_create_kdf_with_fingerprint(
+    base_path: &std::path::Path,
+) -> Result<(KdfParams, RecoveryFingerprint), String> {
+    if let Some(loaded) = load_kdf_with_fingerprint(base_path)? {
+        return Ok(loaded);
     }
     let params = KdfParams::new_random();
     save_kdf(base_path, &params)?;
-    Ok(params)
+    load_kdf_with_fingerprint(base_path)?.ok_or_else(|| {
+        format!(
+            "new KDF metadata {} disappeared immediately after publication",
+            kdf_path(base_path).display()
+        )
+    })
 }
 
 /// Derive a 256-bit key from a passphrase with Argon2id, using the
@@ -315,9 +418,9 @@ pub fn derive_key_legacy_tagged(passphrase: &str) -> [u8; 32] {
     key
 }
 
-/// Small, dependency-free identity for recovery artifacts. XChaCha's random
-/// nonce plus its authentication tag and exact length identifies the staged
-/// ciphertext across the narrow rename-success/manifest-update crash window.
+/// Compact identity for recovery artifacts. Ciphertexts include a streaming
+/// BLAKE2s-256 digest of every byte; nonce, tag, and length retain diagnostics
+/// and compatibility with manifests created before full digests were added.
 /// `_kdf.json` uses an exact fingerprint because it is plaintext and tiny.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -326,6 +429,8 @@ pub(crate) enum RecoveryFingerprint {
         len: u64,
         nonce: Vec<u8>,
         tag: Vec<u8>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        digest: Option<Vec<u8>>,
     },
     Exact {
         bytes: Vec<u8>,
@@ -343,12 +448,52 @@ impl RecoveryFingerprint {
 
     pub(crate) fn is_well_formed(&self) -> bool {
         match self {
-            Self::Ciphertext { len, nonce, tag } => {
+            Self::Ciphertext {
+                len,
+                nonce,
+                tag,
+                digest,
+            } => {
                 *len >= (XNONCE_LEN + TAG_LEN) as u64
                     && nonce.len() == XNONCE_LEN
                     && tag.len() == TAG_LEN
+                    && digest.as_ref().is_none_or(|digest| digest.len() == 32)
             }
             Self::Exact { bytes } => bytes.len() as u64 <= MAX_EXACT_FINGERPRINT_LEN,
+        }
+    }
+
+    pub(crate) fn has_full_content_identity(&self) -> bool {
+        match self {
+            Self::Ciphertext { digest, .. } => {
+                digest.as_ref().is_some_and(|value| value.len() == 32)
+            }
+            Self::Exact { .. } => true,
+        }
+    }
+
+    pub(crate) fn has_same_legacy_identity(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Self::Ciphertext {
+                    len, nonce, tag, ..
+                },
+                Self::Ciphertext {
+                    len: other_len,
+                    nonce: other_nonce,
+                    tag: other_tag,
+                    ..
+                },
+            ) => len == other_len && nonce == other_nonce && tag == other_tag,
+            (Self::Exact { bytes }, Self::Exact { bytes: other_bytes }) => bytes == other_bytes,
+            _ => false,
+        }
+    }
+
+    pub(crate) fn ciphertext_len(&self) -> Option<u64> {
+        match self {
+            Self::Ciphertext { len, .. } => Some(*len),
+            Self::Exact { .. } => None,
         }
     }
 }
@@ -356,12 +501,62 @@ impl RecoveryFingerprint {
 pub(crate) fn ciphertext_fingerprint(
     path: &std::path::Path,
 ) -> Result<RecoveryFingerprint, String> {
-    let mut file =
-        std::fs::File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
-    let len = file
+    ciphertext_fingerprint_with_bounds(path, None, u64::MAX)
+}
+
+pub(crate) fn ciphertext_fingerprint_bounded(
+    path: &std::path::Path,
+    max_len: u64,
+) -> Result<RecoveryFingerprint, String> {
+    ciphertext_fingerprint_with_bounds(path, None, max_len)
+}
+
+pub(crate) fn ciphertext_fingerprint_expected(
+    path: &std::path::Path,
+    expected_len: u64,
+) -> Result<RecoveryFingerprint, String> {
+    ciphertext_fingerprint_with_bounds(path, Some(expected_len), expected_len)
+}
+
+fn ciphertext_fingerprint_with_bounds(
+    path: &std::path::Path,
+    expected_len: Option<u64>,
+    max_len: u64,
+) -> Result<RecoveryFingerprint, String> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|e| format!("open {}: {e}", path.display()))?;
+    let metadata = file
         .metadata()
-        .map_err(|e| format!("stat {}: {e}", path.display()))?
-        .len();
+        .map_err(|e| format!("stat {}: {e}", path.display()))?;
+    if !metadata.is_file() {
+        return Err(format!(
+            "{} is not a regular ciphertext file",
+            path.display()
+        ));
+    }
+    let len = metadata.len();
+    if len > max_len {
+        return Err(format!(
+            "{} is unexpectedly large ({len} bytes; maximum {max_len})",
+            path.display()
+        ));
+    }
+    if let Some(expected_len) = expected_len
+        && len != expected_len
+    {
+        return Err(format!(
+            "{} has {len} bytes; expected {expected_len}",
+            path.display()
+        ));
+    }
     if len < (XNONCE_LEN + TAG_LEN) as u64 {
         return Err(format!(
             "{} is too short to be an XChaCha20-Poly1305 ciphertext",
@@ -377,8 +572,47 @@ pub(crate) fn ciphertext_fingerprint(
     let mut tag = vec![0u8; TAG_LEN];
     file.read_exact(&mut tag)
         .map_err(|e| format!("read tag from {}: {e}", path.display()))?;
+    file.seek(SeekFrom::Start(0))
+        .map_err(|e| format!("rewind {} for hashing: {e}", path.display()))?;
+    let mut hasher = Blake2s256::new();
+    let mut total = 0u64;
+    let mut chunk = [0u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut chunk)
+            .map_err(|e| format!("hash {}: {e}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        total = total
+            .checked_add(read as u64)
+            .ok_or_else(|| format!("{} is too large to fingerprint", path.display()))?;
+        if total > len {
+            return Err(format!(
+                "{} grew while its ciphertext fingerprint was read",
+                path.display()
+            ));
+        }
+        hasher.update(&chunk[..read]);
+    }
+    let final_len = file
+        .metadata()
+        .map_err(|e| format!("restat {}: {e}", path.display()))?
+        .len();
+    if final_len != len || total != len {
+        return Err(format!(
+            "{} changed size while its ciphertext fingerprint was read (expected {len}, read {total}, final {final_len} bytes)",
+            path.display()
+        ));
+    }
+    let digest = Some(hasher.finalize().to_vec());
 
-    Ok(RecoveryFingerprint::Ciphertext { len, nonce, tag })
+    Ok(RecoveryFingerprint::Ciphertext {
+        len,
+        nonce,
+        tag,
+        digest,
+    })
 }
 
 pub(crate) fn ciphertext_bytes_fingerprint(bytes: &[u8]) -> Result<RecoveryFingerprint, String> {
@@ -389,20 +623,50 @@ pub(crate) fn ciphertext_bytes_fingerprint(bytes: &[u8]) -> Result<RecoveryFinge
         len: bytes.len() as u64,
         nonce: bytes[..XNONCE_LEN].to_vec(),
         tag: bytes[bytes.len() - TAG_LEN..].to_vec(),
+        digest: Some(Blake2s256::digest(bytes).to_vec()),
     })
 }
 
 pub(crate) fn exact_fingerprint(path: &std::path::Path) -> Result<RecoveryFingerprint, String> {
-    let len = std::fs::metadata(path)
-        .map_err(|e| format!("stat {}: {e}", path.display()))?
-        .len();
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options
+        .open(path)
+        .map_err(|e| format!("open {}: {e}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|e| format!("stat {}: {e}", path.display()))?;
+    if !metadata.is_file() {
+        return Err(format!("{} is not a regular metadata file", path.display()));
+    }
+    let len = metadata.len();
     if len > MAX_EXACT_FINGERPRINT_LEN {
         return Err(format!(
             "{} is unexpectedly large ({len} bytes)",
             path.display()
         ));
     }
-    let bytes = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let capacity = usize::try_from(len)
+        .map_err(|_| format!("{} is too large for this platform", path.display()))?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(capacity)
+        .map_err(|_| format!("cannot allocate {len} bytes to read {}", path.display()))?;
+    file.take(MAX_EXACT_FINGERPRINT_LEN + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("read {}: {e}", path.display()))?;
+    if bytes.len() as u64 != len {
+        return Err(format!(
+            "{} changed size while being fingerprinted (expected {len}, read {})",
+            path.display(),
+            bytes.len()
+        ));
+    }
     Ok(RecoveryFingerprint::Exact { bytes })
 }
 
@@ -440,28 +704,18 @@ fn blob_aad(disk_filename: &str) -> Vec<u8> {
 /// 24-byte nonce prepended. Prefer the [`encrypt_blob`]/[`encrypt_index`]
 /// wrappers so the AAD policy lives in exactly one place.
 pub fn encrypt_bytes(key: &[u8; 32], plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>, String> {
-    let cipher = XChaCha20Poly1305::new(key.into());
-    let mut nonce_bytes = [0u8; XNONCE_LEN];
-    OsRng.fill_bytes(&mut nonce_bytes);
-    let nonce = XNonce::from_slice(&nonce_bytes);
-    let ciphertext = cipher
-        .encrypt(
-            nonce,
-            Payload {
-                msg: plaintext,
-                aad,
-            },
-        )
-        .map_err(|e| e.to_string())?;
-    let mut out = Vec::with_capacity(XNONCE_LEN + ciphertext.len());
-    out.extend_from_slice(&nonce_bytes);
-    out.extend_from_slice(&ciphertext);
-    Ok(out)
+    let mut owned = Vec::new();
+    owned
+        .try_reserve(plaintext.len().saturating_add(XNONCE_LEN + TAG_LEN))
+        .map_err(|e| format!("cannot allocate plaintext encryption buffer: {e}"))?;
+    owned.extend_from_slice(plaintext);
+    encrypt_bytes_owned(key, owned, aad)
 }
 
 /// Low-level: decrypt v1 XChaCha20-Poly1305 with the given AAD — first 24
 /// bytes are the nonce. Fails if the AAD does not match the one used to
 /// encrypt.
+#[cfg(test)]
 pub fn decrypt_bytes(key: &[u8; 32], data: &[u8], aad: &[u8]) -> Result<Vec<u8>, String> {
     if data.len() < XNONCE_LEN {
         return Err("ciphertext too short".to_string());
@@ -479,6 +733,51 @@ pub fn decrypt_bytes(key: &[u8; 32], data: &[u8], aad: &[u8]) -> Result<Vec<u8>,
         .map_err(|e| e.to_string())
 }
 
+/// Encrypt an owned buffer in place, avoiding a second full-size allocation.
+/// The returned layout is identical to [`encrypt_bytes`].
+fn encrypt_bytes_owned(
+    key: &[u8; 32],
+    mut plaintext: Vec<u8>,
+    aad: &[u8],
+) -> Result<Vec<u8>, String> {
+    plaintext
+        .try_reserve(XNONCE_LEN + TAG_LEN)
+        .map_err(|e| format!("cannot allocate ciphertext buffer: {e}"))?;
+
+    let cipher = XChaCha20Poly1305::new(key.into());
+    let mut nonce_bytes = [0u8; XNONCE_LEN];
+    OsRng.fill_bytes(&mut nonce_bytes);
+    let nonce = XNonce::from_slice(&nonce_bytes);
+    cipher
+        .encrypt_in_place(nonce, aad, &mut plaintext)
+        .map_err(|e| e.to_string())?;
+
+    let ciphertext_len = plaintext.len();
+    plaintext.resize(ciphertext_len + XNONCE_LEN, 0);
+    plaintext.copy_within(0..ciphertext_len, XNONCE_LEN);
+    plaintext[..XNONCE_LEN].copy_from_slice(&nonce_bytes);
+    Ok(plaintext)
+}
+
+/// Decrypt an owned v1 buffer in place. This keeps peak memory near one copy
+/// of the file instead of retaining both ciphertext and plaintext buffers.
+fn decrypt_bytes_owned(key: &[u8; 32], mut data: Vec<u8>, aad: &[u8]) -> Result<Vec<u8>, String> {
+    if data.len() < XNONCE_LEN + TAG_LEN {
+        return Err("ciphertext too short".to_string());
+    }
+    let mut nonce_bytes = [0u8; XNONCE_LEN];
+    nonce_bytes.copy_from_slice(&data[..XNONCE_LEN]);
+    let encrypted_len = data.len() - XNONCE_LEN;
+    data.copy_within(XNONCE_LEN.., 0);
+    data.truncate(encrypted_len);
+
+    let cipher = XChaCha20Poly1305::new(key.into());
+    cipher
+        .decrypt_in_place(XNonce::from_slice(&nonce_bytes), aad, &mut data)
+        .map_err(|e| e.to_string())?;
+    Ok(data)
+}
+
 /// Encrypt a data blob, binding it to its on-disk filename via AAD.
 pub fn encrypt_blob(
     key: &[u8; 32],
@@ -488,10 +787,31 @@ pub fn encrypt_blob(
     encrypt_bytes(key, plaintext, &blob_aad(disk_filename))
 }
 
+/// Owned-buffer variant for maintenance/truncate paths where plaintext is no
+/// longer needed after encryption.
+pub fn encrypt_blob_owned(
+    key: &[u8; 32],
+    disk_filename: &str,
+    plaintext: Vec<u8>,
+) -> Result<Vec<u8>, String> {
+    encrypt_bytes_owned(key, plaintext, &blob_aad(disk_filename))
+}
+
 /// Decrypt a data blob; fails if `disk_filename` does not match the name it
 /// was encrypted under (i.e. the blob was moved/swapped on disk).
+#[cfg(test)]
 pub fn decrypt_blob(key: &[u8; 32], disk_filename: &str, data: &[u8]) -> Result<Vec<u8>, String> {
     decrypt_bytes(key, data, &blob_aad(disk_filename))
+}
+
+/// Owned-buffer variant used by normal filesystem reads to avoid holding a
+/// second file-sized allocation during decryption.
+pub fn decrypt_blob_owned(
+    key: &[u8; 32],
+    disk_filename: &str,
+    data: Vec<u8>,
+) -> Result<Vec<u8>, String> {
+    decrypt_bytes_owned(key, data, &blob_aad(disk_filename))
 }
 
 /// Encrypt the directory index, bound to the index domain tag.
@@ -499,9 +819,21 @@ pub fn encrypt_index(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>, String
     encrypt_bytes(key, plaintext, &index_aad())
 }
 
+/// Owned-buffer variant used by index commits to avoid retaining serialized
+/// plaintext and ciphertext copies of the complete index simultaneously.
+pub fn encrypt_index_owned(key: &[u8; 32], plaintext: Vec<u8>) -> Result<Vec<u8>, String> {
+    encrypt_bytes_owned(key, plaintext, &index_aad())
+}
+
 /// Decrypt the directory index.
+#[cfg(test)]
 pub fn decrypt_index(key: &[u8; 32], data: &[u8]) -> Result<Vec<u8>, String> {
     decrypt_bytes(key, data, &index_aad())
+}
+
+/// Owned-buffer variant used at mount time to reduce peak index memory.
+pub fn decrypt_index_owned(key: &[u8; 32], data: Vec<u8>) -> Result<Vec<u8>, String> {
+    decrypt_bytes_owned(key, data, &index_aad())
 }
 
 /// Decrypt v0 ChaCha20-Poly1305 — first 12 bytes are the nonce. Used
@@ -544,6 +876,57 @@ mod tests {
         assert_ne!(&ct[24..], pt);
         let rt = decrypt_bytes(&key, &ct, b"aad").unwrap();
         assert_eq!(rt, pt);
+    }
+
+    #[test]
+    fn owned_v1_buffers_preserve_the_wire_format_and_authentication() {
+        let key = derive_key("pw", &test_kdf());
+        let plaintext = b"owned buffer".to_vec();
+
+        let mut owned_plaintext =
+            Vec::with_capacity(plaintext.len() + usize::try_from(V1_CIPHERTEXT_OVERHEAD).unwrap());
+        owned_plaintext.extend_from_slice(&plaintext);
+        let allocation = owned_plaintext.as_ptr();
+        let index = encrypt_index_owned(&key, owned_plaintext).unwrap();
+        assert_eq!(index.as_ptr(), allocation);
+        assert_eq!(
+            index.len() as u64,
+            plaintext.len() as u64 + V1_CIPHERTEXT_OVERHEAD
+        );
+        assert_eq!(decrypt_index(&key, &index).unwrap(), plaintext);
+
+        let borrowed_blob = encrypt_blob(&key, "000001.age", &plaintext).unwrap();
+        let allocation = borrowed_blob.as_ptr();
+        let decrypted = decrypt_blob_owned(&key, "000001.age", borrowed_blob).unwrap();
+        assert_eq!(decrypted.as_ptr(), allocation);
+        assert_eq!(decrypted, plaintext);
+        let owned_blob =
+            encrypt_bytes_owned(&key, plaintext.clone(), &blob_aad("000001.age")).unwrap();
+        assert_eq!(
+            decrypt_blob(&key, "000001.age", &owned_blob).unwrap(),
+            plaintext
+        );
+        assert!(decrypt_blob_owned(&key, "000002.age", owned_blob).is_err());
+    }
+
+    #[test]
+    fn ciphertext_fingerprint_covers_middle_bytes() {
+        let dir = std::path::PathBuf::from("target/test-full-ciphertext-fingerprint");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = derive_key("pw", &test_kdf());
+        let path = dir.join("000001.age");
+        let mut ciphertext = encrypt_blob(&key, "000001.age", b"fingerprinted body").unwrap();
+        std::fs::write(&path, &ciphertext).unwrap();
+        let before = ciphertext_fingerprint(&path).unwrap();
+        assert!(before.has_full_content_identity());
+
+        ciphertext[XNONCE_LEN + 1] ^= 0x80;
+        std::fs::write(&path, &ciphertext).unwrap();
+        let after = ciphertext_fingerprint(&path).unwrap();
+        assert_ne!(before, after);
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -660,6 +1043,37 @@ mod tests {
         assert_eq!(a.format_version, FORMAT_VERSION);
         assert_eq!(a.salt.len(), SALT_LEN);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn kdf_io_does_not_follow_metadata_or_predictable_temp_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::path::PathBuf::from("target/test-kdf-symlinks");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let sentinel = outside.join("sentinel");
+        std::fs::write(&sentinel, b"unchanged").unwrap();
+
+        let save_dir = root.join("save");
+        std::fs::create_dir_all(&save_dir).unwrap();
+        symlink(&sentinel, save_dir.join("_kdf.json.tmp")).unwrap();
+        save_kdf(&save_dir, &test_kdf()).unwrap();
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"unchanged");
+
+        let existing = std::fs::read(save_dir.join("_kdf.json")).unwrap();
+        assert!(save_kdf(&save_dir, &KdfParams::new_random()).is_err());
+        assert_eq!(std::fs::read(save_dir.join("_kdf.json")).unwrap(), existing);
+
+        let load_dir = root.join("load");
+        std::fs::create_dir_all(&load_dir).unwrap();
+        symlink("../save/_kdf.json", load_dir.join("_kdf.json")).unwrap();
+        assert!(load_kdf(&load_dir).is_err());
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
