@@ -18,12 +18,12 @@ cargo test                  # Run tests
 
 ## Architecture
 
-- **Encrypted storage**: `~/g.drive/.zerotrust.drive.encrypted/` (opaque `.age` files + encrypted `_index.age` + plaintext `_kdf.json`)
-- **Decrypted mount**: `~/z.drive/` (FUSE mount, in-memory)
-- **Index**: `_index.age` stores the full directory tree (filenames, permissions, sizes, timestamps, file→blob mapping), encrypted with the same passphrase
+- **Encrypted storage**: `~/g.drive/.zerotrust.drive.encrypted/` (v2 immutable authenticated objects + `_root.age` + plaintext `_kdf.json`; legacy v1 stores retain opaque `.age` blobs + `_index.age`)
+- **Decrypted mount**: `~/z.drive/` (FUSE mount; v2 file I/O is chunked, while legacy v1 open files are RAM-backed)
+- **Index**: v2 stores an immutable encrypted metadata snapshot referenced through an authenticated generation and `_root.age`; v1 uses mutable `_index.age`. Both describe the directory tree, permissions, sizes, timestamps, and opaque backing references.
 - **KDF metadata**: `_kdf.json` (plaintext, salts are not secret) holds the per-drive Argon2id salt + cost params. Its presence marks a v1 (0.7+) drive
-- **On-disk format**: v1 = Argon2id + per-drive 16-byte salt + XChaCha20-Poly1305 (24-byte nonce), with each blob AAD-bound to its disk filename and the index to a domain tag (defeats on-disk blob-swap/substitution). v0 (pre-0.7) = homemade KDF + ChaCha20-Poly1305 (12-byte nonce), no `_kdf.json`. Upgrade a v0 drive in place with `--migrate-format` (crash-safe; re-run to resume)
-- **In-memory**: all file content held in RAM while open — not for files larger than available memory
+- **On-disk format**: v2 = immutable XChaCha20-Poly1305 chunks and sparse copy-on-write trees, immutable metadata generations, and an authenticated root switched last by atomic exchange/no-replace. V1 reads remain supported and explicit `--migrate-v2` is resumable without deleting the source. V1 = Argon2id + XChaCha20-Poly1305 whole-file blobs. V0 (pre-0.7) = legacy KDF + ChaCha20-Poly1305; upgrade it first with `--migrate-format`.
+- **Memory**: normal v2 read, write, and flush memory is bounded independently of complete file size. V1 reads/writes and the one-time v1 migration still authenticate a complete legacy blob in memory.
 
 ## Key Files
 
@@ -32,6 +32,9 @@ cargo test                  # Run tests
 | `src/main.rs` | CLI entry point (clap); `--migrate-format` v0→v1 upgrade |
 | `src/fs.rs` | FUSE filesystem + encrypted directory index (InodeEntry tree) |
 | `src/crypto.rs` | Argon2id KDF + XChaCha20-Poly1305 encrypt/decrypt (+ retained v0 legacy readers for migration) |
+| `src/v2.rs` | Immutable chunk/tree objects, copy-on-write generations, authenticated root-last commit and recovery |
+| `src/v2_migrate.rs` | Explicit resumable v1-to-v2 migration with authenticated plan and per-file receipts |
+| `src/fault.rs` | Deterministic durability-boundary fault injection used by v2 transaction tests |
 | `src/migrate.rs` | Crash-safe v0→v1 on-disk format migration |
 | `src/rekey.rs` | Passphrase re-keying (keeps the drive salt; new passphrase → new key) |
 

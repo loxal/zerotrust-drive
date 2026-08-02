@@ -761,7 +761,11 @@ fn encrypt_bytes_owned(
 
 /// Decrypt an owned v1 buffer in place. This keeps peak memory near one copy
 /// of the file instead of retaining both ciphertext and plaintext buffers.
-fn decrypt_bytes_owned(key: &[u8; 32], mut data: Vec<u8>, aad: &[u8]) -> Result<Vec<u8>, String> {
+pub(crate) fn decrypt_bytes_owned(
+    key: &[u8; 32],
+    mut data: Vec<u8>,
+    aad: &[u8],
+) -> Result<Vec<u8>, String> {
     if data.len() < XNONCE_LEN + TAG_LEN {
         return Err("ciphertext too short".to_string());
     }

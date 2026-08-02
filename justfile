@@ -27,6 +27,9 @@ rekey new_passphrase passphrase=passphrase: build
 rekey-resume new_passphrase passphrase=passphrase: build
     cargo run -- --encrypted-dir {{encrypted_dir}} --new-passphrase {{new_passphrase}} --continue-rekey{{ if passphrase != "" { " --passphrase " + passphrase } else { "" } }}
 
+migrate-v2 passphrase=passphrase: build
+    cargo run -- --encrypted-dir {{encrypted_dir}} --migrate-v2{{ if passphrase != "" { " --passphrase " + passphrase } else { "" } }}
+
 populate:
     #!/usr/bin/env bash
     set -euo pipefail

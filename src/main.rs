@@ -1,10 +1,13 @@
 // Copyright 2026 Alexander Orlov <alexander.orlov@loxal.net>
 
 mod crypto;
+mod fault;
 mod fs;
 mod migrate;
 mod rekey;
 mod transaction_lock;
+mod v2;
+mod v2_migrate;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
@@ -58,6 +61,11 @@ struct Cli {
     /// exit. Crash-safe; re-run to resume an interrupted migration.
     #[arg(long)]
     migrate_format: bool,
+
+    /// Upgrade a v1 drive to the immutable authenticated v2 chunk format and
+    /// exit. Source blobs remain untouched. Re-run the same command to resume.
+    #[arg(long)]
+    migrate_v2: bool,
 
     /// Allow creating a brand-new drive with an empty or built-in demo
     /// passphrase. Refused by default because either is effectively
@@ -267,7 +275,7 @@ fn main() {
         expand_home_from_env(&cli.encrypted_dir).unwrap_or_else(|e| exit_with_error(e));
     let expanded_mountpoint =
         expand_home_from_env(&cli.decrypted_dir).unwrap_or_else(|e| exit_with_error(e));
-    if !cli.migrate_format {
+    if !cli.migrate_format && !cli.migrate_v2 {
         // Catch direct nesting before creating either directory. Canonical
         // validation below repeats the check to cover symlinks and `..`.
         ensure_disjoint_paths(&expanded_base, &expanded_mountpoint)
@@ -275,7 +283,7 @@ fn main() {
     }
     let base_path = create_and_canonicalize(&expanded_base, "encrypted storage directory")
         .unwrap_or_else(|e| exit_with_error(e));
-    let mountpoint = if cli.migrate_format {
+    let mountpoint = if cli.migrate_format || cli.migrate_v2 {
         expanded_mountpoint
     } else {
         let canonical_mountpoint =
@@ -296,6 +304,7 @@ fn main() {
     // such as `_index 2.age`. There is no safe automatic merge for an
     // encrypted index, so detect them before recovery or any other write.
     fs::ensure_no_index_siblings(&base_path).unwrap_or_else(|e| exit_with_error(e));
+    fs::ensure_unambiguous_format_heads(&base_path).unwrap_or_else(|e| exit_with_error(e));
 
     // Footgun guard: refuse to CREATE a brand-new drive under the
     // built-in demo passphrase — that would store data under a
@@ -303,9 +312,12 @@ fn main() {
     // left alone (the operator may legitimately be opening a demo drive,
     // and refusing would lock them out).
     let index_path = base_path.join("_index.age");
+    let root_path = base_path.join(v2::ROOT_FILE);
     let index_exists = fs::backing_entry_exists(&index_path)
         .unwrap_or_else(|e| exit_with_error(format!("cannot inspect encrypted index: {e}")));
-    if using_insecure_passphrase && !index_exists && !cli.allow_default_passphrase {
+    let root_exists = fs::backing_entry_exists(&root_path)
+        .unwrap_or_else(|e| exit_with_error(format!("cannot inspect encrypted v2 root: {e}")));
+    if using_insecure_passphrase && !index_exists && !root_exists && !cli.allow_default_passphrase {
         eprintln!(
             "zerotrust-drive: error: refusing to create a new drive with an empty or built-in demo passphrase"
         );
@@ -327,6 +339,9 @@ fn main() {
 
     // Handle --migrate-format (v0 → v1 on-disk upgrade) and exit.
     if cli.migrate_format {
+        if cli.migrate_v2 {
+            exit_with_error("--migrate-format and --migrate-v2 are mutually exclusive");
+        }
         if cli.new_passphrase.is_some() {
             eprintln!(
                 "zerotrust-drive: error: --migrate-format upgrades in place with the current passphrase; do not combine it with --new-passphrase"
@@ -374,6 +389,55 @@ fn main() {
         }
     }
 
+    if cli.migrate_v2 {
+        if cli.new_passphrase.is_some() || cli.continue_rekey {
+            exit_with_error("--migrate-v2 cannot be combined with passphrase-rotation options");
+        }
+        if !index_exists {
+            exit_with_error(format!(
+                "no v1 _index.age found in {} - nothing to migrate",
+                base_path.display()
+            ));
+        }
+        let migration_plan_exists =
+            v2_migrate::migration_plan_exists(&base_path).unwrap_or_else(|e| exit_with_error(e));
+        if root_exists && !migration_plan_exists {
+            eprintln!("zerotrust-drive: drive is already in the v2 on-disk format - nothing to do");
+            return;
+        }
+        if migrate::needs_migration(&base_path).unwrap_or_else(|e| exit_with_error(e)) {
+            exit_with_error(
+                "pre-0.7 storage must first be upgraded with --migrate-format, then migrated with --migrate-v2",
+            );
+        }
+        eprintln!(
+            "zerotrust-drive: migrating {} from v1 whole blobs to v2 immutable authenticated chunks...",
+            base_path.display()
+        );
+        eprintln!(
+            "zerotrust-drive: v1 source ciphertext is retained; allow temporary space for another complete encrypted copy"
+        );
+        match v2_migrate::migrate_v1_to_v2(&passphrase, &base_path) {
+            Ok(()) => {
+                eprintln!(
+                    "zerotrust-drive: v2 migration complete - the authenticated root now points only to immutable chunks"
+                );
+                return;
+            }
+            Err(error) => {
+                exit_with_error(format!(
+                    "v1-to-v2 migration stopped safely: {error}; preserve all plan/progress/object evidence and re-run --migrate-v2 to resume"
+                ));
+            }
+        }
+    }
+
+    if v2_migrate::migration_pending(&base_path).unwrap_or_else(|e| exit_with_error(e)) {
+        exit_with_error(
+            "an authenticated v1-to-v2 migration plan is pending; run --migrate-v2 with the same passphrase to resume before mounting or rekeying",
+        );
+    }
+
     // Refuse to operate on a pre-0.7 drive until it is migrated. This
     // guards both the normal mount and the --new-passphrase rekey path
     // (rekey assumes the v1 KDF + cipher).
@@ -403,6 +467,11 @@ fn main() {
         if new_passphrase == passphrase {
             eprintln!("zerotrust-drive: error: new passphrase is the same as the current one");
             std::process::exit(1);
+        }
+        if root_exists {
+            exit_with_error(
+                "passphrase rotation for v2 is not implemented yet; preserve the immutable generation and migrate a decrypted export into a new v2 store",
+            );
         }
         let index_path = base_path.join("_index.age");
         if !index_path.exists() {
@@ -482,10 +551,20 @@ fn main() {
             "zerotrust-drive: WARNING: using an empty or built-in demo passphrase - set ZEROTRUST_PASSPHRASE for real security"
         );
     }
-    eprintln!(
-        "zerotrust-drive: NOTE: in-memory filesystem — all file content is held in RAM while open"
-    );
-    eprintln!("zerotrust-drive: not recommended for files larger than available memory");
+    let ztfs = fs::ZeroTrustFs::new_v2(&passphrase, base_path);
+    match ztfs.inner.format {
+        fs::StoreFormat::V2 => eprintln!(
+            "zerotrust-drive: v2 immutable chunks enabled - read/write memory is bounded independently of file size"
+        ),
+        fs::StoreFormat::V1 => {
+            eprintln!(
+                "zerotrust-drive: WARNING: legacy v1 store - open files remain buffered in RAM"
+            );
+            eprintln!(
+                "zerotrust-drive: run the explicit v1-to-v2 migration before using files larger than available memory"
+            );
+        }
+    }
     eprintln!("zerotrust-drive: press Ctrl+C to unmount");
 
     let mut config = Config::default();
@@ -493,7 +572,6 @@ fn main() {
         MountOption::RW,
         MountOption::FSName("zerotrust-drive".to_string()),
     ];
-    let ztfs = fs::ZeroTrustFs::new(&passphrase, base_path);
     fuser::mount2(ztfs, &mountpoint, &config)
         .unwrap_or_else(|e| exit_with_error(format!("failed to mount filesystem: {e}")));
 }
