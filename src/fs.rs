@@ -3088,6 +3088,235 @@ impl ZeroTrustFs {
         Ok(())
     }
 
+    /// Perform an unlink as one testable namespace mutation. Open or dirty
+    /// files remain fail-closed until inode tombstones can preserve POSIX
+    /// open-unlink semantics without dropping acknowledged plaintext.
+    fn unlink_name(&self, parent: u64, name: &str) -> Result<(), std::io::Error> {
+        let _persistence = self.inner.persistence_mutex.lock().unwrap();
+        self.inner.ensure_writable()?;
+        let (ino, disk_filename, previous_state) = {
+            let mut state = self.inner.state.write().unwrap();
+            match state.inodes.get(&parent) {
+                Some(entry) if entry.kind == InodeKind::Directory => {}
+                _ => return Err(std::io::Error::from_raw_os_error(libc::ENOTDIR)),
+            }
+            let ino = Self::find_child(&state, parent, name)
+                .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
+            let entry = match state.inodes.get(&ino) {
+                Some(entry) if entry.kind == InodeKind::File => entry,
+                Some(_) => return Err(std::io::Error::from_raw_os_error(libc::EISDIR)),
+                None => return Err(std::io::Error::from_raw_os_error(libc::EIO)),
+            };
+            if self
+                .inner
+                .open_counts
+                .lock()
+                .unwrap()
+                .get(&ino)
+                .copied()
+                .unwrap_or(0)
+                > 0
+                || self.has_v2_dirty_inode(ino)
+            {
+                return Err(std::io::Error::from_raw_os_error(libc::EBUSY));
+            }
+            let disk_filename = entry.disk_filename.clone();
+            let previous_state = state.clone();
+            state.inodes.remove(&ino);
+            if let Some(children) = state.children.get_mut(&parent) {
+                children.retain(|child| child.inode != ino);
+            }
+            (ino, disk_filename, previous_state)
+        };
+        if let Err(error) = self.flush_pending_state_locked(true) {
+            if !self
+                .inner
+                .prospective_intent_may_be_durable
+                .swap(false, Ordering::AcqRel)
+            {
+                *self.inner.state.write().unwrap() = previous_state;
+            } else {
+                // Recovery will roll the authenticated unlink forward. Keep
+                // RAM aligned with that prospective generation while the
+                // mount remains latched read-only.
+                self.inner.open_files.write().unwrap().remove(&ino);
+                self.inner.dirty_inodes.lock().unwrap().remove(&ino);
+                self.inner.open_counts.lock().unwrap().remove(&ino);
+                self.inner.v2_dirty.lock().unwrap().remove_inode(ino);
+            }
+            return Err(error);
+        }
+        self.inner.open_files.write().unwrap().remove(&ino);
+        self.inner.dirty_inodes.lock().unwrap().remove(&ino);
+        self.inner.open_counts.lock().unwrap().remove(&ino);
+        self.inner.v2_dirty.lock().unwrap().remove_inode(ino);
+        if self.inner.format == StoreFormat::V1
+            && !disk_filename.is_empty()
+            && let Err(error) = fs::remove_file(self.inner.base_path.join(&disk_filename))
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            eprintln!("zerotrust-drive: WARNING: orphaned backing file {disk_filename}: {error}");
+        }
+        Ok(())
+    }
+
+    /// Perform the no-flags rename core without a FUSE reply dependency. A
+    /// replacement is committed immediately even when its old file root is
+    /// empty, so no acknowledged overwrite depends only on debounce timing.
+    fn rename_name(
+        &self,
+        parent: u64,
+        name: &str,
+        newparent: u64,
+        newname: &str,
+    ) -> Result<(), std::io::Error> {
+        let _persistence = self.inner.persistence_mutex.lock().unwrap();
+        self.inner.ensure_writable()?;
+        let (disk_file_to_remove, overwritten_ino, previous_state) = {
+            let mut state = self.inner.state.write().unwrap();
+            match state.inodes.get(&parent) {
+                Some(entry) if entry.kind == InodeKind::Directory => {}
+                _ => return Err(std::io::Error::from_raw_os_error(libc::ENOTDIR)),
+            }
+            match state.inodes.get(&newparent) {
+                Some(entry) if entry.kind == InodeKind::Directory => {}
+                _ => return Err(std::io::Error::from_raw_os_error(libc::ENOTDIR)),
+            }
+            let ino = Self::find_child(&state, parent, name)
+                .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
+            let source_kind = state
+                .inodes
+                .get(&ino)
+                .map(|entry| entry.kind.clone())
+                .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EIO))?;
+            if source_kind == InodeKind::Directory
+                && Self::would_create_directory_cycle(&state, ino, newparent)
+            {
+                return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+            }
+            let mut to_remove = None;
+            let mut overwritten = None;
+            if let Some(existing) = Self::find_child(&state, newparent, newname) {
+                if existing == ino {
+                    return Ok(());
+                }
+                let target = state
+                    .inodes
+                    .get(&existing)
+                    .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EIO))?;
+                match (&source_kind, &target.kind) {
+                    (InodeKind::File, InodeKind::Directory) => {
+                        return Err(std::io::Error::from_raw_os_error(libc::EISDIR));
+                    }
+                    (InodeKind::Directory, InodeKind::File) => {
+                        return Err(std::io::Error::from_raw_os_error(libc::ENOTDIR));
+                    }
+                    _ => {}
+                }
+                if target.kind == InodeKind::Directory
+                    && state
+                        .children
+                        .get(&existing)
+                        .is_some_and(|children| !children.is_empty())
+                {
+                    return Err(std::io::Error::from_raw_os_error(libc::ENOTEMPTY));
+                }
+                if self
+                    .inner
+                    .open_counts
+                    .lock()
+                    .unwrap()
+                    .get(&existing)
+                    .copied()
+                    .unwrap_or(0)
+                    > 0
+                    || self.inner.dirty_inodes.lock().unwrap().contains(&existing)
+                    || self.has_v2_dirty_inode(existing)
+                {
+                    return Err(std::io::Error::from_raw_os_error(libc::EBUSY));
+                }
+                to_remove = state.inodes.get(&existing).and_then(|entry| {
+                    (!entry.disk_filename.is_empty()).then(|| entry.disk_filename.clone())
+                });
+                overwritten = Some(existing);
+            }
+            let previous_state = overwritten.map(|_| state.clone());
+            if let Some(existing) = overwritten {
+                let target_was_directory = state
+                    .inodes
+                    .get(&existing)
+                    .is_some_and(|entry| entry.kind == InodeKind::Directory);
+                state.inodes.remove(&existing);
+                if target_was_directory {
+                    state.children.remove(&existing);
+                    if let Some(parent_entry) = state.inodes.get_mut(&newparent) {
+                        parent_entry.nlink = parent_entry.nlink.saturating_sub(1);
+                    }
+                }
+                if let Some(children) = state.children.get_mut(&newparent) {
+                    children.retain(|child| child.inode != existing);
+                }
+            }
+            if let Some(children) = state.children.get_mut(&parent) {
+                children.retain(|child| child.inode != ino);
+            }
+            state.children.entry(newparent).or_default().push(DirChild {
+                name: newname.to_string(),
+                inode: ino,
+            });
+            if source_kind == InodeKind::Directory && parent != newparent {
+                if let Some(old_parent) = state.inodes.get_mut(&parent) {
+                    old_parent.nlink = old_parent.nlink.saturating_sub(1);
+                }
+                if let Some(new_parent) = state.inodes.get_mut(&newparent) {
+                    new_parent.nlink = new_parent.nlink.saturating_add(1);
+                }
+            }
+            if let Some(entry) = state.inodes.get_mut(&ino) {
+                entry.name = newname.to_string();
+                entry.parent = newparent;
+                entry.ctime_secs = now_secs();
+            }
+            (to_remove, overwritten, previous_state)
+        };
+        if overwritten_ino.is_some() {
+            if let Err(error) = self.flush_pending_state_locked(true) {
+                if !self
+                    .inner
+                    .prospective_intent_may_be_durable
+                    .swap(false, Ordering::AcqRel)
+                {
+                    *self.inner.state.write().unwrap() =
+                        previous_state.expect("overwrite rename retains rollback state");
+                } else if let Some(existing) = overwritten_ino {
+                    self.inner.open_files.write().unwrap().remove(&existing);
+                    self.inner.dirty_inodes.lock().unwrap().remove(&existing);
+                    self.inner.open_counts.lock().unwrap().remove(&existing);
+                    self.inner.v2_dirty.lock().unwrap().remove_inode(existing);
+                }
+                return Err(error);
+            }
+        } else {
+            self.mark_dirty();
+        }
+        if let Some(existing) = overwritten_ino {
+            self.inner.open_files.write().unwrap().remove(&existing);
+            self.inner.dirty_inodes.lock().unwrap().remove(&existing);
+            self.inner.open_counts.lock().unwrap().remove(&existing);
+            self.inner.v2_dirty.lock().unwrap().remove_inode(existing);
+        }
+        if self.inner.format == StoreFormat::V1
+            && let Some(disk_filename) = disk_file_to_remove
+            && let Err(error) = fs::remove_file(self.inner.base_path.join(&disk_filename))
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            eprintln!(
+                "zerotrust-drive: WARNING: orphaned overwritten backing file {disk_filename}: {error}"
+            );
+        }
+        Ok(())
+    }
+
     /// Serialize a complete blob+index commit against other persistence and
     /// online rekey operations.
     #[cfg(test)]
@@ -3787,90 +4016,18 @@ impl Filesystem for ZeroTrustFs {
                 return;
             }
         };
-
-        let persistence = self.inner.persistence_mutex.lock().unwrap();
-        if let Err(error) = self.inner.ensure_writable() {
-            reply.error(io_to_errno(&error));
-            return;
-        }
-        let previous_state;
-        let (ino, disk_filename) = {
-            let mut state = self.inner.state.write().unwrap();
-            let ino = match Self::find_child(&state, parent.0, name_str) {
-                Some(i) => i,
-                None => {
-                    reply.error(fuser::Errno::ENOENT);
-                    return;
+        match self.unlink_name(parent.0, name_str) {
+            Ok(()) => reply.ok(),
+            Err(error) => {
+                if !matches!(
+                    error.raw_os_error(),
+                    Some(libc::ENOENT | libc::EISDIR | libc::EBUSY)
+                ) {
+                    eprintln!("zerotrust-drive: ERROR: failed to unlink {name_str:?}: {error}");
                 }
-            };
-            let entry = match state.inodes.get(&ino) {
-                Some(entry) if entry.kind == InodeKind::File => entry,
-                Some(_) => {
-                    reply.error(fuser::Errno::EISDIR);
-                    return;
-                }
-                None => {
-                    reply.error(fuser::Errno::EIO);
-                    return;
-                }
-            };
-            if self
-                .inner
-                .open_counts
-                .lock()
-                .unwrap()
-                .get(&ino)
-                .copied()
-                .unwrap_or(0)
-                > 0
-                || self.has_v2_dirty_inode(ino)
-            {
-                // Proper POSIX open-unlink needs tombstones. Until those exist,
-                // reject the unsafe case instead of discarding a live buffer.
-                reply.error(fuser::Errno::EBUSY);
-                return;
+                reply.error(io_to_errno(&error));
             }
-            let df = entry.disk_filename.clone();
-            previous_state = state.clone();
-            state.inodes.remove(&ino);
-            if let Some(ch) = state.children.get_mut(&parent.0) {
-                ch.retain(|c| c.inode != ino);
-            }
-            (ino, df)
-        };
-        if let Err(e) = self.flush_pending_state_locked(true) {
-            if !self
-                .inner
-                .prospective_intent_may_be_durable
-                .swap(false, Ordering::AcqRel)
-            {
-                *self.inner.state.write().unwrap() = previous_state;
-            } else {
-                // Authenticated v2 intent may already be durable and recovery
-                // will roll this unlink forward. Keep RAM aligned with that
-                // prospective generation while the mount is latched read-only.
-                self.inner.open_files.write().unwrap().remove(&ino);
-                self.inner.dirty_inodes.lock().unwrap().remove(&ino);
-                self.inner.open_counts.lock().unwrap().remove(&ino);
-                self.inner.v2_dirty.lock().unwrap().remove_inode(ino);
-            }
-            eprintln!("zerotrust-drive: ERROR: failed to persist unlink: {e}");
-            reply.error(io_to_errno(&e));
-            return;
         }
-        self.inner.open_files.write().unwrap().remove(&ino);
-        self.inner.dirty_inodes.lock().unwrap().remove(&ino);
-        self.inner.open_counts.lock().unwrap().remove(&ino);
-        self.inner.v2_dirty.lock().unwrap().remove_inode(ino);
-        if self.inner.format == StoreFormat::V1
-            && !disk_filename.is_empty()
-            && let Err(e) = fs::remove_file(self.inner.base_path.join(&disk_filename))
-            && e.kind() != std::io::ErrorKind::NotFound
-        {
-            eprintln!("zerotrust-drive: WARNING: orphaned backing file {disk_filename}: {e}");
-        }
-        drop(persistence);
-        reply.ok();
     }
 
     fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
@@ -3962,190 +4119,27 @@ impl Filesystem for ZeroTrustFs {
             reply.error(fuser::Errno::ENAMETOOLONG);
             return;
         }
-        let persistence = self.inner.persistence_mutex.lock().unwrap();
-        if let Err(error) = self.inner.ensure_writable() {
-            reply.error(io_to_errno(&error));
-            return;
+        match self.rename_name(parent.0, name_str, newparent.0, newname_str) {
+            Ok(()) => reply.ok(),
+            Err(error) => {
+                if !matches!(
+                    error.raw_os_error(),
+                    Some(
+                        libc::ENOENT
+                            | libc::EISDIR
+                            | libc::ENOTDIR
+                            | libc::EINVAL
+                            | libc::ENOTEMPTY
+                            | libc::EBUSY
+                    )
+                ) {
+                    eprintln!(
+                        "zerotrust-drive: ERROR: failed to rename {name_str:?} to {newname_str:?}: {error}"
+                    );
+                }
+                reply.error(io_to_errno(&error));
+            }
         }
-        let previous_state: Option<DiskIndex>;
-        let (disk_file_to_remove, overwritten_ino) = {
-            let mut state = self.inner.state.write().unwrap();
-            match state.inodes.get(&parent.0) {
-                Some(entry) if entry.kind == InodeKind::Directory => {}
-                _ => {
-                    reply.error(fuser::Errno::ENOTDIR);
-                    return;
-                }
-            }
-            match state.inodes.get(&newparent.0) {
-                Some(entry) if entry.kind == InodeKind::Directory => {}
-                _ => {
-                    reply.error(fuser::Errno::ENOTDIR);
-                    return;
-                }
-            }
-            let ino = match Self::find_child(&state, parent.0, name_str) {
-                Some(i) => i,
-                None => {
-                    reply.error(fuser::Errno::ENOENT);
-                    return;
-                }
-            };
-            let source_kind = match state.inodes.get(&ino) {
-                Some(entry) => entry.kind.clone(),
-                None => {
-                    reply.error(fuser::Errno::EIO);
-                    return;
-                }
-            };
-            if source_kind == InodeKind::Directory
-                && Self::would_create_directory_cycle(&state, ino, newparent.0)
-            {
-                reply.error(fuser::Errno::EINVAL);
-                return;
-            }
-            let mut to_remove = None;
-            let mut overwritten = None;
-            if let Some(existing) = Self::find_child(&state, newparent.0, newname_str) {
-                if existing == ino {
-                    reply.ok();
-                    return;
-                }
-                let target = match state.inodes.get(&existing) {
-                    Some(entry) => entry,
-                    None => {
-                        reply.error(fuser::Errno::EIO);
-                        return;
-                    }
-                };
-                match (&source_kind, &target.kind) {
-                    (InodeKind::File, InodeKind::Directory) => {
-                        reply.error(fuser::Errno::EISDIR);
-                        return;
-                    }
-                    (InodeKind::Directory, InodeKind::File) => {
-                        reply.error(fuser::Errno::ENOTDIR);
-                        return;
-                    }
-                    _ => {}
-                }
-                if target.kind == InodeKind::Directory
-                    && state
-                        .children
-                        .get(&existing)
-                        .is_some_and(|children| !children.is_empty())
-                {
-                    reply.error(fuser::Errno::ENOTEMPTY);
-                    return;
-                }
-                if self
-                    .inner
-                    .open_counts
-                    .lock()
-                    .unwrap()
-                    .get(&existing)
-                    .copied()
-                    .unwrap_or(0)
-                    > 0
-                    || self.inner.dirty_inodes.lock().unwrap().contains(&existing)
-                    || self.has_v2_dirty_inode(existing)
-                {
-                    reply.error(fuser::Errno::EBUSY);
-                    return;
-                }
-                to_remove = state.inodes.get(&existing).and_then(|e| {
-                    if e.disk_filename.is_empty() {
-                        None
-                    } else {
-                        Some(e.disk_filename.clone())
-                    }
-                });
-                overwritten = Some(existing);
-            }
-            previous_state = to_remove.as_ref().map(|_| state.clone());
-            if let Some(existing) = overwritten {
-                let target_was_directory = state
-                    .inodes
-                    .get(&existing)
-                    .is_some_and(|entry| entry.kind == InodeKind::Directory);
-                state.inodes.remove(&existing);
-                if target_was_directory {
-                    state.children.remove(&existing);
-                    if let Some(parent_entry) = state.inodes.get_mut(&newparent.0) {
-                        parent_entry.nlink = parent_entry.nlink.saturating_sub(1);
-                    }
-                }
-                if let Some(ch) = state.children.get_mut(&newparent.0) {
-                    ch.retain(|c| c.inode != existing);
-                }
-            }
-            if let Some(ch) = state.children.get_mut(&parent.0) {
-                ch.retain(|c| c.inode != ino);
-            }
-            state
-                .children
-                .entry(newparent.0)
-                .or_default()
-                .push(DirChild {
-                    name: newname_str.to_string(),
-                    inode: ino,
-                });
-            if source_kind == InodeKind::Directory && parent != newparent {
-                if let Some(old_parent) = state.inodes.get_mut(&parent.0) {
-                    old_parent.nlink = old_parent.nlink.saturating_sub(1);
-                }
-                if let Some(new_parent) = state.inodes.get_mut(&newparent.0) {
-                    new_parent.nlink = new_parent.nlink.saturating_add(1);
-                }
-            }
-            if let Some(entry) = state.inodes.get_mut(&ino) {
-                entry.name = newname_str.to_string();
-                entry.parent = newparent.0;
-                entry.ctime_secs = now_secs();
-            }
-            (to_remove, overwritten)
-        };
-        if disk_file_to_remove.is_some() {
-            if let Err(e) = self.flush_pending_state_locked(true) {
-                if !self
-                    .inner
-                    .prospective_intent_may_be_durable
-                    .swap(false, Ordering::AcqRel)
-                {
-                    *self.inner.state.write().unwrap() =
-                        previous_state.expect("overwrite rename must retain rollback state");
-                } else if let Some(existing) = overwritten_ino {
-                    // Recovery will roll forward the authenticated overwrite;
-                    // retain the prospective namespace and remove stale caches.
-                    self.inner.open_files.write().unwrap().remove(&existing);
-                    self.inner.dirty_inodes.lock().unwrap().remove(&existing);
-                    self.inner.open_counts.lock().unwrap().remove(&existing);
-                    self.inner.v2_dirty.lock().unwrap().remove_inode(existing);
-                }
-                eprintln!("zerotrust-drive: ERROR: failed to persist rename: {e}");
-                reply.error(io_to_errno(&e));
-                return;
-            }
-        } else {
-            // No physical blob is deleted, so normal metadata debounce is safe
-            // and avoids cloning/rewriting the entire index for every rename.
-            self.mark_dirty();
-        }
-        if let Some(existing) = overwritten_ino {
-            self.inner.open_files.write().unwrap().remove(&existing);
-            self.inner.dirty_inodes.lock().unwrap().remove(&existing);
-            self.inner.open_counts.lock().unwrap().remove(&existing);
-            self.inner.v2_dirty.lock().unwrap().remove_inode(existing);
-        }
-        if self.inner.format == StoreFormat::V1
-            && let Some(f) = disk_file_to_remove
-            && let Err(e) = fs::remove_file(self.inner.base_path.join(&f))
-            && e.kind() != std::io::ErrorKind::NotFound
-        {
-            eprintln!("zerotrust-drive: WARNING: orphaned overwritten backing file {f}: {e}");
-        }
-        drop(persistence);
-        reply.ok();
     }
 
     fn readdir(
@@ -5576,6 +5570,31 @@ mod tests {
             .count()
     }
 
+    fn leave_v2_overlay_after_failed_last_release(ztfs: &ZeroTrustFs, ino: u64) {
+        use crate::fault::FaultInjectionGuard;
+
+        let injector = FaultInjectionGuard::fail_at(1);
+        let error = ztfs.release_inode(ino).unwrap_err();
+        drop(injector);
+        assert!(
+            error.to_string().contains("deterministic injected crash"),
+            "last release failed for an unexpected reason: {error}"
+        );
+        assert_eq!(
+            ztfs.inner.open_counts.lock().unwrap().get(&ino).copied(),
+            None,
+            "the failed last release must leave no open-handle count"
+        );
+        assert!(
+            ztfs.has_v2_dirty_inode(ino),
+            "the failed last release discarded its dirty overlay"
+        );
+        assert!(
+            ztfs.inner.persistence_error().is_none(),
+            "an early injected failure should remain retryable"
+        );
+    }
+
     fn copy_test_directory(source: &Path, destination: &Path) {
         let _ = fs::remove_dir_all(destination);
         fs::create_dir_all(destination).unwrap();
@@ -6313,6 +6332,274 @@ mod tests {
             b"abc\0\0\0\0\0"
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn v2_dirty_unlink_fails_closed_without_discarding_overlay() {
+        let dir = PathBuf::from("target/test-v2-dirty-unlink-core");
+        let _ = fs::remove_dir_all(&dir);
+        let ztfs = ZeroTrustFs::new_v2("pw", dir.clone());
+        let ino = add_v2_file(&ztfs, "dirty.txt");
+        ztfs.open_inode(ino).unwrap();
+        ztfs.write_inode_content(ino, 0, b"acknowledged-dirty-bytes")
+            .unwrap();
+        let root_before = fs::read(dir.join(v2::ROOT_FILE)).unwrap();
+        leave_v2_overlay_after_failed_last_release(&ztfs, ino);
+
+        let error = ztfs.unlink_name(1, "dirty.txt").unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EBUSY));
+        assert_eq!(
+            ZeroTrustFs::find_child(&ztfs.inner.state.read().unwrap(), 1, "dirty.txt"),
+            Some(ino)
+        );
+        assert_eq!(
+            ztfs.read_v2_inode_range(ino, 0, 64).unwrap(),
+            b"acknowledged-dirty-bytes"
+        );
+        assert!(ztfs.has_v2_dirty_inode(ino));
+        assert_eq!(fs::read(dir.join(v2::ROOT_FILE)).unwrap(), root_before);
+
+        ztfs.fsync_inode(ino).unwrap();
+        ztfs.unlink_name(1, "dirty.txt").unwrap();
+        assert!(
+            ZeroTrustFs::find_child(&ztfs.inner.state.read().unwrap(), 1, "dirty.txt").is_none()
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unlink_core_rejects_a_non_directory_parent() {
+        let dir = PathBuf::from(format!(
+            "target/test-v2-unlink-nondirectory-parent-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let ztfs = ZeroTrustFs::new_v2("pw", dir.clone());
+        let file = add_v2_file(&ztfs, "not-a-directory");
+
+        let error = ztfs.unlink_name(file, "child").unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::ENOTDIR));
+        assert_eq!(
+            ZeroTrustFs::find_child(&ztfs.inner.state.read().unwrap(), 1, "not-a-directory"),
+            Some(file)
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn v2_dirty_rename_preserves_overlay_and_commits_new_namespace() {
+        let dir = PathBuf::from("target/test-v2-dirty-rename-core");
+        let _ = fs::remove_dir_all(&dir);
+        let ztfs = ZeroTrustFs::new_v2("pw", dir.clone());
+        let ino = add_v2_file(&ztfs, "before.txt");
+        ztfs.open_inode(ino).unwrap();
+        ztfs.write_inode_content(ino, 0, b"dirty-content-follows-inode")
+            .unwrap();
+        leave_v2_overlay_after_failed_last_release(&ztfs, ino);
+
+        ztfs.rename_name(1, "before.txt", 1, "after.txt").unwrap();
+        let state = ztfs.inner.state.read().unwrap();
+        assert!(ZeroTrustFs::find_child(&state, 1, "before.txt").is_none());
+        assert_eq!(ZeroTrustFs::find_child(&state, 1, "after.txt"), Some(ino));
+        assert_eq!(state.inodes[&ino].name, "after.txt");
+        drop(state);
+        assert_eq!(
+            ztfs.read_v2_inode_range(ino, 0, 64).unwrap(),
+            b"dirty-content-follows-inode"
+        );
+
+        ztfs.fsync_inode(ino).unwrap();
+        drop(ztfs);
+        let reopened = ZeroTrustFs::new_v2("pw", dir.clone());
+        let state = reopened.inner.state.read().unwrap();
+        assert!(ZeroTrustFs::find_child(&state, 1, "before.txt").is_none());
+        assert_eq!(ZeroTrustFs::find_child(&state, 1, "after.txt"), Some(ino));
+        drop(state);
+        assert_eq!(
+            reopened.read_v2_inode_range(ino, 0, 64).unwrap(),
+            b"dirty-content-follows-inode"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn v2_rename_over_dirty_target_is_busy_and_preserves_both_names() {
+        let dir = PathBuf::from("target/test-v2-dirty-rename-target-core");
+        let _ = fs::remove_dir_all(&dir);
+        let ztfs = ZeroTrustFs::new_v2("pw", dir.clone());
+        let source = add_v2_file(&ztfs, "source.txt");
+        let target = add_v2_file(&ztfs, "target.txt");
+        ztfs.open_inode(target).unwrap();
+        ztfs.write_inode_content(target, 0, b"target-dirty-evidence")
+            .unwrap();
+        let root_before = fs::read(dir.join(v2::ROOT_FILE)).unwrap();
+        leave_v2_overlay_after_failed_last_release(&ztfs, target);
+
+        let error = ztfs
+            .rename_name(1, "source.txt", 1, "target.txt")
+            .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EBUSY));
+        let state = ztfs.inner.state.read().unwrap();
+        assert_eq!(
+            ZeroTrustFs::find_child(&state, 1, "source.txt"),
+            Some(source)
+        );
+        assert_eq!(
+            ZeroTrustFs::find_child(&state, 1, "target.txt"),
+            Some(target)
+        );
+        drop(state);
+        assert_eq!(
+            ztfs.read_v2_inode_range(target, 0, 64).unwrap(),
+            b"target-dirty-evidence"
+        );
+        assert_eq!(fs::read(dir.join(v2::ROOT_FILE)).unwrap(), root_before);
+        ztfs.fsync_inode(target).unwrap();
+        drop(ztfs);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn v2_rename_over_clean_empty_target_commits_before_return() {
+        let dir = PathBuf::from("target/test-v2-rename-clean-empty-target");
+        let _ = fs::remove_dir_all(&dir);
+        let ztfs = ZeroTrustFs::new_v2("pw", dir.clone());
+        let source = add_v2_file(&ztfs, "source.txt");
+        let target = add_v2_file(&ztfs, "target.txt");
+        ztfs.open_inode(source).unwrap();
+        ztfs.write_inode_content(source, 0, b"source survives overwrite")
+            .unwrap();
+        ztfs.fsync_inode(source).unwrap();
+        ztfs.release_inode(source).unwrap();
+        assert!(
+            ztfs.inner.state.read().unwrap().inodes[&target]
+                .disk_filename
+                .is_empty(),
+            "the overwrite target must exercise the clean empty-root path"
+        );
+        let root_before = fs::read(dir.join(v2::ROOT_FILE)).unwrap();
+
+        ztfs.rename_name(1, "source.txt", 1, "target.txt").unwrap();
+        let root_after = fs::read(dir.join(v2::ROOT_FILE)).unwrap();
+        assert_ne!(
+            root_after, root_before,
+            "a successful overwrite must publish its namespace before returning"
+        );
+        drop(ztfs);
+
+        let reopened = ZeroTrustFs::new_v2("pw", dir.clone());
+        let state = reopened.inner.state.read().unwrap();
+        assert!(ZeroTrustFs::find_child(&state, 1, "source.txt").is_none());
+        assert_eq!(
+            ZeroTrustFs::find_child(&state, 1, "target.txt"),
+            Some(source)
+        );
+        assert!(!state.inodes.contains_key(&target));
+        drop(state);
+        assert_eq!(
+            reopened.read_v2_inode_range(source, 0, 64).unwrap(),
+            b"source survives overwrite"
+        );
+        drop(reopened);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn every_clean_empty_target_overwrite_checkpoint_recovers_old_or_new() {
+        use crate::fault::{DurabilityEvent, FaultInjectionGuard};
+
+        let process = std::process::id();
+        let baseline = PathBuf::from(format!("target/test-v2-empty-overwrite-baseline-{process}"));
+        let successful = PathBuf::from(format!("target/test-v2-empty-overwrite-success-{process}"));
+        let _ = fs::remove_dir_all(&baseline);
+        let _ = fs::remove_dir_all(&successful);
+        let (source, target);
+        {
+            let ztfs = ZeroTrustFs::new_v2("pw", baseline.clone());
+            source = add_v2_file(&ztfs, "source.txt");
+            target = add_v2_file(&ztfs, "target.txt");
+            ztfs.open_inode(source).unwrap();
+            ztfs.write_inode_content(source, 0, b"source generation")
+                .unwrap();
+            ztfs.fsync_inode(source).unwrap();
+            ztfs.release_inode(source).unwrap();
+        }
+        let old_root = fs::read(baseline.join(v2::ROOT_FILE)).unwrap();
+
+        copy_test_directory(&baseline, &successful);
+        let ztfs = ZeroTrustFs::new_v2("pw", successful.clone());
+        let recorder = FaultInjectionGuard::record();
+        ztfs.rename_name(1, "source.txt", 1, "target.txt").unwrap();
+        let events = recorder.events();
+        drop(recorder);
+        for required in [
+            DurabilityEvent::Write,
+            DurabilityEvent::FileSync,
+            DurabilityEvent::Rename,
+            DurabilityEvent::DirectorySync,
+            DurabilityEvent::Cleanup,
+        ] {
+            assert!(
+                events.contains(&required),
+                "overwrite trace omitted {required:?}"
+            );
+        }
+        let new_root = fs::read(successful.join(v2::ROOT_FILE)).unwrap();
+        assert_ne!(new_root, old_root);
+        drop(ztfs);
+        fs::remove_dir_all(&successful).unwrap();
+
+        for checkpoint in 1..=events.len() {
+            let crashed = PathBuf::from(format!(
+                "target/test-v2-empty-overwrite-{process}-checkpoint-{checkpoint}"
+            ));
+            copy_test_directory(&baseline, &crashed);
+            fs::write(crashed.join("rename-evidence.keep"), b"preserve me").unwrap();
+            let ztfs = ZeroTrustFs::new_v2("pw", crashed.clone());
+            let injector = FaultInjectionGuard::fail_at(checkpoint);
+            let result = ztfs.rename_name(1, "source.txt", 1, "target.txt");
+            drop(injector);
+            assert!(result.is_err(), "checkpoint {checkpoint} was not exercised");
+            *ztfs.inner.persistence_failure.lock().unwrap() =
+                Some("stop test retry before simulated remount".to_string());
+            drop(ztfs);
+
+            let reopened = ZeroTrustFs::new_v2("pw", crashed.clone());
+            let state = reopened.inner.state.read().unwrap();
+            let source_name = ZeroTrustFs::find_child(&state, 1, "source.txt");
+            let target_name = ZeroTrustFs::find_child(&state, 1, "target.txt");
+            let old_visible = source_name == Some(source) && target_name == Some(target);
+            let new_visible = source_name.is_none() && target_name == Some(source);
+            assert!(
+                old_visible || new_visible,
+                "checkpoint {checkpoint} exposed a mixed overwrite namespace"
+            );
+            let visible_root = fs::read(crashed.join(v2::ROOT_FILE)).unwrap();
+            if old_visible {
+                assert_eq!(
+                    visible_root, old_root,
+                    "checkpoint {checkpoint} changed the exact old root"
+                );
+            } else {
+                assert_ne!(
+                    visible_root, old_root,
+                    "checkpoint {checkpoint} exposed the old root with the new namespace"
+                );
+            }
+            drop(state);
+            assert_eq!(
+                reopened.read_v2_inode_range(source, 0, 64).unwrap(),
+                b"source generation"
+            );
+            assert_eq!(
+                fs::read(crashed.join("rename-evidence.keep")).unwrap(),
+                b"preserve me"
+            );
+            drop(reopened);
+            fs::remove_dir_all(crashed).unwrap();
+        }
+
+        fs::remove_dir_all(baseline).unwrap();
     }
 
     #[test]

@@ -1252,7 +1252,26 @@ pub(crate) fn gc_completed_evidence_roots(
     })
 }
 
+fn ensure_no_provider_head_siblings_with_pin(
+    base_path: &Path,
+    namespace_pin: &v2::V2NamespacePin,
+    context: &'static str,
+) -> Result<(), String> {
+    namespace_pin
+        .verify_at(base_path, context)
+        .map_err(|error| format!("immutable v2 namespace changed before conflict scan: {error}"))?;
+    crate::fs::ensure_no_index_siblings(base_path).map_err(|error| error.to_string())?;
+    namespace_pin
+        .verify(base_path)
+        .map_err(|error| format!("immutable v2 namespace changed across conflict scan: {error}"))
+}
+
 pub(crate) fn migrate_v1_to_v2(passphrase: &str, base_path: &Path) -> Result<(), String> {
+    // A completed migration can otherwise take its fast verification path
+    // without invoking normal write recovery. Reject provider-created index or
+    // root siblings before examining any resumable state so no competing head
+    // is silently ignored at any migration phase.
+    crate::fs::ensure_no_index_siblings(base_path).map_err(|error| error.to_string())?;
     let (kdf, kdf_fingerprint) = load_kdf_with_fingerprint(base_path)?
         .ok_or_else(|| "v1-to-v2 migration requires existing Argon2id KDF metadata".to_string())?;
     let key = try_derive_key(passphrase, &kdf)?;
@@ -1377,6 +1396,11 @@ pub(crate) fn migrate_v1_to_v2(passphrase: &str, base_path: &Path) -> Result<(),
             &kdf_fingerprint,
             &current,
             &namespace_pin,
+        )?;
+        ensure_no_provider_head_siblings_with_pin(
+            base_path,
+            &namespace_pin,
+            "before completed migration final sibling scan",
         )?;
         return Ok(());
     }
@@ -1553,6 +1577,11 @@ pub(crate) fn migrate_v1_to_v2(passphrase: &str, base_path: &Path) -> Result<(),
     namespace_pin.verify(base_path).map_err(|error| {
         format!("immutable v2 namespace changed before migration completion: {error}")
     })?;
+    ensure_no_provider_head_siblings_with_pin(
+        base_path,
+        &namespace_pin,
+        "before migration completion sibling scan",
+    )?;
     publish_completion(
         base_path,
         &key,
@@ -1564,12 +1593,22 @@ pub(crate) fn migrate_v1_to_v2(passphrase: &str, base_path: &Path) -> Result<(),
     namespace_pin.verify(base_path).map_err(|error| {
         format!("immutable v2 namespace changed across migration completion: {error}")
     })?;
+    ensure_no_provider_head_siblings_with_pin(
+        base_path,
+        &namespace_pin,
+        "after migration completion publication before sibling scan",
+    )?;
     validate_completed_migration_evidence_with_pin(
         base_path,
         &key,
         &kdf_fingerprint,
         &state,
         &namespace_pin,
+    )?;
+    ensure_no_provider_head_siblings_with_pin(
+        base_path,
+        &namespace_pin,
+        "before migration final sibling scan",
     )?;
     // Retain the authenticated plan, receipts, and v1 source blobs as explicit
     // recovery evidence. Garbage collection is deliberately a separate future
@@ -1812,6 +1851,85 @@ mod tests {
         assert!(error.contains("authenticate v2 migration plan"), "{error}");
         assert_eq!(fs::read(path.join(v2::ROOT_FILE)).unwrap(), root);
 
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn completed_migration_fast_path_rejects_provider_root_sibling() {
+        let path = directory("completed-root-sibling");
+        fixture(&path, b"retained source");
+        migrate_v1_to_v2("migration-passphrase", &path).unwrap();
+        let root_before = fs::read(path.join(v2::ROOT_FILE)).unwrap();
+        let sibling = path.join("_root (conflicted copy).age");
+        fs::write(&sibling, b"provider conflict evidence").unwrap();
+
+        let error = migrate_v1_to_v2("migration-passphrase", &path).unwrap_err();
+        assert!(error.contains("_root"), "{error}");
+        assert_eq!(fs::read(path.join(v2::ROOT_FILE)).unwrap(), root_before);
+        assert_eq!(fs::read(&sibling).unwrap(), b"provider conflict evidence");
+        assert_eq!(read_migrated(&path), b"retained source");
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn completed_migration_fast_path_rechecks_late_provider_root_sibling() {
+        let path = directory("completed-late-root-sibling");
+        fixture(&path, b"retained source");
+        migrate_v1_to_v2("migration-passphrase", &path).unwrap();
+        let root_before = fs::read(path.join(v2::ROOT_FILE)).unwrap();
+        let sibling = path.join("_root (conflicted copy).age");
+        let sibling_for_hook = sibling.clone();
+        let hook = v2::arm_namespace_test_hook(
+            "before completed migration final sibling scan",
+            move || fs::write(sibling_for_hook, b"late provider conflict evidence").unwrap(),
+        );
+
+        let error = migrate_v1_to_v2("migration-passphrase", &path).unwrap_err();
+        drop(hook);
+        assert!(error.contains("_root"), "{error}");
+        assert_eq!(fs::read(path.join(v2::ROOT_FILE)).unwrap(), root_before);
+        assert_eq!(
+            fs::read(&sibling).unwrap(),
+            b"late provider conflict evidence"
+        );
+        assert_eq!(read_migrated(&path), b"retained source");
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn migration_rechecks_provider_root_sibling_after_completion_publication() {
+        let path = directory("completion-publication-root-sibling");
+        fixture(&path, b"retained source");
+        let old_index = fs::read(path.join("_index.age")).unwrap();
+        let old_blob = fs::read(path.join("000001.age")).unwrap();
+        let sibling = path.join("_root (conflicted copy).age");
+        let sibling_for_hook = sibling.clone();
+        let hook = v2::arm_namespace_test_hook(
+            "after migration completion publication before sibling scan",
+            move || fs::write(sibling_for_hook, b"provider conflict during publication").unwrap(),
+        );
+
+        let error = migrate_v1_to_v2("migration-passphrase", &path).unwrap_err();
+        drop(hook);
+        assert!(error.contains("_root"), "{error}");
+        assert!(
+            path.join(COMPLETION_FILE).exists(),
+            "the test hook must run only after completion publication"
+        );
+        assert_eq!(fs::read(path.join("_index.age")).unwrap(), old_index);
+        assert_eq!(fs::read(path.join("000001.age")).unwrap(), old_blob);
+        assert_eq!(
+            fs::read(&sibling).unwrap(),
+            b"provider conflict during publication"
+        );
+        assert_eq!(read_migrated(&path), b"retained source");
+
+        let retry = migrate_v1_to_v2("migration-passphrase", &path).unwrap_err();
+        assert!(retry.contains("_root"), "{retry}");
+        fs::remove_file(&sibling).unwrap();
+        File::open(&path).unwrap().sync_all().unwrap();
+        migrate_v1_to_v2("migration-passphrase", &path).unwrap();
+        assert_eq!(read_migrated(&path), b"retained source");
         fs::remove_dir_all(path).unwrap();
     }
 

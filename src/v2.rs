@@ -231,7 +231,11 @@ impl V2NamespacePin {
         }
     }
 
-    fn verify_at(&self, base_path: &Path, _context: &'static str) -> std::io::Result<()> {
+    pub(crate) fn verify_at(
+        &self,
+        base_path: &Path,
+        _context: &'static str,
+    ) -> std::io::Result<()> {
         #[cfg(test)]
         namespace_test_hook::checkpoint(_context);
         self.verify(base_path)

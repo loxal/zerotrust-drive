@@ -5,6 +5,8 @@ mod fault;
 mod fs;
 mod migrate;
 mod rekey;
+#[allow(dead_code)]
+mod storage;
 mod transaction_lock;
 mod v2;
 mod v2_migrate;

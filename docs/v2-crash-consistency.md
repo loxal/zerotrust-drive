@@ -336,17 +336,32 @@ An additional opt-in harness runs the normal commit and recovery traces in
 fresh subprocesses and delivers `SIGKILL` immediately after each selected
 checkpoint. On 2026-08-02 the complete 46 normal-write plus 18 recovery matrix
 passed on local APFS and on a real loopback ext4 filesystem mounted inside the
-local OrbStack Linux 7.0.11 aarch64 VM. The separate hosted x86 ext4 CI gate is
-configured but has not yet run.
+local OrbStack Linux 7.0.11 aarch64 VM. The same baseline subsequently passed
+in hosted APFS and x86 loopback-ext4 jobs on PR #1. The verifier now
+authenticates the raw root and its complete reachable graph before recovery is
+allowed to mutate names, then authenticates the recovered result again. The
+gate pins audited checkpoint counts and critical root/manifest contexts, fails
+if its opt-in environment is missing, and CI verifies the exact fully qualified
+test name before execution.
+
+Dedicated local APFS suites also pass 22 GC-quarantine plus 14 canonical
+post-rename quarantine-recovery deaths, 9 restore plus 8 canonical post-rename
+restore-recovery deaths, and 65 v1-to-v2 migration plus 29 authenticated
+pending-root-recovery deaths. Every GC case leaves exactly one byte-identical
+live or quarantine name and retains passive and recognized conflict evidence.
+Every migration case retains exact v1 sources, and every visible v2 root
+authenticates a complete generation. These are selected reachable mutation
+states, not a Cartesian matrix of manually malformed staging artifacts. Hosted
+qualification of the dedicated suites remains pending.
 
 The harness uses direct `ZeroTrustFs` calls for one representative open,
 write, `fsync`, and release sequence; it is not a live kernel-mounted FUSE
-test. Each recovery case receives one real process death from the selected
-baseline state rather than repeated deaths from every already-partial recovery
-state. These tests do not emulate sudden power loss, torn sectors,
-controller-cache loss, provider reordering, concurrent writers, or a device
-lying about `fsync`. macOS `File::sync_all` is not claimed to provide
-`F_FULLFSYNC`. The local proof still depends on the stated filesystem contract.
+test. Maintenance recovery repeats deaths from the selected canonical partial
+states described above, not every manually corrupted recovery artifact. These
+tests do not emulate sudden power loss, torn sectors, controller-cache loss,
+provider reordering, concurrent writers, or a device lying about `fsync`.
+macOS `File::sync_all` is not claimed to provide `F_FULLFSYNC`. The local proof
+still depends on the stated filesystem contract.
 
 ## Cloud replication boundary
 
@@ -389,8 +404,10 @@ store.
   cannot exclude a final concurrent/ABA provider rename. The old-or-new proof
   is therefore about process crashes with a stable selected namespace, not an
   adversarial sync client mutating directory names during publication.
-- `NSFileCoordinator` integration is not implemented. Partial coordination
-  would imply a guarantee the Rust POSIX paths do not provide. iCloud remains a
+- A no-presenter, exact-URL `NSFileCoordinator` shim and capability-rooted
+  storage boundary are implemented and tested, but production POSIX paths are
+  intentionally not wired through them yet. Partial coordination would imply a
+  guarantee the complete path inventory does not provide. iCloud remains a
   macOS beta target, the folder must be marked Keep Downloaded, and its backing
   store must pass the runtime atomic-exchange probe.
 - The full mount scrub favors integrity over availability and startup speed. A
@@ -398,11 +415,10 @@ store.
   authenticated objects are local. The scrub is not repeated over all live
   data before every commit; post-mount in-place object loss or corruption can
   be inherited by a later metadata generation.
-- Real subprocess-kill qualification has local APFS and local loopback-ext4
-  results, but the hosted x86 ext4 gate has not run. Migration and GC have
-  exhaustive deterministic returned-error coverage but not their own real-kill
-  matrices, and the normal-write harness does not mount through the kernel FUSE
-  path.
+- Baseline subprocess-kill qualification has local and hosted APFS and
+  loopback-ext4 results. Migration and GC have dedicated local APFS real-kill
+  matrices, while their hosted APFS/x86-ext4 qualification remains pending.
+  The normal-write harness does not mount through the kernel FUSE path.
 
 V2 is therefore a durability-focused beta/source preview. It is appropriate
 for controlled testing and low-write workloads with one active writer and an

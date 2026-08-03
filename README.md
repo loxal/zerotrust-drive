@@ -55,9 +55,10 @@ Stream mode or a Shared Drive as the backing store.
 
 iCloud Drive is a macOS-only beta target. Mark the complete encrypted backing folder
 **Keep Downloaded** before use. iCloud's File Provider placeholders and lack of a general
-user-facing pause-sync control make migration and recovery less predictable. The current client
-does not yet route every backing-store operation through `NSFileCoordinator`; adding only partial
-coordination would give a false guarantee and can introduce nested-coordination failures.
+user-facing pause-sync control make migration and recovery less predictable. A safe exact-URL,
+no-presenter `NSFileCoordinator` shim and capability-rooted storage boundary are implemented and
+tested, but production routing remains disabled and unwired. The current client does not yet coordinate every backing-store operation; enabling only
+partial coordination would give a false guarantee and can introduce nested-coordination failures.
 Apple says an individual iCloud Drive folder or file over 50 GB is usually marked Ineligible.
 Treat that as a conservative operational ceiling rather than a precisely specified recursive
 quota contract. The relevant planning number here is the complete accumulated ciphertext footprint,
@@ -67,6 +68,18 @@ portable pathname APIs cannot exclude a final concurrent rename, write, or hard-
 risking conflict evidence. Quarantine therefore does not reclaim space. Use iCloud only for stores
 that remain comfortably below the limit, monitor the encrypted folder, and migrate away before it
 approaches 50 GB.
+
+Proton Drive is an experimental macOS backing target. Use a dedicated folder under `My files`,
+mark the complete encrypted folder **Make Available Offline**, and verify the client's last
+successful synchronization before mounting or moving to another device. Proton's macOS client
+uses Apple File Provider, and Proton officially warns that large numbers of small files can take
+substantially longer to synchronize. This is directly relevant to v2's immutable-object layout.
+Proton's own end-to-end encryption is welcome defense in depth, but it is not part of this
+project's trust argument: `zerotrust-drive` must independently encrypt and authenticate the data
+before Proton receives it. Keep the ZeroTrust Drive passphrase separate, retain Proton's recovery
+phrase or file outside Proton, and maintain an independent backup. The official Proton CLI is a
+transfer tool rather than a mounted or continuously synchronized filesystem; rclone's
+reverse-engineered Proton backend is not supported for a writable store.
 
 Yandex Disk is an experimental secondary target, strongest when its official Linux sync daemon is
 useful. Prefer a fully local synchronized folder, not WebDAV. Its documented upload cap is twice
@@ -88,14 +101,25 @@ corrupt object. Deterministic tests return an injected
 error after every write, file fsync, namespace publication/rename, directory fsync,
 evidence-retention, and recovery checkpoint, then retry recovery against that state. An opt-in
 subprocess matrix also uses real `SIGKILL` after every checkpoint and verifies recovery in a fresh
-process. The complete 64-kill normal-write/recovery matrix passes on local APFS and on a real
-loopback ext4 filesystem inside the local OrbStack Linux aarch64 VM. The hosted x86 ext4 CI gate is
-defined but has not yet run. The harness drives one representative write-and-fsync transaction
-through `ZeroTrustFs` directly; it is not a live kernel-mounted FUSE test, and each recovery case
-receives one process death rather than repeated deaths from every already-partial recovery state.
-Neither test emulates power loss, torn sectors, controller caches, remote-provider ordering, or a
-device that lies about `fsync`; the claim still relies on the documented filesystem contract. See the
+process. The baseline 64-kill normal-write/recovery matrix passes on local APFS, local loopback
+ext4, hosted APFS, and hosted x86 loopback ext4. [GitHub PR #1](https://github.com/loxal/zerotrust-drive/pull/1) recorded the hosted unit job in
+2m19s, APFS in 1m17s, and x86 ext4 in 1m23s. Dedicated local APFS matrices also pass 22 GC
+quarantine plus 14 quarantine-recovery deaths, 9 GC restore plus 8 restore-recovery deaths, and
+65 v1-to-v2 migration plus 29 pending-root recovery deaths. The migration matrix exposed and
+helped fix completed-migration and late-publication root-sibling bypasses. Hosted runs of these new
+dedicated matrices remain pending. The harnesses exercise `ZeroTrustFs` and maintenance
+entrypoints directly; they are not live kernel-mounted FUSE tests. The maintenance suites repeat
+death from selected canonical post-rename and pending-root recovery states, not every synthetic
+malformed-artifact combination. Neither test emulates power loss,
+torn sectors, controller caches, remote-provider ordering, or a device that lies about `fsync`;
+the claim still relies on the documented filesystem contract. See the
 [v2 crash-consistency argument](docs/v2-crash-consistency.md).
+
+Each normal-write death is inspected in a fresh process before recovery: the
+crash-visible root must authenticate either the byte-identical old generation
+or the complete new generation and every reachable object. The matrices pin
+their audited checkpoint counts, fail when their opt-in environment is absent,
+and hosted CI verifies each exact test name before executing it.
 
 The old-or-new proof is a local process-crash proof under the one-writer rule and a stable selected
 object namespace during the root-publication syscall. The mount retains exact namespace,
@@ -135,6 +159,11 @@ purge is refused before intent or tombstone creation because no supported portab
 it safe against concurrent inode mutation. The quarantine framework selects only authenticated objects proven
 unreachable, never committed history or conflict/recovery evidence, but currently reclaims no
 storage. Sustained write-heavy production use is not yet recommended.
+
+The hosted baseline filesystem gates are green, but the beta status is unchanged. Hosted
+qualification of the dedicated migration and GC matrices, live kernel-mounted FUSE coverage,
+complete File Provider coordination, remote-provider ordering, and safe evidence retirement
+remain open.
 
 Legacy v1 commits still have the historical blob-before-index crash window. Migrate important v1
 stores before relying on root-last atomicity.

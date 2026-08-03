@@ -16,7 +16,7 @@ jobs:
       - name: Install FUSE
         run: sudo apt-get update && sudo apt-get install -y libfuse3-dev fuse3
       - name: Run tests
-        run: cargo test
+        run: cargo test --locked
 
   durability-ext4:
     runs-on: ubuntu-latest
@@ -26,6 +26,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Install FUSE and ext4 tools
         run: sudo apt-get update && sudo apt-get install -y libfuse3-dev fuse3 e2fsprogs
+      - name: Verify x86_64 durability host
+        run: uname -m | grep -Fx x86_64
       - name: Create isolated ext4 test filesystem
         run: |
           truncate -s 1G "$RUNNER_TEMP/zerotrust-drive-ext4.img"
@@ -37,10 +39,32 @@ jobs:
         env:
           ZDRIVE_RUN_PROCESS_CRASH_TESTS: "1"
           ZDRIVE_CRASH_TEST_ROOT: /mnt/zerotrust-drive-ext4
-        run: cargo test subprocess_sigkill_v2_durability_ext4 -- --ignored --nocapture
+        run: |
+          test_name='v2::process_crash_tests::subprocess_sigkill_v2_durability_ext4'
+          cargo test --locked -- --list | awk -v expected="$test_name: test" '$0 == expected { found += 1 } END { exit(found == 1 ? 0 : 1) }'
+          cargo test --locked "$test_name" -- --exact --ignored --nocapture
+      - name: Run real SIGKILL GC quarantine and restore matrices on ext4
+        env:
+          ZDRIVE_RUN_PROCESS_CRASH_TESTS: "1"
+          ZDRIVE_CRASH_TEST_ROOT: /mnt/zerotrust-drive-ext4
+        run: |
+          test_name='v2::process_crash_tests::subprocess_sigkill_v2_gc_ext4'
+          cargo test --locked -- --list | awk -v expected="$test_name: test" '$0 == expected { found += 1 } END { exit(found == 1 ? 0 : 1) }'
+          cargo test --locked "$test_name" -- --exact --ignored --nocapture
+      - name: Run real SIGKILL v1-to-v2 migration matrix on ext4
+        env:
+          ZDRIVE_RUN_PROCESS_CRASH_TESTS: "1"
+          ZDRIVE_CRASH_TEST_ROOT: /mnt/zerotrust-drive-ext4
+        run: |
+          test_name='v2::process_crash_tests::subprocess_sigkill_v1_to_v2_migration_ext4'
+          cargo test --locked -- --list | awk -v expected="$test_name: test" '$0 == expected { found += 1 } END { exit(found == 1 ? 0 : 1) }'
+          cargo test --locked "$test_name" -- --exact --ignored --nocapture
       - name: Unmount ext4 test filesystem
         if: always()
-        run: sudo umount /mnt/zerotrust-drive-ext4 || true
+        run: |
+          if mountpoint -q /mnt/zerotrust-drive-ext4; then
+            sudo umount /mnt/zerotrust-drive-ext4
+          fi
 
   durability-apfs:
     runs-on: macos-latest
@@ -54,7 +78,26 @@ jobs:
         env:
           ZDRIVE_RUN_PROCESS_CRASH_TESTS: "1"
           ZDRIVE_CRASH_TEST_ROOT: ${{ runner.temp }}
-        run: cargo test subprocess_sigkill_v2_durability_apfs -- --ignored --nocapture
+        run: |
+          test_name='v2::process_crash_tests::subprocess_sigkill_v2_durability_apfs'
+          cargo test --locked -- --list | awk -v expected="$test_name: test" '$0 == expected { found += 1 } END { exit(found == 1 ? 0 : 1) }'
+          cargo test --locked "$test_name" -- --exact --ignored --nocapture
+      - name: Run real SIGKILL GC quarantine and restore matrices on APFS
+        env:
+          ZDRIVE_RUN_PROCESS_CRASH_TESTS: "1"
+          ZDRIVE_CRASH_TEST_ROOT: ${{ runner.temp }}
+        run: |
+          test_name='v2::process_crash_tests::subprocess_sigkill_v2_gc_apfs'
+          cargo test --locked -- --list | awk -v expected="$test_name: test" '$0 == expected { found += 1 } END { exit(found == 1 ? 0 : 1) }'
+          cargo test --locked "$test_name" -- --exact --ignored --nocapture
+      - name: Run real SIGKILL v1-to-v2 migration matrix on APFS
+        env:
+          ZDRIVE_RUN_PROCESS_CRASH_TESTS: "1"
+          ZDRIVE_CRASH_TEST_ROOT: ${{ runner.temp }}
+        run: |
+          test_name='v2::process_crash_tests::subprocess_sigkill_v1_to_v2_migration_apfs'
+          cargo test --locked -- --list | awk -v expected="$test_name: test" '$0 == expected { found += 1 } END { exit(found == 1 ? 0 : 1) }'
+          cargo test --locked "$test_name" -- --exact --ignored --nocapture
 
   release-linux:
     needs: [test, durability-ext4, durability-apfs]
@@ -66,7 +109,7 @@ jobs:
       - name: Install FUSE
         run: sudo apt-get update && sudo apt-get install -y libfuse3-dev fuse3
       - name: Build release
-        run: cargo build --release
+        run: cargo build --release --locked
       - name: Prepare artifact
         run: cp target/release/zerotrust-drive zdrive-linux-x86_64
       - uses: actions/upload-artifact@v4
@@ -84,7 +127,7 @@ jobs:
       - name: Install macFUSE
         run: brew install macfuse
       - name: Build release
-        run: cargo build --release
+        run: cargo build --release --locked
       - name: Prepare artifact
         run: cp target/release/zerotrust-drive zdrive-macos-aarch64
       - uses: actions/upload-artifact@v4
