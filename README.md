@@ -5,9 +5,11 @@ while all data is stored encrypted at rest with XChaCha20-Poly1305 AEAD encrypti
 derived from your passphrase with Argon2id (the `.age` file extension is a naming convention -
 not the age crate).
 
-The cloud storage service and account receive only ciphertext through the backing directory. A
-provider's desktop sync process still runs on the endpoint and may have local access to the
-separate plaintext mount, so ordinary endpoint security remains necessary. New stores use the v2 format:
+The cloud storage service receives user content and filesystem metadata only as ciphertext through
+the backing directory. That store also exposes non-secret plaintext KDF parameters, object sizes,
+names, timing, and account metadata. A provider's desktop sync process still runs on the endpoint
+and may have local access to the separate plaintext mount, so ordinary endpoint security remains
+necessary. New stores use the v2 format:
 immutable authenticated chunks on a 4 MiB logical grid, sparse copy-on-write radix trees, immutable metadata
 generations, and a small authenticated `_root.age` visibility pointer. A plaintext `_kdf.json`
 holds only the key-derivation salt and bounded cost parameters (not secret - see
@@ -19,19 +21,21 @@ Point `--encrypted-dir` at a fully local cloud-sync folder and its provider hand
 of the ciphertext. Placeholder/on-demand storage is not a safe backing filesystem for this tool.
 
 V2 does not buffer complete open files. Read, write, and flush memory are bounded independently of
-logical file size: random I/O decrypts at most one fixed chunk plus a bounded tree path, and flush
-contains metadata rather than complete file content. Sparse writes do not materialize holes.
+logical file size: a bounded read decrypts at most one fixed-size chunk at a time in addition to
+the bounded response buffer, and flush contains metadata rather than complete file content. Sparse
+writes do not materialize holes.
 Existing v1 stores still mount for compatibility and retain their legacy whole-file RAM behavior
 until explicitly migrated with `--migrate-v2`.
 
-If the encrypted storage is modified externally (e.g. by cloud sync) while mounted,
-zerotrust-drive fingerprints the authenticated root (or the legacy v1 index) and refuses the next local commit instead of
-overwriting the external generation. It also fails closed when it finds provider-generated sibling
-blobs, indexes, KDF metadata, or maintenance controls; iCloud index-placeholder names; ambiguous
-non-UTF-8 backing entries; an unreferenced canonical blob that could collide with future allocation;
-malformed or provider-conflicted staging names; or a stale temp from an interrupted write. Valid
-transaction-ready files left before authenticated intent publication remain unreferenced evidence:
-they are preserved, do not select a generation, and do not prevent a fresh retry.
+If the selected authenticated root (or legacy v1 index), exact KDF metadata, or pinned control
+topology changes externally while mounted, zerotrust-drive refuses the next local commit instead
+of overwriting the external generation. It also fails closed when it finds provider-generated sibling
+v1 blobs or indexes, the v2 root or object namespace, KDF metadata, or maintenance controls; iCloud
+index-placeholder names; ambiguous non-UTF-8 top-level, control, or evidence entries; an unreferenced canonical blob that
+could collide with future allocation; malformed or provider-conflicted staging names; or a stale
+temp from an interrupted write. Valid transaction-ready files left before authenticated intent
+publication remain unreferenced evidence: they are preserved, do not select a generation, and do
+not prevent a fresh retry.
 The mounted instance then latches read-only and persistence calls fail until remount, even if
 synchronization later hides the conflicting artifact. Preserve every copy before reconciling.
 Never mount the same store on two computers at once.
@@ -51,21 +55,38 @@ Stream mode or a Shared Drive as the backing store.
 
 iCloud Drive is a macOS-only beta target. Mark the complete encrypted backing folder
 **Keep Downloaded** before use. iCloud's File Provider placeholders and lack of a general
-user-facing pause-sync control make migration and recovery less predictable. The current client
-does not yet route every backing-store operation through `NSFileCoordinator`; adding only partial
-coordination would give a false guarantee and can introduce nested-coordination failures.
-Apple also documents a 50 GB limit for an individual iCloud Drive folder or file. The relevant
-number here is the complete accumulated ciphertext footprint, including unreachable copy-on-write
-objects and retained evidence, not the visible plaintext size. Until evidence-aware garbage
-collection exists, use iCloud only for small, low-write stores that remain comfortably below that
-limit, monitor the encrypted folder, and migrate away before it approaches 50 GB.
+user-facing pause-sync control make migration and recovery less predictable. A safe exact-URL,
+no-presenter `NSFileCoordinator` shim and capability-rooted storage boundary are implemented and
+tested, but production routing remains disabled and unwired. The current client does not yet coordinate every backing-store operation; enabling only
+partial coordination would give a false guarantee and can introduce nested-coordination failures.
+Apple says an individual iCloud Drive folder or file over 50 GB is usually marked Ineligible.
+Treat that as a conservative operational ceiling rather than a precisely specified recursive
+quota contract. The relevant planning number here is the complete accumulated ciphertext footprint,
+including unreachable copy-on-write objects and retained evidence, not the visible plaintext size. Offline v2 GC can authenticate and
+reversibly quarantine exact unreachable objects, but new physical purge is deliberately disabled:
+portable pathname APIs cannot exclude a final concurrent rename, write, or hard-link race without
+risking conflict evidence. Quarantine therefore does not reclaim space. Use iCloud only for stores
+that remain comfortably below the limit, monitor the encrypted folder, and migrate away before it
+approaches 50 GB.
+
+Proton Drive is an experimental macOS backing target. Use a dedicated folder under `My files`,
+mark the complete encrypted folder **Make Available Offline**, and verify the client's last
+successful synchronization before mounting or moving to another device. Proton's macOS client
+uses Apple File Provider, and Proton officially warns that large numbers of small files can take
+substantially longer to synchronize. This is directly relevant to v2's immutable-object layout.
+Proton's own end-to-end encryption is welcome defense in depth, but it is not part of this
+project's trust argument: `zerotrust-drive` must independently encrypt and authenticate the data
+before Proton receives it. Keep the ZeroTrust Drive passphrase separate, retain Proton's recovery
+phrase or file outside Proton, and maintain an independent backup. The official Proton CLI is a
+transfer tool rather than a mounted or continuously synchronized filesystem; rclone's
+reverse-engineered Proton backend is not supported for a writable store.
 
 Yandex Disk is an experimental secondary target, strongest when its official Linux sync daemon is
-useful. Prefer a fully local synchronized folder, not WebDAV. Its documented rolling 30-day upload
-allowance is twice the current storage capacity, which is a material constraint for immutable
-copy-on-write churn and migrations. Yandex also warns that simultaneous multi-device editing can
-create duplicate conflict copies or lose files. Keep the same one-writer and independent-backup
-discipline.
+useful. Prefer a fully local synchronized folder, not WebDAV. Its documented upload cap is twice
+the current storage capacity for a 30-day accounting period that begins with the first upload and
+then resets every 30 days. This is a material constraint for immutable copy-on-write churn and
+migrations. Yandex also warns that simultaneous multi-device editing can create duplicate conflict
+copies or lose files. Keep the same one-writer and independent-backup discipline.
 
 None of these providers supplies a multi-file transaction, a cross-machine writer lock, or a backup.
 Use one active mount, wait for sync to finish before switching computers, and keep an independent
@@ -78,21 +99,71 @@ manifest; then atomically switch `_root.age` last (exchange for an update, no-re
 root). Recovery accepts only the exact authenticated old or new root and never falls back around a
 corrupt object. Deterministic tests return an injected
 error after every write, file fsync, namespace publication/rename, directory fsync,
-evidence-retention, and recovery checkpoint, then retry recovery against that state. They do not
-emulate process death, torn writes, or loss of pre-fsync page-cache state; the actual-crash claim
-also relies on the documented filesystem contract. See the
+evidence-retention, and recovery checkpoint, then retry recovery against that state. An opt-in
+subprocess matrix also uses real `SIGKILL` after every checkpoint and verifies recovery in a fresh
+process. The baseline 64-kill normal-write/recovery matrix passes on local APFS, local loopback
+ext4, hosted APFS, and hosted x86 loopback ext4. [GitHub PR #1](https://github.com/loxal/zerotrust-drive/pull/1) recorded the hosted unit job in
+2m19s, APFS in 1m17s, and x86 ext4 in 1m23s. Dedicated local and hosted matrices also pass 22 GC
+quarantine plus 14 quarantine-recovery deaths, 9 GC restore plus 8 restore-recovery deaths, and
+65 v1-to-v2 migration plus 29 pending-root recovery deaths. The migration matrix exposed and
+helped fix completed-migration and late-publication root-sibling bypasses. The final expanded
+[hosted run](https://github.com/loxal/zerotrust-drive/actions/runs/30805725643) passed the 216-test job in 1m58s,
+APFS in 1m19s, and x86_64 loopback ext4 in 1m06s. The harnesses exercise `ZeroTrustFs` and maintenance
+entrypoints directly; they are not live kernel-mounted FUSE tests. The maintenance suites repeat
+death from selected canonical post-rename and pending-root recovery states, not every synthetic
+malformed-artifact combination. Neither test emulates power loss,
+torn sectors, controller caches, remote-provider ordering, or a device that lies about `fsync`;
+the claim still relies on the documented filesystem contract. See the
 [v2 crash-consistency argument](docs/v2-crash-consistency.md).
 
-Writable v2 startup traverses and authenticates every file root, tree, and chunk reachable from
-the active generation. This prevents a partially synchronized machine from committing on top of
-missing data, but can make mount time proportional to live data and can force placeholder
-downloads. Keep the complete backing folder local before mounting.
+Each normal-write death is inspected in a fresh process before recovery: the
+crash-visible root must authenticate either the byte-identical old generation
+or the complete new generation and every reachable object. The matrices pin
+their audited checkpoint counts, fail when their opt-in environment is absent,
+and hosted CI verifies each exact test name before executing it.
 
-V2 is currently a durability-focused beta. Each small FUSE write performs chunk/tree/file-root
-copy-on-write immediately, so repeated writes inside one 4 MiB chunk can amplify uploads.
-Automatic garbage collection is not implemented: old generations, orphan objects, and retained
-transaction evidence accumulate. Bounded dirty-chunk coalescing and evidence-aware compaction are
-required before recommending sustained write-heavy production use.
+The old-or-new proof is a local process-crash proof under the one-writer rule and a stable selected
+object namespace during the root-publication syscall. The mount retains exact namespace,
+`objects`, and `evidence` directory descriptors; immutable generation/index reads and writes use
+the pinned `objects` descriptor and verify each newly published final name, inode, link count,
+length, and bytes. Evidence inventory, atomic no-replace moves, and durable manifest hard links use
+the pinned `evidence` descriptor. Commit, recovery, and migration revalidate the canonical
+directory identities around publication and evidence retention.
+Those checks fail closed for a replacement present at a validation boundary, but POSIX cannot
+atomically couple a child-directory identity check to the separate `_root.age` exchange. A provider
+replacement in that final interval can be detected only after the root became visible. This is a
+provider-concurrency beta limitation, not part of the process-crash proof; preserve all artifacts
+and remount only after synchronization has settled.
+
+Writable v2 startup traverses and authenticates every file root, tree, and chunk reachable from
+the active generation. It authenticates the new-generation graph named by every retained manifest
+or manifest-ready artifact, and it authenticates each completed update's exact displaced root.
+Both sides are walked through their parent chains to the declared origin, validating every
+historical index and file graph. Provider replacement therefore cannot leave apparently valid but
+unusable conflict or lineage evidence. This prevents a partially synchronized machine from committing on top of
+incompleteness present at startup, but can make mount time proportional to live and retained history and can force
+placeholder downloads. The full scrub is not repeated before every commit; post-mount in-place
+object loss or corruption can be inherited by a later metadata generation. Keep the complete
+backing folder local before mounting.
+
+A pending canonical write manifest is checked the same way before recovery changes any name: its
+complete new lineage and its exact displaced old root and lineage must already be readable through
+the retained namespace. Recovery cannot make incomplete evidence look completed for one mount.
+
+V2 is currently a durability-focused beta. A bounded dirty overlay coalesces writes in up to sixteen
+4 MiB slots (64 MiB) across the mount before a root-last flush; pressure flushes the prior overlay
+before accepting another chunk. This removes complete-file buffering and repeated object creation
+for edits that remain in one dirty interval, but close/fsync-heavy workloads can still amplify
+copy-on-write uploads. Evidence-aware orphan handling is explicit and offline: preview does not
+modify the encrypted backing store or persist a plan, and quarantine is reversible. New physical
+purge is refused before intent or tombstone creation because no supported portable primitive makes
+it safe against concurrent inode mutation. The quarantine framework selects only authenticated objects proven
+unreachable, never committed history or conflict/recovery evidence, but currently reclaims no
+storage. Sustained write-heavy production use is not yet recommended.
+
+The expanded hosted filesystem gates are green, but the beta status is unchanged. Live
+kernel-mounted FUSE coverage, complete File Provider coordination, real iCloud-backed tests,
+remote-provider ordering, and safe evidence retirement remain open.
 
 Legacy v1 commits still have the historical blob-before-index crash window. Migrate important v1
 stores before relying on root-last atomicity.
@@ -101,6 +172,11 @@ A brand-new store publishes `_kdf.json` before its first authenticated root. If 
 between those publications, restart refuses the KDF-only directory because it is indistinguishable
 from incompletely synchronized existing data. Preserve and inspect the directory; delete it only
 when you can prove that no user data was ever committed, or restore the missing cloud generation.
+KDF creation rechecks for a provider-arriving v1 index, v2 root, or write manifest immediately
+before and after publication and retains its durable temp on conflict. POSIX still cannot
+atomically test three independent control names while creating a fourth; a provider arrival in the
+remaining interval can leave an incompatible canonical KDF beside preserved conflict evidence.
+Do not delete either side automatically.
 Back up `_kdf.json` separately with the encrypted store. Its salt is not secret, but losing or
 corrupting this single file makes every ciphertext undecryptable even with the correct passphrase.
 
@@ -109,18 +185,17 @@ corrupting this single file makes every ciphertext undecryptable even with the c
 A FUSE implementation is required. Install the one for your OS:
 
 - **macOS** - [macFUSE](https://macfuse.github.io/)
-- **Linux** - `libfuse-dev` (Debian/Ubuntu: `sudo apt install libfuse-dev`, Fedora: `sudo dnf install fuse-devel`)
+- **Linux** - FUSE 3 (Debian/Ubuntu: `sudo apt install libfuse3-dev fuse3`, Fedora: `sudo dnf install fuse3-devel`)
 - **Windows** - not supported (would require [WinFSP](https://winfsp.dev/) and a different FUSE crate)
 
-#### macOS: Full Disk Access required
+#### macOS: permissions troubleshooting
 
-On macOS, the system's privacy framework (TCC) restricts which applications can access FUSE
-mounts. If `ls`, `du`, or other commands return "Operation not permitted" or "Permission
-denied" on the mount point, the terminal application you are using does not have Full Disk
-Access.
+On macOS, the privacy framework (TCC) can restrict access when the backing or mount location is
+protected. An "Operation not permitted" or "Permission denied" result can also mean that the
+mount is absent or ordinary directory permissions are wrong, so verify those conditions first.
 
-To fix this, go to **System Settings > Privacy & Security > Full Disk Access** and enable
-it for your terminal application (e.g. Terminal.app, iTerm2, Alacritty).
+If the location is TCC-protected, go to **System Settings > Privacy & Security > Full Disk
+Access** and enable access for the terminal or application using the mount.
 
 ### Directory Layout
 
@@ -140,6 +215,49 @@ Both paths are overridable via justfile variables or CLI flags `--encrypted-dir`
     just test                                           # run unit tests
     just release                                        # build optimized release binary
     just clean                                          # remove build artifacts and encrypted storage
+
+### Offline v2 orphan quarantine
+
+Unmount the store everywhere, wait for every provider to report synchronization complete, make an
+independent snapshot, and pause synchronization on every device. Preview does not modify the
+encrypted backing store or persist a GC plan; it only acquires a local advisory process lock outside
+that store:
+
+    zerotrust-drive --encrypted-dir /fully/local/store --gc-v2
+
+Copy the exact plan ID from that preview. Quarantine moves only the named, still-unreachable
+immutable object bytes into its plan directory without unlinking those bytes; it is resumable and
+reversible:
+
+    zerotrust-drive --encrypted-dir /fully/local/store --gc-v2-quarantine PLAN_ID --confirm-sync-paused
+    zerotrust-drive --encrypted-dir /fully/local/store --gc-v2-restore PLAN_ID --confirm-sync-paused
+
+The `--gc-v2-purge` flag is retained only to finish authenticated compatibility evidence for an
+already-reclaimed zero tombstone. A new purge authenticates and revalidates the plan, then returns
+an unsupported error without changing any name or byte, publishing intent, or creating tombstones:
+
+    zerotrust-drive --encrypted-dir /fully/local/store --gc-v2-purge PLAN_ID --confirm-sync-paused
+
+Every plan-consuming operation re-authenticates the plan, and every GC action holds the one-writer
+process lock. Preview,
+quarantine, and compatibility purge reject pending maintenance, provider siblings, unknown evidence, and stale
+live roots or object inventory. Restore is deliberately narrower and additive: before purge intent
+exists, it authenticates the current key, stored plan, GC controls, and exact candidate state, then
+can put the planned objects back even if unrelated live roots or evidence changed after quarantine.
+Missing planned bytes or ambiguous source/quarantine copies fail closed. Existing full tombstones
+and quarantined bytes are preserved; only a pre-existing, authenticated all-zero compatibility
+state can publish purge completion. Compact authenticated GC records and append-only staged-control
+evidence remain. Plans use portable authenticated store identity rather than a host-local absolute
+path; old
+path-bearing plans remain readable after relocation. V1 preview does not modify the encrypted
+backing store or persist GC state. This collector does not retire committed generations or
+recognized conflict/recovery evidence, and it cannot prove that a remote provider replica is
+current.
+
+GC uses one shared 250,000-entry budget across immutable-object and namespace inventory, ready
+controls, normal-write and migration evidence, migration receipts, GC operations, controls,
+quarantines, and compatibility tombstones. Its authenticated plan ciphertext is capped at 64 MiB;
+preview refuses an oversized scan or plan before creating GC state.
 
 ### Passphrase
 
@@ -216,14 +334,17 @@ Or directly:
 
     cargo run -- --new-passphrase "same-passphrase" --continue-rekey
 
-Before resuming, the passphrase is **cryptographically verified** against every recognized
-staged blob and staged index. If any decryption fails, the resume is rejected with a clear
-error. No passphrase is ever stored on disk.
+Before resuming, the passphrase is cryptographically probed against the staged index or one staged
+blob. Each staged item is then reused only if it decrypts to the current plaintext; otherwise that
+item is regenerated. ZeroTrust Drive does not persist the passphrase in the encrypted backing
+store. Supplying it as a command-line argument can still leave it in shell history and expose it
+temporarily through process inspection. Use a protected `ZEROTRUST_PASSPHRASE` injection method
+and clear the variable after use; the client does not currently provide an interactive prompt.
 
 ### Limits
 
-Filenames are limited to **255 bytes** - the standard maximum shared by ext4, APFS, and
-NTFS. Operations that exceed this limit (create, mkdir, rename) return `ENAMETOOLONG`.
+Filenames are limited by this implementation to **255 UTF-8 bytes** on its POSIX targets.
+Operations that exceed this limit (create, mkdir, rename) return `ENAMETOOLONG`.
 
 V2 content uses a 4 MiB logical chunk grid and short random 128-bit object IDs. A tail or sparse
 chunk stores only its meaningful prefix rather than padding every ciphertext object to 4 MiB.
@@ -246,11 +367,11 @@ so concurrent computers remain unsupported.
 ### Encryption
 
 Files are encrypted at rest with **XChaCha20-Poly1305**, an AEAD (Authenticated Encryption
-with Associated Data) cipher. It is the extended-nonce variant of the ChaCha20-Poly1305
-construction standardized by the IETF in RFC 8439 - the same cipher used by WireGuard, TLS 1.3,
-SSH (OpenSSH), and Google's QUIC. The 256-bit key makes it equally secure to AES-256, and its
-192-bit (24-byte) random nonce is wide enough that randomly generated nonces never collide in
-practice, even when one long-lived per-drive key encrypts millions of blobs and index rewrites.
+with Associated Data) construction. It extends the ChaCha20-Poly1305 design with a 192-bit
+(24-byte) nonce while retaining a 256-bit key. That extended-nonce construction is related to,
+but not the same wire algorithm as, the ChaCha20-Poly1305 variants used by common network
+protocols. Random 192-bit nonces make accidental collision negligibly probable even when one
+long-lived per-drive key encrypts millions of objects and index generations.
 
 AEAD provides both confidentiality and integrity: if a file is tampered with or corrupted (e.g.
 during cloud sync), decryption fails rather than silently returning garbage. V2 associated data
@@ -310,7 +431,7 @@ the local operation runs. For the iCloud beta target, first confirm the folder i
 and synchronized, then disconnect the Mac from the network because iCloud has no equivalent
 general Pause Sync control. Validate the transformed store locally before reconnecting or resuming
 sync. Do not mount it on another device until every immutable object and `_root.age` has uploaded.
-For Yandex Disk, also preflight the rolling upload allowance before migration.
+For Yandex Disk, also preflight the current 30-day upload allowance before migration.
 
 ### Building
 
@@ -321,14 +442,13 @@ Build an optimized release binary and install it as `zdrive`:
 
 #### Cross-compilation
 
-Build release binaries for all platforms (requires [cross](https://github.com/cross-rs/cross)):
+Build release binaries for the supported macOS and Linux targets (the Linux cross-build requires
+[cross](https://github.com/cross-rs/cross)):
 
     just release-macos                                  # aarch64-apple-darwin   -> target/dist/zdrive-macos-aarch64
     just release-linux                                  # x86_64-unknown-linux   -> target/dist/zdrive-linux-x86_64
-    just release-windows                                # x86_64-pc-windows-gnu  -> target/dist/zdrive-windows-x86_64.exe
-    just release-all                                    # all three platforms
+    just release-all                                    # both supported targets
 
-The Linux and Windows targets use `cross`, which handles toolchains and sysroot
-dependencies via Docker. Install it with `cargo install cross`. Note that while the
-Windows binary compiles, runtime support requires replacing `fuser` with a WinFSP-based
-FUSE crate.
+The Linux target uses `cross`, which handles toolchains and sysroot dependencies via Docker.
+Install it with `cargo install cross`. Windows does not compile with the current Unix-only
+`fuser` backend; `just release-windows` remains only as a fail-fast explanation of that limit.

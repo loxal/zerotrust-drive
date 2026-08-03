@@ -20,16 +20,56 @@ pub(crate) enum DurabilityEvent {
 
 const INJECTED_CRASH: &str = "deterministic injected crash";
 
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DurabilityCheckpoint {
+    pub(crate) event: DurabilityEvent,
+    pub(crate) context: String,
+}
+
 pub(crate) fn checkpoint(event: DurabilityEvent, context: &str) -> io::Result<()> {
     #[cfg(test)]
     {
         test_state::STATE.with(|state| {
             let mut state = state.borrow_mut();
-            state.events.push(event);
-            if state.fail_at == Some(state.events.len()) {
-                return Err(io::Error::other(format!(
-                    "{INJECTED_CRASH} after {event:?}: {context}"
-                )));
+            state.checkpoints.push(DurabilityCheckpoint {
+                event,
+                context: context.to_string(),
+            });
+            let checkpoint = state.checkpoints.len();
+            match &state.action {
+                Some(test_state::Action::FailAt(expected)) if *expected == checkpoint => {
+                    return Err(io::Error::other(format!(
+                        "{INJECTED_CRASH} after {event:?}: {context}"
+                    )));
+                }
+                #[cfg(unix)]
+                Some(test_state::Action::KillAt {
+                    checkpoint: expected_checkpoint,
+                    expected,
+                }) if *expected_checkpoint == checkpoint => {
+                    assert_eq!(
+                        expected.event, event,
+                        "subprocess crash checkpoint {checkpoint} event changed"
+                    );
+                    assert_eq!(
+                        expected.context, context,
+                        "subprocess crash checkpoint {checkpoint} context changed"
+                    );
+                    use std::io::Write as _;
+                    let mut stderr = std::io::stderr().lock();
+                    writeln!(
+                        stderr,
+                        "ZDRIVE_SIGKILL_CHECKPOINT\t{checkpoint}\t{event:?}\t{context}"
+                    )
+                    .expect("write subprocess crash marker");
+                    stderr.flush().expect("flush subprocess crash marker");
+                    drop(stderr);
+                    let result = unsafe { libc::kill(libc::getpid(), libc::SIGKILL) };
+                    assert_eq!(result, 0, "send deterministic SIGKILL to test process");
+                    unreachable!("SIGKILL returned without terminating the test process");
+                }
+                _ => {}
             }
             Ok(())
         })
@@ -54,8 +94,8 @@ impl FaultInjectionGuard {
     pub(crate) fn fail_at(checkpoint: usize) -> Self {
         test_state::STATE.with(|state| {
             *state.borrow_mut() = test_state::State {
-                fail_at: Some(checkpoint),
-                events: Vec::new(),
+                action: Some(test_state::Action::FailAt(checkpoint)),
+                checkpoints: Vec::new(),
             };
         });
         Self
@@ -64,15 +104,40 @@ impl FaultInjectionGuard {
     pub(crate) fn record() -> Self {
         test_state::STATE.with(|state| {
             *state.borrow_mut() = test_state::State {
-                fail_at: None,
-                events: Vec::new(),
+                action: None,
+                checkpoints: Vec::new(),
             };
         });
         Self
     }
 
     pub(crate) fn events(&self) -> Vec<DurabilityEvent> {
-        test_state::STATE.with(|state| state.borrow().events.clone())
+        test_state::STATE.with(|state| {
+            state
+                .borrow()
+                .checkpoints
+                .iter()
+                .map(|checkpoint| checkpoint.event)
+                .collect()
+        })
+    }
+
+    pub(crate) fn checkpoints(&self) -> Vec<DurabilityCheckpoint> {
+        test_state::STATE.with(|state| state.borrow().checkpoints.clone())
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn kill_at(checkpoint: usize, expected: DurabilityCheckpoint) -> Self {
+        test_state::STATE.with(|state| {
+            *state.borrow_mut() = test_state::State {
+                action: Some(test_state::Action::KillAt {
+                    checkpoint,
+                    expected,
+                }),
+                checkpoints: Vec::new(),
+            };
+        });
+        Self
     }
 }
 
@@ -85,13 +150,22 @@ impl Drop for FaultInjectionGuard {
 
 #[cfg(test)]
 mod test_state {
-    use super::DurabilityEvent;
+    use super::DurabilityCheckpoint;
     use std::cell::RefCell;
+
+    pub(super) enum Action {
+        FailAt(usize),
+        #[cfg(unix)]
+        KillAt {
+            checkpoint: usize,
+            expected: DurabilityCheckpoint,
+        },
+    }
 
     #[derive(Default)]
     pub(super) struct State {
-        pub(super) fail_at: Option<usize>,
-        pub(super) events: Vec<DurabilityEvent>,
+        pub(super) action: Option<Action>,
+        pub(super) checkpoints: Vec<DurabilityCheckpoint>,
     }
 
     thread_local! {

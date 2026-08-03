@@ -1,6 +1,6 @@
 // Copyright 2026 Alexander Orlov <alexander.orlov@loxal.net>
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs;
 use std::io::{Read, Write};
@@ -40,6 +40,12 @@ const MAX_INDEX_CIPHERTEXT_LEN: u64 = 64 * 1024 * 1024;
 const MAX_INDEX_PLAINTEXT_LEN: u64 = MAX_INDEX_CIPHERTEXT_LEN - V1_CIPHERTEXT_OVERHEAD;
 const DEBOUNCE_QUIET_INTERVAL: Duration = Duration::from_secs(5);
 const MAX_DIRTY_INTERVAL: Duration = Duration::from_secs(30);
+/// At most sixteen 4 MiB plaintext chunks are retained between durable v2
+/// generations. Budgeting a full slot per entry keeps the limit independent
+/// of sparse/tail chunk length and allocator behavior.
+const V2_DIRTY_CHUNK_LIMIT: usize = 16;
+/// Truncate-only files consume no chunk slots, so cap their bookkeeping too.
+const V2_DIRTY_FILE_LIMIT: usize = 256;
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug)]
@@ -60,6 +66,159 @@ impl DirtyTiming {
         let quiet = (self.last + DEBOUNCE_QUIET_INTERVAL).saturating_duration_since(now);
         let maximum = (self.first + MAX_DIRTY_INTERVAL).saturating_duration_since(now);
         quiet.min(maximum)
+    }
+}
+
+#[derive(Debug)]
+struct V2DirtyFile {
+    base_root: String,
+    base_size: u64,
+    logical_size: u64,
+    /// The earliest acknowledged shrink since `base_root`. Bytes at and after
+    /// this point remain logically zero even if the file is grown again before
+    /// the overlay is materialized.
+    discard_from: Option<u64>,
+    chunks: BTreeMap<u64, Vec<u8>>,
+}
+
+impl V2DirtyFile {
+    fn new(base_root: String, base_size: u64) -> Self {
+        Self {
+            base_root,
+            base_size,
+            logical_size: base_size,
+            discard_from: None,
+            chunks: BTreeMap::new(),
+        }
+    }
+
+    fn visible_base_size(&self) -> u64 {
+        self.base_size
+            .min(self.discard_from.unwrap_or(self.base_size))
+    }
+
+    fn missing_chunks(&self, first: u64, last: u64) -> usize {
+        (first..=last)
+            .filter(|chunk| !self.chunks.contains_key(chunk))
+            .count()
+    }
+
+    fn load_visible_base_chunk(
+        &self,
+        base_path: &Path,
+        key: &[u8; 32],
+        chunk_index: u64,
+    ) -> std::io::Result<Vec<u8>> {
+        let offset = chunk_index
+            .checked_mul(v2::CHUNK_SIZE as u64)
+            .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EFBIG))?;
+        let visible = self.visible_base_size();
+        if offset >= visible {
+            return Ok(Vec::new());
+        }
+        let requested = usize::try_from((visible - offset).min(v2::CHUNK_SIZE as u64))
+            .map_err(|_| std::io::Error::from_raw_os_error(libc::EFBIG))?;
+        v2::read_file_range(
+            base_path,
+            key,
+            &self.base_root,
+            self.base_size,
+            offset,
+            requested,
+        )
+    }
+
+    fn write(
+        &mut self,
+        base_path: &Path,
+        key: &[u8; 32],
+        offset: u64,
+        data: &[u8],
+    ) -> std::io::Result<usize> {
+        let end = offset
+            .checked_add(data.len() as u64)
+            .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EFBIG))?;
+        let first = offset / v2::CHUNK_SIZE as u64;
+        let last = (end - 1) / v2::CHUNK_SIZE as u64;
+        let mut staged = Vec::with_capacity(self.missing_chunks(first, last));
+        for chunk_index in first..=last {
+            if self.chunks.contains_key(&chunk_index) {
+                continue;
+            }
+            let mut chunk = self.load_visible_base_chunk(base_path, key, chunk_index)?;
+            chunk
+                .try_reserve_exact(v2::CHUNK_SIZE.saturating_sub(chunk.len()))
+                .map_err(|_| std::io::Error::from_raw_os_error(libc::ENOMEM))?;
+            chunk.resize(v2::CHUNK_SIZE, 0);
+            staged.push((chunk_index, chunk));
+        }
+        let inserted = staged.len();
+        for (chunk_index, chunk) in staged {
+            self.chunks.insert(chunk_index, chunk);
+        }
+
+        let mut consumed = 0usize;
+        while consumed < data.len() {
+            let absolute = offset
+                .checked_add(consumed as u64)
+                .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EFBIG))?;
+            let chunk_index = absolute / v2::CHUNK_SIZE as u64;
+            let within = (absolute % v2::CHUNK_SIZE as u64) as usize;
+            let take = (v2::CHUNK_SIZE - within).min(data.len() - consumed);
+            let chunk = self
+                .chunks
+                .get_mut(&chunk_index)
+                .ok_or_else(|| std::io::Error::other("staged dirty chunk is missing"))?;
+            let required = within + take;
+            chunk[within..required].copy_from_slice(&data[consumed..consumed + take]);
+            consumed += take;
+        }
+        self.logical_size = self.logical_size.max(end);
+        Ok(inserted)
+    }
+
+    fn truncate(&mut self, new_size: u64) -> usize {
+        if new_size >= self.logical_size {
+            self.logical_size = new_size;
+            return 0;
+        }
+        self.discard_from = Some(
+            self.discard_from
+                .map_or(new_size, |discard| discard.min(new_size)),
+        );
+        self.logical_size = new_size;
+        let first_removed = new_size.div_ceil(v2::CHUNK_SIZE as u64);
+        let before = self.chunks.len();
+        self.chunks.retain(|chunk, _| *chunk < first_removed);
+        if new_size != 0 {
+            let last = (new_size - 1) / v2::CHUNK_SIZE as u64;
+            let tail = (new_size % v2::CHUNK_SIZE as u64) as usize;
+            if tail != 0
+                && let Some(chunk) = self.chunks.get_mut(&last)
+            {
+                chunk[tail..].fill(0);
+            }
+        }
+        before - self.chunks.len()
+    }
+}
+
+#[derive(Default, Debug)]
+struct V2DirtyOverlay {
+    files: BTreeMap<u64, V2DirtyFile>,
+    chunk_count: usize,
+}
+
+impl V2DirtyOverlay {
+    fn clear(&mut self) {
+        self.files.clear();
+        self.chunk_count = 0;
+    }
+
+    fn remove_inode(&mut self, ino: u64) {
+        if let Some(file) = self.files.remove(&ino) {
+            self.chunk_count = self.chunk_count.saturating_sub(file.chunks.len());
+        }
     }
 }
 
@@ -303,6 +462,7 @@ pub(crate) fn validate_disk_index_v2(index: &DiskIndex) -> Result<(), String> {
     validate_disk_index_for_format(index, true)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn validate_reachable_v2_files(
     base_path: &Path,
     key: &[u8; 32],
@@ -322,6 +482,36 @@ pub(crate) fn validate_reachable_v2_files(
                     "encrypted v2 file inode {inode} is not completely materialized and authenticated: {error}"
                 )
             })?;
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_reachable_v2_files_with_pin(
+    base_path: &Path,
+    key: &[u8; 32],
+    index: &DiskIndex,
+    namespace_pin: &v2::V2NamespacePin,
+) -> Result<(), String> {
+    for (&inode, entry) in index
+        .inodes
+        .iter()
+        .filter(|(_, entry)| entry.kind == InodeKind::File)
+    {
+        if entry.disk_filename.is_empty() {
+            continue;
+        }
+        v2::validate_reachable_file_with_pin(
+            base_path,
+            key,
+            &entry.disk_filename,
+            entry.size,
+            namespace_pin,
+        )
+        .map_err(|error| {
+            format!(
+                "encrypted v2 file inode {inode} is not completely materialized and authenticated: {error}"
+            )
+        })?;
     }
     Ok(())
 }
@@ -949,7 +1139,15 @@ pub(crate) struct FsInner {
     pub(crate) state: RwLock<DiskIndex>,
     pub(crate) format: StoreFormat,
     v2_commit: Mutex<Option<V2CommitState>>,
+    /// Exact immutable namespace held open for the lifetime of a v2 mount.
+    /// Immutable objects use its retained descriptor and each root
+    /// publication revalidates the canonical namespace identities.
+    v2_namespace_pin: Option<v2::V2NamespacePin>,
     pub(crate) open_files: RwLock<HashMap<u64, Vec<u8>>>,
+    /// Bounded v2 plaintext write-back cache. Content becomes immutable v2
+    /// objects only when the generation is flushed, avoiding one COW path per
+    /// small write while retaining a hard file-size-independent memory limit.
+    v2_dirty: Mutex<V2DirtyOverlay>,
     /// Per-inode open reference count. An inode's `open_files` buffer is
     /// loaded on the first `open` and only persisted+evicted on the last
     /// `release`, so concurrent open handles share one buffer without a
@@ -998,10 +1196,49 @@ struct ControlFileSnapshot {
     fingerprint: Option<RecoveryFingerprint>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DirectoryIdentity {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ImmutableNamespaceSnapshot {
+    namespace: Option<DirectoryIdentity>,
+    objects: Option<DirectoryIdentity>,
+    evidence: Option<DirectoryIdentity>,
+}
+
+impl ImmutableNamespaceSnapshot {
+    fn capture(base_path: &Path, name: &str) -> std::io::Result<Self> {
+        let namespace_path = base_path.join(name);
+        let namespace = optional_directory_identity(&namespace_path)?;
+        let (objects, evidence) = if namespace.is_some() {
+            (
+                optional_directory_identity(&namespace_path.join(v2::OBJECTS_DIRECTORY))?,
+                optional_directory_identity(&namespace_path.join(v2::EVIDENCE_DIRECTORY))?,
+            )
+        } else {
+            (None, None)
+        };
+        Ok(Self {
+            namespace,
+            objects,
+            evidence,
+        })
+    }
+
+    fn exists(&self) -> bool {
+        self.namespace.is_some()
+    }
+}
+
 #[derive(Clone, Debug)]
 struct FormatControlSnapshot {
     files: Vec<ControlFileSnapshot>,
-    object_directories: (bool, bool),
+    object_directories: (ImmutableNamespaceSnapshot, ImmutableNamespaceSnapshot),
     migration_progress_exists: bool,
 }
 
@@ -1029,8 +1266,8 @@ impl FormatControlSnapshot {
             })
             .collect::<std::io::Result<Vec<_>>>()?;
         let object_directories = (
-            backing_entry_exists(&base_path.join(v2::OBJECT_DIRECTORY))?,
-            backing_entry_exists(&base_path.join(v2::LEGACY_OBJECT_DIRECTORY))?,
+            ImmutableNamespaceSnapshot::capture(base_path, v2::OBJECT_DIRECTORY)?,
+            ImmutableNamespaceSnapshot::capture(base_path, v2::LEGACY_OBJECT_DIRECTORY)?,
         );
         let migration_progress_exists =
             backing_entry_exists(&base_path.join(crate::v2_migrate::PROGRESS_DIRECTORY))?;
@@ -1053,8 +1290,7 @@ impl FormatControlSnapshot {
             ));
         }
         if format == StoreFormat::V2
-            && snapshot.object_directories != (true, false)
-            && snapshot.object_directories != (false, true)
+            && (snapshot.object_directories.0.exists() == snapshot.object_directories.1.exists())
         {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::AlreadyExists,
@@ -1066,12 +1302,12 @@ impl FormatControlSnapshot {
 
     fn verify(&self, base_path: &Path) -> std::io::Result<()> {
         let object_directories = (
-            backing_entry_exists(&base_path.join(v2::OBJECT_DIRECTORY))?,
-            backing_entry_exists(&base_path.join(v2::LEGACY_OBJECT_DIRECTORY))?,
+            ImmutableNamespaceSnapshot::capture(base_path, v2::OBJECT_DIRECTORY)?,
+            ImmutableNamespaceSnapshot::capture(base_path, v2::LEGACY_OBJECT_DIRECTORY)?,
         );
         if object_directories != self.object_directories {
             return Err(control_topology_changed(
-                "the v2 immutable-object directory topology changed after mount",
+                "the v2 immutable-object directory topology changed after mount: namespace, objects, or evidence identity differs",
             ));
         }
         let progress_exists =
@@ -1106,6 +1342,38 @@ impl FormatControlSnapshot {
     }
 }
 
+fn optional_directory_identity(path: &Path) -> std::io::Result<Option<DirectoryIdentity>> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{} is not a real backing directory", path.display()),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.ino() == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                format!("{} has no stable directory inode", path.display()),
+            ));
+        }
+        Ok(Some(DirectoryIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        }))
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(Some(DirectoryIdentity {}))
+    }
+}
+
 fn optional_control_fingerprint(
     base_path: &Path,
     name: &'static str,
@@ -1121,6 +1389,64 @@ fn optional_control_fingerprint(
 
 fn control_topology_changed(message: impl Into<String>) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::AlreadyExists, message.into())
+}
+
+/// Refuse a partially materialized v2 control plane before any startup
+/// recovery or maintenance path can mutate the backing directory. Entry
+/// existence is checked without following symlinks so an ambiguous provider
+/// placeholder never looks like an absent file.
+pub(crate) fn ensure_v2_controls_have_kdf(base_path: &Path) -> Result<(), String> {
+    let root_exists = backing_entry_exists(&base_path.join(v2::ROOT_FILE)).map_err(|error| {
+        format!(
+            "cannot inspect v2 root {}: {error}",
+            base_path.join(v2::ROOT_FILE).display()
+        )
+    })?;
+    let write_recovery_exists =
+        backing_entry_exists(&base_path.join(v2::WRITE_MANIFEST)).map_err(|error| {
+            format!(
+                "cannot inspect v2 recovery intent {}: {error}",
+                base_path.join(v2::WRITE_MANIFEST).display()
+            )
+        })?;
+    let kdf_exists = backing_entry_exists(&base_path.join("_kdf.json")).map_err(|error| {
+        format!(
+            "cannot inspect KDF metadata {}: {error}",
+            base_path.join("_kdf.json").display()
+        )
+    })?;
+    if (root_exists || write_recovery_exists) && !kdf_exists {
+        return Err(format!(
+            "{} contains a v2 root or recovery intent but no _kdf.json; refusing to create replacement key metadata because cloud synchronization or recovery may be incomplete",
+            base_path.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Guard the only path that publishes a KDF into an apparently empty store.
+/// A head or recovery intent arriving from synchronization must be preserved
+/// and must win over local initialization, even if it appears after the
+/// initial empty-directory inspection.
+fn ensure_new_kdf_publication_safe(base_path: &Path) -> Result<(), String> {
+    let mut controls = Vec::new();
+    for name in [INDEX_FILE, v2::ROOT_FILE, v2::WRITE_MANIFEST] {
+        if backing_entry_exists(&base_path.join(name)).map_err(|error| {
+            format!(
+                "cannot inspect {} while guarding new KDF publication: {error}",
+                base_path.join(name).display()
+            )
+        })? {
+            controls.push(name);
+        }
+    }
+    if controls.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "encrypted control file(s) {controls:?} appeared while initializing {}; refusing to publish or accept replacement KDF metadata",
+        base_path.display()
+    ))
 }
 
 impl FsInner {
@@ -1170,6 +1496,10 @@ impl FsInner {
         self.dirty_inodes
             .lock()
             .map_err(|_| "dirty-inode lock is poisoned".to_string())?
+            .clear();
+        self.v2_dirty
+            .lock()
+            .map_err(|_| "v2 dirty-overlay lock is poisoned".to_string())?
             .clear();
         self.index_dirty.store(false, Ordering::Release);
         Ok(())
@@ -1326,13 +1656,10 @@ impl ZeroTrustFs {
                 eprintln!("zerotrust-drive: error: cannot inspect v2 recovery intent: {e}");
                 std::process::exit(1);
             });
-        if write_recovery_exists && stored_kdf.is_none() {
-            eprintln!(
-                "zerotrust-drive: error: {} contains a v2 recovery intent but no _kdf.json; refusing to create replacement key metadata because cloud synchronization or recovery may be incomplete",
-                base_path.display()
-            );
+        ensure_v2_controls_have_kdf(&base_path).unwrap_or_else(|error| {
+            eprintln!("zerotrust-drive: error: {error}");
             std::process::exit(1);
-        }
+        });
         if !index_exists
             && !root_exists
             && !write_recovery_exists
@@ -1360,12 +1687,13 @@ impl ZeroTrustFs {
         // (`_kdf.json`), created on first use for a brand-new drive.
         let (kdf, kdf_fingerprint) = match stored_kdf {
             Some(loaded) => loaded,
-            None => {
-                crate::crypto::load_or_create_kdf_with_fingerprint(&base_path).unwrap_or_else(|e| {
-                    eprintln!("zerotrust-drive: error: cannot create KDF metadata: {e}");
-                    std::process::exit(1);
-                })
-            }
+            None => crate::crypto::load_or_create_kdf_with_fingerprint_guarded(&base_path, |_| {
+                ensure_new_kdf_publication_safe(&base_path)
+            })
+            .unwrap_or_else(|e| {
+                eprintln!("zerotrust-drive: error: cannot create KDF metadata: {e}");
+                std::process::exit(1);
+            }),
         };
         let key = crate::crypto::try_derive_key(passphrase, &kdf).unwrap_or_else(|e| {
             eprintln!("zerotrust-drive: error: cannot derive encryption key: {e}");
@@ -1376,32 +1704,53 @@ impl ZeroTrustFs {
             || write_recovery_exists
             || (!index_exists && !root_exists && empty_format == StoreFormat::V2);
         let mut exchange_probed = false;
-        if will_use_v2 && write_recovery_exists {
-            v2::authenticate_recovery_intent_before_probe(
-                &base_path,
-                &key,
-                &kdf_fingerprint,
-            )
-            .unwrap_or_else(|error| {
+        let mut recovery_namespace_pin = None;
+        if will_use_v2 && (write_recovery_exists || root_exists) {
+            let namespace_pin = v2::V2NamespacePin::capture(&base_path).unwrap_or_else(|error| {
                 eprintln!(
-                    "zerotrust-drive: error: cannot authenticate v2 recovery intent before backing-store preflight: {error}"
+                    "zerotrust-drive: error: cannot pin the complete existing immutable namespace before v2 audit/recovery: {error}"
                 );
                 std::process::exit(1);
             });
-            v2::probe_atomic_exchange(&base_path).unwrap_or_else(|error| {
-                eprintln!(
-                    "zerotrust-drive: error: backing directory {} cannot provide the atomic exchange required for reliable v2 commits: {error}",
-                    base_path.display()
+            if write_recovery_exists {
+                v2::authenticate_recovery_intent_before_probe(
+                    &base_path,
+                    &key,
+                    &kdf_fingerprint,
+                    &namespace_pin,
+                )
+                .unwrap_or_else(|error| {
+                    eprintln!(
+                        "zerotrust-drive: error: cannot authenticate v2 recovery intent before backing-store preflight: {error}"
+                    );
+                    std::process::exit(1);
+                });
+                v2::probe_atomic_exchange_with_pin(&base_path, &namespace_pin).unwrap_or_else(
+                    |error| {
+                        eprintln!(
+                            "zerotrust-drive: error: backing directory {} cannot provide the atomic exchange required for reliable v2 commits: {error}",
+                            base_path.display()
+                        );
+                        std::process::exit(1);
+                    },
                 );
-                std::process::exit(1);
-            });
-            exchange_probed = true;
+                exchange_probed = true;
+            }
+            recovery_namespace_pin = Some(namespace_pin);
         }
 
-        v2::recover(&base_path, &key, &kdf_fingerprint).unwrap_or_else(|e| {
-            eprintln!("zerotrust-drive: error: v2 normal-write recovery failed: {e}");
-            std::process::exit(1);
-        });
+        if let Some(namespace_pin) = recovery_namespace_pin.as_ref() {
+            v2::recover_with_namespace_pin(&base_path, &key, &kdf_fingerprint, namespace_pin)
+                .unwrap_or_else(|e| {
+                    eprintln!("zerotrust-drive: error: v2 normal-write recovery failed: {e}");
+                    std::process::exit(1);
+                });
+        } else {
+            v2::recover(&base_path, &key, &kdf_fingerprint).unwrap_or_else(|e| {
+                eprintln!("zerotrust-drive: error: v2 normal-write recovery failed: {e}");
+                std::process::exit(1);
+            });
+        }
         index_exists = backing_entry_exists(&index_path).unwrap_or_else(|e| {
             eprintln!("zerotrust-drive: error: cannot re-inspect v1 index: {e}");
             std::process::exit(1);
@@ -1425,10 +1774,43 @@ impl ZeroTrustFs {
             std::process::exit(1);
         }
 
+        // A brand-new v2 store needs its layout before it can be pinned. For
+        // an existing root, do not create missing provider directories here:
+        // capture must fail closed before the startup reachability scrub.
+        if format == StoreFormat::V2 && !root_exists && !exchange_probed {
+            v2::probe_atomic_exchange(&base_path).unwrap_or_else(|error| {
+                eprintln!(
+                    "zerotrust-drive: error: backing directory {} cannot provide the atomic exchange required for reliable v2 commits: {error}",
+                    base_path.display()
+                );
+                std::process::exit(1);
+            });
+            exchange_probed = true;
+        }
+        let v2_namespace_pin = if format == StoreFormat::V2 {
+            Some(recovery_namespace_pin.take().unwrap_or_else(|| {
+                v2::V2NamespacePin::capture(&base_path).unwrap_or_else(|error| {
+                    eprintln!(
+                        "zerotrust-drive: error: cannot pin the exact immutable v2 namespace before loading it: {error}"
+                    );
+                    std::process::exit(1);
+                })
+            }))
+        } else {
+            None
+        };
+
         let mut initial_index_fingerprint = None;
         let mut initial_v2_commit = None;
         let state = if format == StoreFormat::V2 && root_exists {
-            let (index, commit) = v2::load(&base_path, &key).unwrap_or_else(|e| {
+            let (index, commit) = v2::load_with_pin(
+                &base_path,
+                &key,
+                v2_namespace_pin
+                    .as_ref()
+                    .expect("existing v2 root must retain its namespace pin"),
+            )
+            .unwrap_or_else(|e| {
                 eprintln!(
                     "zerotrust-drive: error: cannot load authenticated v2 generation {}: {e}",
                     root_path.display()
@@ -1436,11 +1818,14 @@ impl ZeroTrustFs {
                 std::process::exit(1);
             });
             if index_exists {
-                match crate::v2_migrate::validate_completed_migration_evidence(
+                match crate::v2_migrate::validate_completed_migration_evidence_with_pin(
                     &base_path,
                     &key,
                     &kdf_fingerprint,
                     &commit,
+                    v2_namespace_pin
+                        .as_ref()
+                        .expect("existing v2 root must retain its namespace pin"),
                 ) {
                     Ok(true) => {}
                     Ok(false) => {
@@ -1539,7 +1924,15 @@ impl ZeroTrustFs {
             std::process::exit(1);
         });
         if format == StoreFormat::V2 {
-            validate_reachable_v2_files(&base_path, &key, &state).unwrap_or_else(|error| {
+            validate_reachable_v2_files_with_pin(
+                &base_path,
+                &key,
+                &state,
+                v2_namespace_pin
+                    .as_ref()
+                    .expect("v2 format must retain a namespace pin"),
+            )
+            .unwrap_or_else(|error| {
                 eprintln!("zerotrust-drive: error: {error}");
                 eprintln!(
                     "zerotrust-drive: wait for the cloud provider to finish downloading every referenced v2 object, then remount before making changes"
@@ -1555,6 +1948,16 @@ impl ZeroTrustFs {
                     std::process::exit(1);
                 });
             }
+            v2_namespace_pin
+                .as_ref()
+                .expect("v2 format must retain a namespace pin")
+                .verify(&base_path)
+                .unwrap_or_else(|error| {
+                    eprintln!(
+                        "zerotrust-drive: error: immutable v2 namespace changed during startup validation: {error}"
+                    );
+                    std::process::exit(1);
+                });
         }
         if format == StoreFormat::V1 {
             ensure_no_future_blob_collisions(&base_path, &state).unwrap_or_else(|error| {
@@ -1593,7 +1996,9 @@ impl ZeroTrustFs {
             state: RwLock::new(state),
             format,
             v2_commit: Mutex::new(initial_v2_commit),
+            v2_namespace_pin,
             open_files: RwLock::new(HashMap::new()),
+            v2_dirty: Mutex::new(V2DirtyOverlay::default()),
             open_counts: Mutex::new(HashMap::new()),
             index_mtime: Mutex::new(initial_index_mtime),
             index_fingerprint: Mutex::new(initial_index_fingerprint),
@@ -1705,18 +2110,27 @@ impl ZeroTrustFs {
                 .prospective_intent_may_be_durable
                 .store(false, Ordering::Release);
             let previous = self.inner.v2_commit.lock().unwrap().clone();
-            let committed = v2::commit_with_phase(
+            let namespace_pin = self.inner.v2_namespace_pin.as_ref().ok_or_else(|| {
+                self.inner.latch_persistence_failure(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "v2 mount has no pinned immutable namespace",
+                ))
+            })?;
+            let committed = v2::commit_with_phase_pinned(
                 &self.inner.base_path,
                 &self.inner.key.read().unwrap(),
                 &json,
                 previous.as_ref(),
                 &self.inner.kdf_fingerprint,
+                namespace_pin,
             )
             .map_err(|failure| {
                 self.inner
                     .prospective_intent_may_be_durable
                     .store(failure.own_intent_may_be_durable, Ordering::Release);
-                if failure.recovery_required {
+                if failure.recovery_required
+                    || failure.error.kind() == std::io::ErrorKind::AlreadyExists
+                {
                     self.inner.latch_persistence_failure(failure.error)
                 } else {
                     failure.error
@@ -2005,6 +2419,210 @@ impl ZeroTrustFs {
         Ok(())
     }
 
+    fn v2_overlay_needs_flush_for_range(
+        &self,
+        ino: u64,
+        offset: u64,
+        len: usize,
+    ) -> std::io::Result<bool> {
+        let end = offset
+            .checked_add(len as u64)
+            .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EFBIG))?;
+        if end == offset {
+            return Ok(false);
+        }
+        let first = offset / v2::CHUNK_SIZE as u64;
+        let last = (end - 1) / v2::CHUNK_SIZE as u64;
+        let overlay = self.inner.v2_dirty.lock().unwrap();
+        let missing = overlay.files.get(&ino).map_or_else(
+            || (last - first + 1) as usize,
+            |file| file.missing_chunks(first, last),
+        );
+        Ok(
+            overlay.chunk_count.saturating_add(missing) > V2_DIRTY_CHUNK_LIMIT
+                || (!overlay.files.contains_key(&ino)
+                    && overlay.files.len() >= V2_DIRTY_FILE_LIMIT),
+        )
+    }
+
+    fn has_v2_dirty_inode(&self, ino: u64) -> bool {
+        self.inner.v2_dirty.lock().unwrap().files.contains_key(&ino)
+    }
+
+    fn materialize_v2_dirty_file(&self, dirty: &V2DirtyFile) -> std::io::Result<(String, u64)> {
+        let key = *self.inner.key.read().unwrap();
+        let namespace_pin = self.inner.v2_namespace_pin.as_ref().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "v2 mount has no pinned immutable namespace",
+            )
+        })?;
+        let mut root = dirty.base_root.clone();
+        let mut size = dirty.base_size;
+
+        if let Some(discard_from) = dirty.discard_from
+            && discard_from < size
+        {
+            root = v2::truncate_file_with_pin(
+                &self.inner.base_path,
+                &key,
+                &root,
+                size,
+                discard_from,
+                Some(namespace_pin),
+            )?;
+            size = discard_from;
+        }
+
+        for (&chunk_index, chunk) in &dirty.chunks {
+            let offset = chunk_index
+                .checked_mul(v2::CHUNK_SIZE as u64)
+                .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EFBIG))?;
+            if offset >= dirty.logical_size {
+                continue;
+            }
+            let len = usize::try_from(
+                (dirty.logical_size - offset)
+                    .min(chunk.len() as u64)
+                    .min(v2::CHUNK_SIZE as u64),
+            )
+            .map_err(|_| std::io::Error::from_raw_os_error(libc::EFBIG))?;
+            if len != 0 {
+                (root, size) = v2::write_file_range_with_pin(
+                    &self.inner.base_path,
+                    &key,
+                    &root,
+                    size,
+                    offset,
+                    &chunk[..len],
+                    Some(namespace_pin),
+                )?;
+            }
+        }
+
+        if size != dirty.logical_size {
+            root = v2::truncate_file_with_pin(
+                &self.inner.base_path,
+                &key,
+                &root,
+                size,
+                dirty.logical_size,
+                Some(namespace_pin),
+            )?;
+            size = dirty.logical_size;
+        }
+        Ok((root, size))
+    }
+
+    /// Read a v2 range through the pending overlay. One bounded response and
+    /// the globally bounded dirty slots are the only plaintext allocations;
+    /// complete file size never controls memory use.
+    pub(crate) fn read_v2_inode_range(
+        &self,
+        ino: u64,
+        offset: u64,
+        requested: usize,
+    ) -> std::io::Result<Vec<u8>> {
+        if requested > v2::MAX_FUSE_READ_SIZE {
+            return Err(std::io::Error::from_raw_os_error(libc::EFBIG));
+        }
+        let _persistence = self.inner.persistence_mutex.lock().unwrap();
+        let (encoded_root, logical_size) = {
+            let state = self.inner.state.read().unwrap();
+            let entry = state
+                .inodes
+                .get(&ino)
+                .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
+            if entry.kind != InodeKind::File {
+                return Err(std::io::Error::from_raw_os_error(libc::EISDIR));
+            }
+            (entry.disk_filename.clone(), entry.size)
+        };
+        let response_len =
+            usize::try_from(logical_size.saturating_sub(offset).min(requested as u64))
+                .map_err(|_| std::io::Error::from_raw_os_error(libc::EFBIG))?;
+        if response_len == 0 {
+            return Ok(Vec::new());
+        }
+
+        let overlay = self.inner.v2_dirty.lock().unwrap();
+        let Some(dirty) = overlay.files.get(&ino) else {
+            return v2::read_file_range(
+                &self.inner.base_path,
+                &self.inner.key.read().unwrap(),
+                &encoded_root,
+                logical_size,
+                offset,
+                response_len,
+            );
+        };
+        if dirty.base_root != encoded_root || dirty.logical_size != logical_size {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("v2 dirty overlay for inode {ino} does not match indexed state"),
+            ));
+        }
+
+        let visible_base = dirty.visible_base_size();
+        let base_len =
+            usize::try_from(visible_base.saturating_sub(offset).min(response_len as u64))
+                .map_err(|_| std::io::Error::from_raw_os_error(libc::EFBIG))?;
+        let mut result = if base_len == 0 {
+            Vec::new()
+        } else {
+            v2::read_file_range(
+                &self.inner.base_path,
+                &self.inner.key.read().unwrap(),
+                &dirty.base_root,
+                dirty.base_size,
+                offset,
+                base_len,
+            )?
+        };
+        result
+            .try_reserve_exact(response_len.saturating_sub(result.len()))
+            .map_err(|_| std::io::Error::from_raw_os_error(libc::ENOMEM))?;
+        result.resize(response_len, 0);
+
+        let response_end = offset
+            .checked_add(response_len as u64)
+            .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EFBIG))?;
+        let first = offset / v2::CHUNK_SIZE as u64;
+        let last = (response_end - 1) / v2::CHUNK_SIZE as u64;
+        for (&chunk_index, chunk) in dirty.chunks.range(first..=last) {
+            let chunk_start = chunk_index
+                .checked_mul(v2::CHUNK_SIZE as u64)
+                .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EFBIG))?;
+            // `u64::MAX` is a valid exclusive file end. The final logical
+            // chunk therefore has no representable grid-aligned exclusive
+            // end; saturating at the file-size ceiling keeps an acknowledged
+            // write at `u64::MAX - 1` readable without wrapping or rejecting
+            // that otherwise valid sparse range.
+            let logical_chunk_end = chunk_start
+                .saturating_add(v2::CHUNK_SIZE as u64)
+                .min(logical_size);
+            let overlap_start = offset.max(chunk_start);
+            let overlap_end = response_end.min(logical_chunk_end);
+            if overlap_start >= overlap_end {
+                continue;
+            }
+            let destination_start = (overlap_start - offset) as usize;
+            let destination_end = (overlap_end - offset) as usize;
+            result[destination_start..destination_end].fill(0);
+
+            let chunk_data_end = chunk_start.saturating_add(chunk.len() as u64);
+            let copy_end = overlap_end.min(chunk_data_end);
+            if overlap_start < copy_end {
+                let source_start = (overlap_start - chunk_start) as usize;
+                let source_end = (copy_end - chunk_start) as usize;
+                let destination_end = destination_start + source_end - source_start;
+                result[destination_start..destination_end]
+                    .copy_from_slice(&chunk[source_start..source_end]);
+            }
+        }
+        Ok(result)
+    }
+
     /// Resize a file to `new_size`. If the file is open, the in-memory
     /// buffer is the source of truth; if it is closed, the on-disk blob is
     /// read-modify-written so a truncation of a closed file is actually
@@ -2028,20 +2646,51 @@ impl ZeroTrustFs {
             }
         };
         if self.inner.format == StoreFormat::V2 {
-            let encoded = v2::truncate_file(
-                &self.inner.base_path,
-                &self.inner.key.read().unwrap(),
-                &disk_filename,
-                old_size,
-                new_size,
-            )?;
+            if old_size == new_size {
+                if let Some(entry) = self.inner.state.write().unwrap().inodes.get_mut(&ino) {
+                    entry.mtime_secs = now_secs();
+                }
+                self.mark_dirty();
+                return Ok(());
+            }
+            let needs_flush = {
+                let overlay = self.inner.v2_dirty.lock().unwrap();
+                !overlay.files.contains_key(&ino) && overlay.files.len() >= V2_DIRTY_FILE_LIMIT
+            };
+            if needs_flush {
+                self.flush_pending_state_locked(false)?;
+            }
+            let (disk_filename, old_size) = {
+                let state = self.inner.state.read().unwrap();
+                let entry = state
+                    .inodes
+                    .get(&ino)
+                    .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
+                (entry.disk_filename.clone(), entry.size)
+            };
+            let new_logical_size = {
+                let mut overlay = self.inner.v2_dirty.lock().unwrap();
+                let dirty = overlay
+                    .files
+                    .entry(ino)
+                    .or_insert_with(|| V2DirtyFile::new(disk_filename.clone(), old_size));
+                if dirty.base_root != disk_filename || dirty.logical_size != old_size {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("v2 dirty overlay for inode {ino} does not match indexed state"),
+                    ));
+                }
+                let removed = dirty.truncate(new_size);
+                let logical_size = dirty.logical_size;
+                overlay.chunk_count = overlay.chunk_count.saturating_sub(removed);
+                logical_size
+            };
             let mut state = self.inner.state.write().unwrap();
             let entry = state
                 .inodes
                 .get_mut(&ino)
                 .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
-            entry.disk_filename = encoded;
-            entry.size = new_size;
+            entry.size = new_logical_size;
             entry.mtime_secs = now_secs();
             drop(state);
             self.mark_dirty();
@@ -2111,14 +2760,40 @@ impl ZeroTrustFs {
         }
         let written = u32::try_from(data.len())
             .map_err(|_| std::io::Error::from_raw_os_error(libc::EFBIG))?;
-        let start =
-            usize::try_from(offset).map_err(|_| std::io::Error::from_raw_os_error(libc::EFBIG))?;
-        let end = start
-            .checked_add(data.len())
+        offset
+            .checked_add(data.len() as u64)
             .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EFBIG))?;
         let _persistence = self.inner.persistence_mutex.lock().unwrap();
         self.inner.ensure_writable()?;
         if self.inner.format == StoreFormat::V2 {
+            if data.len() > v2::CHUNK_SIZE {
+                return Err(std::io::Error::from_raw_os_error(libc::EFBIG));
+            }
+            {
+                let state = self.inner.state.read().unwrap();
+                let entry = state
+                    .inodes
+                    .get(&ino)
+                    .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
+                if entry.kind != InodeKind::File {
+                    return Err(std::io::Error::from_raw_os_error(libc::EISDIR));
+                }
+                if self
+                    .inner
+                    .open_counts
+                    .lock()
+                    .unwrap()
+                    .get(&ino)
+                    .copied()
+                    .unwrap_or(0)
+                    == 0
+                {
+                    return Err(std::io::Error::from_raw_os_error(libc::EBADF));
+                }
+            }
+            if self.v2_overlay_needs_flush_for_range(ino, offset, data.len())? {
+                self.flush_pending_state_locked(false)?;
+            }
             let (encoded_root, old_size) = {
                 let state = self.inner.state.read().unwrap();
                 let entry = state
@@ -2142,28 +2817,43 @@ impl ZeroTrustFs {
                 }
                 (entry.disk_filename.clone(), entry.size)
             };
-            // Every produced object is create-new + file-fsynced +
-            // directory-fsynced before the index starts referencing it.
-            let (new_root, new_size) = v2::write_file_range(
-                &self.inner.base_path,
-                &self.inner.key.read().unwrap(),
-                &encoded_root,
-                old_size,
-                offset,
-                data,
-            )?;
+            let key = *self.inner.key.read().unwrap();
+            let new_size = {
+                let mut overlay = self.inner.v2_dirty.lock().unwrap();
+                let dirty = overlay
+                    .files
+                    .entry(ino)
+                    .or_insert_with(|| V2DirtyFile::new(encoded_root.clone(), old_size));
+                if dirty.base_root != encoded_root || dirty.logical_size != old_size {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("v2 dirty overlay for inode {ino} does not match indexed state"),
+                    ));
+                }
+                let inserted = dirty.write(&self.inner.base_path, &key, offset, data)?;
+                let logical_size = dirty.logical_size;
+                overlay.chunk_count = overlay
+                    .chunk_count
+                    .checked_add(inserted)
+                    .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EFBIG))?;
+                logical_size
+            };
             let mut state = self.inner.state.write().unwrap();
             let entry = state
                 .inodes
                 .get_mut(&ino)
                 .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
-            entry.disk_filename = new_root;
             entry.size = new_size;
             entry.mtime_secs = now_secs();
             drop(state);
             self.mark_dirty();
             return Ok(written);
         }
+        let start =
+            usize::try_from(offset).map_err(|_| std::io::Error::from_raw_os_error(libc::EFBIG))?;
+        let end = start
+            .checked_add(data.len())
+            .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EFBIG))?;
         let new_size = {
             let mut open = self.inner.open_files.write().unwrap();
             let content = open
@@ -2240,17 +2930,53 @@ impl ZeroTrustFs {
                     "v2 content must be immutable before its root generation is committed",
                 )));
             }
-            let index_json = {
-                let state = self.inner.state.read().unwrap();
-                serialize_index_bounded_v2(&state).map_err(|error| {
-                    if error.kind() == std::io::ErrorKind::InvalidData {
+            let mut prospective = self.inner.state.read().unwrap().clone();
+            let mut overlay = self.inner.v2_dirty.lock().unwrap();
+            for (&ino, dirty) in &overlay.files {
+                let entry = prospective.inodes.get(&ino).ok_or_else(|| {
+                    self.inner.latch_persistence_failure(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("v2 dirty inode {ino} is missing from the prospective index"),
+                    ))
+                })?;
+                if entry.kind != InodeKind::File
+                    || entry.disk_filename != dirty.base_root
+                    || entry.size != dirty.logical_size
+                {
+                    return Err(self.inner.latch_persistence_failure(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("v2 dirty overlay for inode {ino} does not match indexed state"),
+                    )));
+                }
+            }
+            for (&ino, dirty) in &overlay.files {
+                let (root, size) = self.materialize_v2_dirty_file(dirty).map_err(|error| {
+                    if error.kind() == std::io::ErrorKind::AlreadyExists {
                         self.inner.latch_persistence_failure(error)
                     } else {
                         error
                     }
-                })?
-            };
-            return self.persist_index(index_json);
+                })?;
+                let entry = prospective.inodes.get_mut(&ino).ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("v2 dirty inode {ino} disappeared while materializing"),
+                    )
+                })?;
+                entry.disk_filename = root;
+                entry.size = size;
+            }
+            let index_json = serialize_index_bounded_v2(&prospective).map_err(|error| {
+                if error.kind() == std::io::ErrorKind::InvalidData {
+                    self.inner.latch_persistence_failure(error)
+                } else {
+                    error
+                }
+            })?;
+            self.persist_index(index_json)?;
+            *self.inner.state.write().unwrap() = prospective;
+            overlay.clear();
+            return Ok(());
         }
         let dirty: Vec<u64> = self
             .inner
@@ -2344,7 +3070,8 @@ impl ZeroTrustFs {
             return Err(error);
         }
         let had_index_dirty = self.inner.index_dirty.swap(false, Ordering::AcqRel);
-        let has_dirty_content = !self.inner.dirty_inodes.lock().unwrap().is_empty();
+        let has_dirty_content = !self.inner.dirty_inodes.lock().unwrap().is_empty()
+            || !self.inner.v2_dirty.lock().unwrap().files.is_empty();
         if !force && !had_index_dirty && !has_dirty_content {
             *self.inner.dirty_timing.lock().unwrap() = None;
             return Ok(());
@@ -2361,12 +3088,259 @@ impl ZeroTrustFs {
         Ok(())
     }
 
+    /// Perform an unlink as one testable namespace mutation. Open or dirty
+    /// files remain fail-closed until inode tombstones can preserve POSIX
+    /// open-unlink semantics without dropping acknowledged plaintext.
+    fn unlink_name(&self, parent: u64, name: &str) -> Result<(), std::io::Error> {
+        let _persistence = self.inner.persistence_mutex.lock().unwrap();
+        self.inner.ensure_writable()?;
+        let (ino, disk_filename, previous_state) = {
+            let mut state = self.inner.state.write().unwrap();
+            match state.inodes.get(&parent) {
+                Some(entry) if entry.kind == InodeKind::Directory => {}
+                _ => return Err(std::io::Error::from_raw_os_error(libc::ENOTDIR)),
+            }
+            let ino = Self::find_child(&state, parent, name)
+                .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
+            let entry = match state.inodes.get(&ino) {
+                Some(entry) if entry.kind == InodeKind::File => entry,
+                Some(_) => return Err(std::io::Error::from_raw_os_error(libc::EISDIR)),
+                None => return Err(std::io::Error::from_raw_os_error(libc::EIO)),
+            };
+            if self
+                .inner
+                .open_counts
+                .lock()
+                .unwrap()
+                .get(&ino)
+                .copied()
+                .unwrap_or(0)
+                > 0
+                || self.has_v2_dirty_inode(ino)
+            {
+                return Err(std::io::Error::from_raw_os_error(libc::EBUSY));
+            }
+            let disk_filename = entry.disk_filename.clone();
+            let previous_state = state.clone();
+            state.inodes.remove(&ino);
+            if let Some(children) = state.children.get_mut(&parent) {
+                children.retain(|child| child.inode != ino);
+            }
+            (ino, disk_filename, previous_state)
+        };
+        if let Err(error) = self.flush_pending_state_locked(true) {
+            if !self
+                .inner
+                .prospective_intent_may_be_durable
+                .swap(false, Ordering::AcqRel)
+            {
+                *self.inner.state.write().unwrap() = previous_state;
+            } else {
+                // Recovery will roll the authenticated unlink forward. Keep
+                // RAM aligned with that prospective generation while the
+                // mount remains latched read-only.
+                self.inner.open_files.write().unwrap().remove(&ino);
+                self.inner.dirty_inodes.lock().unwrap().remove(&ino);
+                self.inner.open_counts.lock().unwrap().remove(&ino);
+                self.inner.v2_dirty.lock().unwrap().remove_inode(ino);
+            }
+            return Err(error);
+        }
+        self.inner.open_files.write().unwrap().remove(&ino);
+        self.inner.dirty_inodes.lock().unwrap().remove(&ino);
+        self.inner.open_counts.lock().unwrap().remove(&ino);
+        self.inner.v2_dirty.lock().unwrap().remove_inode(ino);
+        if self.inner.format == StoreFormat::V1
+            && !disk_filename.is_empty()
+            && let Err(error) = fs::remove_file(self.inner.base_path.join(&disk_filename))
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            eprintln!("zerotrust-drive: WARNING: orphaned backing file {disk_filename}: {error}");
+        }
+        Ok(())
+    }
+
+    /// Perform the no-flags rename core without a FUSE reply dependency. A
+    /// replacement is committed immediately even when its old file root is
+    /// empty, so no acknowledged overwrite depends only on debounce timing.
+    fn rename_name(
+        &self,
+        parent: u64,
+        name: &str,
+        newparent: u64,
+        newname: &str,
+    ) -> Result<(), std::io::Error> {
+        let _persistence = self.inner.persistence_mutex.lock().unwrap();
+        self.inner.ensure_writable()?;
+        let (disk_file_to_remove, overwritten_ino, previous_state) = {
+            let mut state = self.inner.state.write().unwrap();
+            match state.inodes.get(&parent) {
+                Some(entry) if entry.kind == InodeKind::Directory => {}
+                _ => return Err(std::io::Error::from_raw_os_error(libc::ENOTDIR)),
+            }
+            match state.inodes.get(&newparent) {
+                Some(entry) if entry.kind == InodeKind::Directory => {}
+                _ => return Err(std::io::Error::from_raw_os_error(libc::ENOTDIR)),
+            }
+            let ino = Self::find_child(&state, parent, name)
+                .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
+            let source_kind = state
+                .inodes
+                .get(&ino)
+                .map(|entry| entry.kind.clone())
+                .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EIO))?;
+            if source_kind == InodeKind::Directory
+                && Self::would_create_directory_cycle(&state, ino, newparent)
+            {
+                return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+            }
+            let mut to_remove = None;
+            let mut overwritten = None;
+            if let Some(existing) = Self::find_child(&state, newparent, newname) {
+                if existing == ino {
+                    return Ok(());
+                }
+                let target = state
+                    .inodes
+                    .get(&existing)
+                    .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EIO))?;
+                match (&source_kind, &target.kind) {
+                    (InodeKind::File, InodeKind::Directory) => {
+                        return Err(std::io::Error::from_raw_os_error(libc::EISDIR));
+                    }
+                    (InodeKind::Directory, InodeKind::File) => {
+                        return Err(std::io::Error::from_raw_os_error(libc::ENOTDIR));
+                    }
+                    _ => {}
+                }
+                if target.kind == InodeKind::Directory
+                    && state
+                        .children
+                        .get(&existing)
+                        .is_some_and(|children| !children.is_empty())
+                {
+                    return Err(std::io::Error::from_raw_os_error(libc::ENOTEMPTY));
+                }
+                if self
+                    .inner
+                    .open_counts
+                    .lock()
+                    .unwrap()
+                    .get(&existing)
+                    .copied()
+                    .unwrap_or(0)
+                    > 0
+                    || self.inner.dirty_inodes.lock().unwrap().contains(&existing)
+                    || self.has_v2_dirty_inode(existing)
+                {
+                    return Err(std::io::Error::from_raw_os_error(libc::EBUSY));
+                }
+                to_remove = state.inodes.get(&existing).and_then(|entry| {
+                    (!entry.disk_filename.is_empty()).then(|| entry.disk_filename.clone())
+                });
+                overwritten = Some(existing);
+            }
+            let previous_state = overwritten.map(|_| state.clone());
+            if let Some(existing) = overwritten {
+                let target_was_directory = state
+                    .inodes
+                    .get(&existing)
+                    .is_some_and(|entry| entry.kind == InodeKind::Directory);
+                state.inodes.remove(&existing);
+                if target_was_directory {
+                    state.children.remove(&existing);
+                    if let Some(parent_entry) = state.inodes.get_mut(&newparent) {
+                        parent_entry.nlink = parent_entry.nlink.saturating_sub(1);
+                    }
+                }
+                if let Some(children) = state.children.get_mut(&newparent) {
+                    children.retain(|child| child.inode != existing);
+                }
+            }
+            if let Some(children) = state.children.get_mut(&parent) {
+                children.retain(|child| child.inode != ino);
+            }
+            state.children.entry(newparent).or_default().push(DirChild {
+                name: newname.to_string(),
+                inode: ino,
+            });
+            if source_kind == InodeKind::Directory && parent != newparent {
+                if let Some(old_parent) = state.inodes.get_mut(&parent) {
+                    old_parent.nlink = old_parent.nlink.saturating_sub(1);
+                }
+                if let Some(new_parent) = state.inodes.get_mut(&newparent) {
+                    new_parent.nlink = new_parent.nlink.saturating_add(1);
+                }
+            }
+            if let Some(entry) = state.inodes.get_mut(&ino) {
+                entry.name = newname.to_string();
+                entry.parent = newparent;
+                entry.ctime_secs = now_secs();
+            }
+            (to_remove, overwritten, previous_state)
+        };
+        if overwritten_ino.is_some() {
+            if let Err(error) = self.flush_pending_state_locked(true) {
+                if !self
+                    .inner
+                    .prospective_intent_may_be_durable
+                    .swap(false, Ordering::AcqRel)
+                {
+                    *self.inner.state.write().unwrap() =
+                        previous_state.expect("overwrite rename retains rollback state");
+                } else if let Some(existing) = overwritten_ino {
+                    self.inner.open_files.write().unwrap().remove(&existing);
+                    self.inner.dirty_inodes.lock().unwrap().remove(&existing);
+                    self.inner.open_counts.lock().unwrap().remove(&existing);
+                    self.inner.v2_dirty.lock().unwrap().remove_inode(existing);
+                }
+                return Err(error);
+            }
+        } else {
+            self.mark_dirty();
+        }
+        if let Some(existing) = overwritten_ino {
+            self.inner.open_files.write().unwrap().remove(&existing);
+            self.inner.dirty_inodes.lock().unwrap().remove(&existing);
+            self.inner.open_counts.lock().unwrap().remove(&existing);
+            self.inner.v2_dirty.lock().unwrap().remove_inode(existing);
+        }
+        if self.inner.format == StoreFormat::V1
+            && let Some(disk_filename) = disk_file_to_remove
+            && let Err(error) = fs::remove_file(self.inner.base_path.join(&disk_filename))
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            eprintln!(
+                "zerotrust-drive: WARNING: orphaned overwritten backing file {disk_filename}: {error}"
+            );
+        }
+        Ok(())
+    }
+
     /// Serialize a complete blob+index commit against other persistence and
     /// online rekey operations.
     #[cfg(test)]
     pub(crate) fn flush_state(&self) -> Result<(), std::io::Error> {
         let _persistence = self.inner.persistence_mutex.lock().unwrap();
         self.flush_pending_state_locked(true)
+    }
+
+    /// Remove wall-clock scheduling from tests that specifically exercise
+    /// capacity-pressure flushing. The caller must explicitly fsync or release
+    /// every accepted mutation because Drop no longer owns a worker to stop.
+    #[cfg(test)]
+    fn stop_debounce_thread_for_test(&mut self) {
+        let Some(handle) = self.debounce_thread.take() else {
+            return;
+        };
+        {
+            let mut stop = self.inner.debounce_mutex.lock().unwrap();
+            *stop = true;
+            self.inner.debounce_notify.notify_one();
+        }
+        handle
+            .join()
+            .expect("debounce test worker must stop cleanly");
     }
 }
 
@@ -2636,26 +3610,7 @@ impl Filesystem for ZeroTrustFs {
         reply: ReplyData,
     ) {
         if self.inner.format == StoreFormat::V2 {
-            let (encoded_root, file_size) = {
-                let state = self.inner.state.read().unwrap();
-                let Some(entry) = state.inodes.get(&ino.0) else {
-                    reply.error(fuser::Errno::ENOENT);
-                    return;
-                };
-                if entry.kind != InodeKind::File {
-                    reply.error(fuser::Errno::EISDIR);
-                    return;
-                }
-                (entry.disk_filename.clone(), entry.size)
-            };
-            match v2::read_file_range(
-                &self.inner.base_path,
-                &self.inner.key.read().unwrap(),
-                &encoded_root,
-                file_size,
-                offset,
-                size as usize,
-            ) {
+            match self.read_v2_inode_range(ino.0, offset, size as usize) {
                 Ok(data) => reply.data(&data),
                 Err(error) => {
                     eprintln!("zerotrust-drive: ERROR: read v2 inode {}: {error}", ino.0);
@@ -3079,87 +4034,18 @@ impl Filesystem for ZeroTrustFs {
                 return;
             }
         };
-
-        let persistence = self.inner.persistence_mutex.lock().unwrap();
-        if let Err(error) = self.inner.ensure_writable() {
-            reply.error(io_to_errno(&error));
-            return;
-        }
-        let previous_state;
-        let (ino, disk_filename) = {
-            let mut state = self.inner.state.write().unwrap();
-            let ino = match Self::find_child(&state, parent.0, name_str) {
-                Some(i) => i,
-                None => {
-                    reply.error(fuser::Errno::ENOENT);
-                    return;
+        match self.unlink_name(parent.0, name_str) {
+            Ok(()) => reply.ok(),
+            Err(error) => {
+                if !matches!(
+                    error.raw_os_error(),
+                    Some(libc::ENOENT | libc::EISDIR | libc::EBUSY)
+                ) {
+                    eprintln!("zerotrust-drive: ERROR: failed to unlink {name_str:?}: {error}");
                 }
-            };
-            let entry = match state.inodes.get(&ino) {
-                Some(entry) if entry.kind == InodeKind::File => entry,
-                Some(_) => {
-                    reply.error(fuser::Errno::EISDIR);
-                    return;
-                }
-                None => {
-                    reply.error(fuser::Errno::EIO);
-                    return;
-                }
-            };
-            if self
-                .inner
-                .open_counts
-                .lock()
-                .unwrap()
-                .get(&ino)
-                .copied()
-                .unwrap_or(0)
-                > 0
-            {
-                // Proper POSIX open-unlink needs tombstones. Until those exist,
-                // reject the unsafe case instead of discarding a live buffer.
-                reply.error(fuser::Errno::EBUSY);
-                return;
+                reply.error(io_to_errno(&error));
             }
-            let df = entry.disk_filename.clone();
-            previous_state = state.clone();
-            state.inodes.remove(&ino);
-            if let Some(ch) = state.children.get_mut(&parent.0) {
-                ch.retain(|c| c.inode != ino);
-            }
-            (ino, df)
-        };
-        if let Err(e) = self.flush_pending_state_locked(true) {
-            if !self
-                .inner
-                .prospective_intent_may_be_durable
-                .swap(false, Ordering::AcqRel)
-            {
-                *self.inner.state.write().unwrap() = previous_state;
-            } else {
-                // Authenticated v2 intent may already be durable and recovery
-                // will roll this unlink forward. Keep RAM aligned with that
-                // prospective generation while the mount is latched read-only.
-                self.inner.open_files.write().unwrap().remove(&ino);
-                self.inner.dirty_inodes.lock().unwrap().remove(&ino);
-                self.inner.open_counts.lock().unwrap().remove(&ino);
-            }
-            eprintln!("zerotrust-drive: ERROR: failed to persist unlink: {e}");
-            reply.error(io_to_errno(&e));
-            return;
         }
-        self.inner.open_files.write().unwrap().remove(&ino);
-        self.inner.dirty_inodes.lock().unwrap().remove(&ino);
-        self.inner.open_counts.lock().unwrap().remove(&ino);
-        if self.inner.format == StoreFormat::V1
-            && !disk_filename.is_empty()
-            && let Err(e) = fs::remove_file(self.inner.base_path.join(&disk_filename))
-            && e.kind() != std::io::ErrorKind::NotFound
-        {
-            eprintln!("zerotrust-drive: WARNING: orphaned backing file {disk_filename}: {e}");
-        }
-        drop(persistence);
-        reply.ok();
     }
 
     fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
@@ -3251,187 +4137,27 @@ impl Filesystem for ZeroTrustFs {
             reply.error(fuser::Errno::ENAMETOOLONG);
             return;
         }
-        let persistence = self.inner.persistence_mutex.lock().unwrap();
-        if let Err(error) = self.inner.ensure_writable() {
-            reply.error(io_to_errno(&error));
-            return;
+        match self.rename_name(parent.0, name_str, newparent.0, newname_str) {
+            Ok(()) => reply.ok(),
+            Err(error) => {
+                if !matches!(
+                    error.raw_os_error(),
+                    Some(
+                        libc::ENOENT
+                            | libc::EISDIR
+                            | libc::ENOTDIR
+                            | libc::EINVAL
+                            | libc::ENOTEMPTY
+                            | libc::EBUSY
+                    )
+                ) {
+                    eprintln!(
+                        "zerotrust-drive: ERROR: failed to rename {name_str:?} to {newname_str:?}: {error}"
+                    );
+                }
+                reply.error(io_to_errno(&error));
+            }
         }
-        let previous_state: Option<DiskIndex>;
-        let (disk_file_to_remove, overwritten_ino) = {
-            let mut state = self.inner.state.write().unwrap();
-            match state.inodes.get(&parent.0) {
-                Some(entry) if entry.kind == InodeKind::Directory => {}
-                _ => {
-                    reply.error(fuser::Errno::ENOTDIR);
-                    return;
-                }
-            }
-            match state.inodes.get(&newparent.0) {
-                Some(entry) if entry.kind == InodeKind::Directory => {}
-                _ => {
-                    reply.error(fuser::Errno::ENOTDIR);
-                    return;
-                }
-            }
-            let ino = match Self::find_child(&state, parent.0, name_str) {
-                Some(i) => i,
-                None => {
-                    reply.error(fuser::Errno::ENOENT);
-                    return;
-                }
-            };
-            let source_kind = match state.inodes.get(&ino) {
-                Some(entry) => entry.kind.clone(),
-                None => {
-                    reply.error(fuser::Errno::EIO);
-                    return;
-                }
-            };
-            if source_kind == InodeKind::Directory
-                && Self::would_create_directory_cycle(&state, ino, newparent.0)
-            {
-                reply.error(fuser::Errno::EINVAL);
-                return;
-            }
-            let mut to_remove = None;
-            let mut overwritten = None;
-            if let Some(existing) = Self::find_child(&state, newparent.0, newname_str) {
-                if existing == ino {
-                    reply.ok();
-                    return;
-                }
-                let target = match state.inodes.get(&existing) {
-                    Some(entry) => entry,
-                    None => {
-                        reply.error(fuser::Errno::EIO);
-                        return;
-                    }
-                };
-                match (&source_kind, &target.kind) {
-                    (InodeKind::File, InodeKind::Directory) => {
-                        reply.error(fuser::Errno::EISDIR);
-                        return;
-                    }
-                    (InodeKind::Directory, InodeKind::File) => {
-                        reply.error(fuser::Errno::ENOTDIR);
-                        return;
-                    }
-                    _ => {}
-                }
-                if target.kind == InodeKind::Directory
-                    && state
-                        .children
-                        .get(&existing)
-                        .is_some_and(|children| !children.is_empty())
-                {
-                    reply.error(fuser::Errno::ENOTEMPTY);
-                    return;
-                }
-                if self
-                    .inner
-                    .open_counts
-                    .lock()
-                    .unwrap()
-                    .get(&existing)
-                    .copied()
-                    .unwrap_or(0)
-                    > 0
-                    || self.inner.dirty_inodes.lock().unwrap().contains(&existing)
-                {
-                    reply.error(fuser::Errno::EBUSY);
-                    return;
-                }
-                to_remove = state.inodes.get(&existing).and_then(|e| {
-                    if e.disk_filename.is_empty() {
-                        None
-                    } else {
-                        Some(e.disk_filename.clone())
-                    }
-                });
-                overwritten = Some(existing);
-            }
-            previous_state = to_remove.as_ref().map(|_| state.clone());
-            if let Some(existing) = overwritten {
-                let target_was_directory = state
-                    .inodes
-                    .get(&existing)
-                    .is_some_and(|entry| entry.kind == InodeKind::Directory);
-                state.inodes.remove(&existing);
-                if target_was_directory {
-                    state.children.remove(&existing);
-                    if let Some(parent_entry) = state.inodes.get_mut(&newparent.0) {
-                        parent_entry.nlink = parent_entry.nlink.saturating_sub(1);
-                    }
-                }
-                if let Some(ch) = state.children.get_mut(&newparent.0) {
-                    ch.retain(|c| c.inode != existing);
-                }
-            }
-            if let Some(ch) = state.children.get_mut(&parent.0) {
-                ch.retain(|c| c.inode != ino);
-            }
-            state
-                .children
-                .entry(newparent.0)
-                .or_default()
-                .push(DirChild {
-                    name: newname_str.to_string(),
-                    inode: ino,
-                });
-            if source_kind == InodeKind::Directory && parent != newparent {
-                if let Some(old_parent) = state.inodes.get_mut(&parent.0) {
-                    old_parent.nlink = old_parent.nlink.saturating_sub(1);
-                }
-                if let Some(new_parent) = state.inodes.get_mut(&newparent.0) {
-                    new_parent.nlink = new_parent.nlink.saturating_add(1);
-                }
-            }
-            if let Some(entry) = state.inodes.get_mut(&ino) {
-                entry.name = newname_str.to_string();
-                entry.parent = newparent.0;
-                entry.ctime_secs = now_secs();
-            }
-            (to_remove, overwritten)
-        };
-        if disk_file_to_remove.is_some() {
-            if let Err(e) = self.flush_pending_state_locked(true) {
-                if !self
-                    .inner
-                    .prospective_intent_may_be_durable
-                    .swap(false, Ordering::AcqRel)
-                {
-                    *self.inner.state.write().unwrap() =
-                        previous_state.expect("overwrite rename must retain rollback state");
-                } else if let Some(existing) = overwritten_ino {
-                    // Recovery will roll forward the authenticated overwrite;
-                    // retain the prospective namespace and remove stale caches.
-                    self.inner.open_files.write().unwrap().remove(&existing);
-                    self.inner.dirty_inodes.lock().unwrap().remove(&existing);
-                    self.inner.open_counts.lock().unwrap().remove(&existing);
-                }
-                eprintln!("zerotrust-drive: ERROR: failed to persist rename: {e}");
-                reply.error(io_to_errno(&e));
-                return;
-            }
-        } else {
-            // No physical blob is deleted, so normal metadata debounce is safe
-            // and avoids cloning/rewriting the entire index for every rename.
-            self.mark_dirty();
-        }
-        if let Some(existing) = overwritten_ino {
-            self.inner.open_files.write().unwrap().remove(&existing);
-            self.inner.dirty_inodes.lock().unwrap().remove(&existing);
-            self.inner.open_counts.lock().unwrap().remove(&existing);
-        }
-        if self.inner.format == StoreFormat::V1
-            && let Some(f) = disk_file_to_remove
-            && let Err(e) = fs::remove_file(self.inner.base_path.join(&f))
-            && e.kind() != std::io::ErrorKind::NotFound
-        {
-            eprintln!("zerotrust-drive: WARNING: orphaned overwritten backing file {f}: {e}");
-        }
-        drop(persistence);
-        reply.ok();
     }
 
     fn readdir(
@@ -3542,7 +4268,8 @@ impl Filesystem for ZeroTrustFs {
 mod tests {
     use super::*;
     use crate::crypto::{
-        FORMAT_VERSION, KdfParams, SALT_LEN, decrypt_bytes, derive_key, encrypt_bytes,
+        FORMAT_VERSION, KdfParams, KdfPublicationPhase, SALT_LEN, decrypt_bytes, derive_key,
+        encrypt_bytes,
     };
 
     /// Derive a key with a fixed cheap test salt+params. Keeps the
@@ -4610,6 +5337,149 @@ mod tests {
     }
 
     #[test]
+    fn v2_root_without_kdf_refuses_replacement_key_metadata() {
+        let directory = PathBuf::from("target/test-v2-root-without-kdf");
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join(v2::ROOT_FILE), b"provider root").unwrap();
+        fs::write(
+            directory.join("_rekey.manifest"),
+            b"unresolved recovery evidence",
+        )
+        .unwrap();
+
+        let error = ensure_v2_controls_have_kdf(&directory).unwrap_err();
+        assert!(error.contains("v2 root or recovery intent"), "{error}");
+        assert!(error.contains("no _kdf.json"), "{error}");
+        assert_eq!(
+            fs::read(directory.join(v2::ROOT_FILE)).unwrap(),
+            b"provider root"
+        );
+        assert_eq!(
+            fs::read(directory.join("_rekey.manifest")).unwrap(),
+            b"unresolved recovery evidence",
+            "KDF preflight must fail before startup cleanup can alter recovery evidence"
+        );
+
+        fs::write(directory.join("_kdf.json"), b"provider KDF").unwrap();
+        ensure_v2_controls_have_kdf(&directory).unwrap();
+        fs::remove_file(directory.join(v2::ROOT_FILE)).unwrap();
+        fs::remove_file(directory.join("_kdf.json")).unwrap();
+        fs::remove_file(directory.join("_rekey.manifest")).unwrap();
+        ensure_v2_controls_have_kdf(&directory).unwrap();
+
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn new_kdf_publication_rechecks_every_control_before_and_after_publish() {
+        for (control, arrival_phase) in [
+            (INDEX_FILE, KdfPublicationPhase::Before),
+            (v2::ROOT_FILE, KdfPublicationPhase::Before),
+            (v2::WRITE_MANIFEST, KdfPublicationPhase::Before),
+            (INDEX_FILE, KdfPublicationPhase::After),
+            (v2::ROOT_FILE, KdfPublicationPhase::After),
+            (v2::WRITE_MANIFEST, KdfPublicationPhase::After),
+        ] {
+            let label = control.trim_matches(['_', '.']).replace(['.', '/'], "-");
+            let directory = PathBuf::from(format!(
+                "target/test-kdf-publication-{label}-phase-{arrival_phase:?}"
+            ));
+            let _ = fs::remove_dir_all(&directory);
+            fs::create_dir_all(&directory).unwrap();
+            let injected = std::cell::Cell::new(false);
+
+            let error =
+                crate::crypto::load_or_create_kdf_with_fingerprint_guarded(&directory, |phase| {
+                    if phase == arrival_phase && !injected.replace(true) {
+                        fs::write(directory.join(control), b"provider control evidence")
+                            .map_err(|error| error.to_string())?;
+                    }
+                    ensure_new_kdf_publication_safe(&directory)
+                })
+                .unwrap_err();
+
+            assert!(injected.get());
+            assert!(error.contains("appeared"), "{error}");
+            assert_eq!(
+                fs::read(directory.join(control)).unwrap(),
+                b"provider control evidence"
+            );
+            assert_eq!(
+                backing_entry_exists(&directory.join("_kdf.json")).unwrap(),
+                arrival_phase == KdfPublicationPhase::After,
+                "the canonical KDF must be absent before publication and preserved after publication"
+            );
+            let retained_temps = fs::read_dir(&directory)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with("._kdf.json.")
+                })
+                .count();
+            assert_eq!(
+                retained_temps, 1,
+                "a durable KDF staging file must remain as initialization evidence"
+            );
+            if arrival_phase == KdfPublicationPhase::After {
+                assert!(crate::crypto::load_kdf(&directory).unwrap().is_some());
+            }
+
+            let _ = fs::remove_dir_all(directory);
+        }
+    }
+
+    #[test]
+    fn v2_recovery_intent_without_kdf_refuses_replacement_key_metadata() {
+        let directory = PathBuf::from("target/test-v2-intent-without-kdf");
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join(v2::WRITE_MANIFEST), b"provider intent").unwrap();
+
+        let error = ensure_v2_controls_have_kdf(&directory).unwrap_err();
+        assert!(error.contains("v2 root or recovery intent"), "{error}");
+        assert!(error.contains("no _kdf.json"), "{error}");
+
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn v2_commit_snapshot_rejects_replaced_namespace_and_object_directory() {
+        for child in [None, Some(v2::OBJECTS_DIRECTORY)] {
+            let label = child.unwrap_or("namespace");
+            let directory = PathBuf::from(format!(
+                "target/test-v2-replaced-directory-{}",
+                label.replace('/', "-")
+            ));
+            let _ = fs::remove_dir_all(&directory);
+            let ztfs = ZeroTrustFs::new_v2("replacement-pw", directory.clone());
+            assert_eq!(ztfs.inner.format, StoreFormat::V2);
+            let snapshot = ztfs.inner.format_controls.clone();
+            let namespace = directory.join(v2::OBJECT_DIRECTORY);
+            let target = child.map_or_else(|| namespace.clone(), |name| namespace.join(name));
+            let displaced = target.with_extension("displaced");
+            fs::rename(&target, &displaced).unwrap();
+            fs::create_dir(&target).unwrap();
+            if child.is_none() {
+                fs::create_dir(target.join(v2::OBJECTS_DIRECTORY)).unwrap();
+                fs::create_dir(target.join(v2::EVIDENCE_DIRECTORY)).unwrap();
+            }
+
+            let error = snapshot.verify(&directory).unwrap_err();
+            let message = error.to_string();
+            assert!(message.contains("topology changed"), "{error}");
+            assert!(message.contains("identity"), "{error}");
+
+            drop(ztfs);
+            let _ = fs::remove_dir_all(directory);
+        }
+    }
+
+    #[test]
     fn missing_backing_file_returns_error() {
         // Verify that an inode with a non-empty disk_filename but missing backing
         // file would be detected. We test the detection logic directly rather than
@@ -4683,6 +5553,78 @@ mod tests {
             inode: ino,
         });
         (ino, df)
+    }
+
+    fn add_v2_file(ztfs: &ZeroTrustFs, name: &str) -> u64 {
+        let mut state = ztfs.inner.state.write().unwrap();
+        let ino = ZeroTrustFs::allocate_inode(&mut state);
+        state.inodes.insert(
+            ino,
+            InodeEntry {
+                name: name.to_string(),
+                kind: InodeKind::File,
+                disk_filename: String::new(),
+                size: 0,
+                perm: 0o600,
+                uid: 501,
+                gid: 20,
+                atime_secs: 1,
+                mtime_secs: 1,
+                ctime_secs: 1,
+                nlink: 1,
+                parent: 1,
+            },
+        );
+        state.children.get_mut(&1).unwrap().push(DirChild {
+            name: name.to_string(),
+            inode: ino,
+        });
+        ino
+    }
+
+    fn v2_object_count(directory: &Path) -> usize {
+        fs::read_dir(directory.join(v2::OBJECT_DIRECTORY).join("objects"))
+            .unwrap()
+            .count()
+    }
+
+    fn leave_v2_overlay_after_failed_last_release(ztfs: &ZeroTrustFs, ino: u64) {
+        use crate::fault::FaultInjectionGuard;
+
+        let injector = FaultInjectionGuard::fail_at(1);
+        let error = ztfs.release_inode(ino).unwrap_err();
+        drop(injector);
+        assert!(
+            error.to_string().contains("deterministic injected crash"),
+            "last release failed for an unexpected reason: {error}"
+        );
+        assert_eq!(
+            ztfs.inner.open_counts.lock().unwrap().get(&ino).copied(),
+            None,
+            "the failed last release must leave no open-handle count"
+        );
+        assert!(
+            ztfs.has_v2_dirty_inode(ino),
+            "the failed last release discarded its dirty overlay"
+        );
+        assert!(
+            ztfs.inner.persistence_error().is_none(),
+            "an early injected failure should remain retryable"
+        );
+    }
+
+    fn copy_test_directory(source: &Path, destination: &Path) {
+        let _ = fs::remove_dir_all(destination);
+        fs::create_dir_all(destination).unwrap();
+        for entry in fs::read_dir(source).unwrap() {
+            let entry = entry.unwrap();
+            let target = destination.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_test_directory(&entry.path(), &target);
+            } else {
+                fs::copy(entry.path(), target).unwrap();
+            }
+        }
     }
 
     /// mknod-style inode (non-empty disk_filename, size 0, no backing blob)
@@ -5213,6 +6155,581 @@ mod tests {
         let error = validate_reachable_v2_files(&dir, &key, &state).unwrap_err();
         assert!(error.contains("not completely materialized"), "{error}");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn v2_small_writes_coalesce_in_bounded_overlay_until_fsync() {
+        let dir = PathBuf::from("target/test-v2-dirty-overlay-coalesce");
+        let _ = fs::remove_dir_all(&dir);
+        let ztfs = ZeroTrustFs::new_v2("pw", dir.clone());
+        let ino = add_v2_file(&ztfs, "coalesced.bin");
+        ztfs.open_inode(ino).unwrap();
+        let before = v2_object_count(&dir);
+
+        for (offset, byte) in b"bounded-overlay".iter().copied().enumerate() {
+            ztfs.write_inode_content(ino, offset as u64, &[byte])
+                .unwrap();
+        }
+
+        assert_eq!(v2_object_count(&dir), before);
+        assert_eq!(ztfs.inner.v2_dirty.lock().unwrap().chunk_count, 1);
+        assert_eq!(
+            ztfs.read_v2_inode_range(ino, 0, 64).unwrap(),
+            b"bounded-overlay"
+        );
+
+        ztfs.fsync_inode(ino).unwrap();
+        assert!(v2_object_count(&dir) > before);
+        assert_eq!(ztfs.inner.v2_dirty.lock().unwrap().chunk_count, 0);
+        ztfs.release_inode(ino).unwrap();
+        drop(ztfs);
+
+        let reopened = ZeroTrustFs::new_v2("pw", dir.clone());
+        assert_eq!(
+            reopened.read_v2_inode_range(ino, 0, 64).unwrap(),
+            b"bounded-overlay"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn v2_overlay_handles_cross_chunk_write_and_read() {
+        let dir = PathBuf::from("target/test-v2-dirty-overlay-cross-chunk");
+        let _ = fs::remove_dir_all(&dir);
+        let ztfs = ZeroTrustFs::new_v2("pw", dir.clone());
+        let ino = add_v2_file(&ztfs, "boundary.bin");
+        ztfs.open_inode(ino).unwrap();
+        let offset = v2::CHUNK_SIZE as u64 - 3;
+
+        ztfs.write_inode_content(ino, offset, b"abcdef").unwrap();
+
+        assert_eq!(ztfs.inner.v2_dirty.lock().unwrap().chunk_count, 2);
+        assert_eq!(
+            ztfs.read_v2_inode_range(ino, offset - 2, 10).unwrap(),
+            b"\0\0abcdef"
+        );
+        ztfs.fsync_inode(ino).unwrap();
+        assert_eq!(
+            ztfs.read_v2_inode_range(ino, offset - 2, 10).unwrap(),
+            b"\0\0abcdef"
+        );
+        ztfs.release_inode(ino).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn v2_overlay_reads_last_representable_sparse_byte_before_and_after_flush() {
+        let dir = PathBuf::from("target/test-v2-dirty-overlay-u64-boundary");
+        let _ = fs::remove_dir_all(&dir);
+        let ztfs = ZeroTrustFs::new_v2("pw", dir.clone());
+        let ino = add_v2_file(&ztfs, "boundary.bin");
+        ztfs.open_inode(ino).unwrap();
+        let offset = u64::MAX - 1;
+
+        assert_eq!(ztfs.write_inode_content(ino, offset, b"x").unwrap(), 1);
+        assert_eq!(
+            ztfs.read_v2_inode_range(ino, offset, 1).unwrap(),
+            b"x",
+            "the dirty final chunk must be readable before persistence"
+        );
+        ztfs.fsync_inode(ino).unwrap();
+        ztfs.release_inode(ino).unwrap();
+        drop(ztfs);
+
+        let reopened = ZeroTrustFs::new_v2("pw", dir.clone());
+        assert_eq!(
+            reopened.read_v2_inode_range(ino, offset, 1).unwrap(),
+            b"x",
+            "the final sparse byte must remain readable after root-last persistence"
+        );
+        drop(reopened);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn v2_overlay_pressure_flushes_before_accepting_another_chunk() {
+        let dir = PathBuf::from(format!(
+            "target/test-v2-dirty-overlay-pressure-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let mut ztfs = ZeroTrustFs::new_v2("pw", dir.clone());
+        ztfs.stop_debounce_thread_for_test();
+        let ino = add_v2_file(&ztfs, "pressure.bin");
+        ztfs.open_inode(ino).unwrap();
+        let before = v2_object_count(&dir);
+
+        for chunk in 0..=V2_DIRTY_CHUNK_LIMIT {
+            let offset = chunk as u64 * v2::CHUNK_SIZE as u64;
+            ztfs.write_inode_content(ino, offset, &[chunk as u8])
+                .unwrap();
+        }
+
+        let overlay = ztfs.inner.v2_dirty.lock().unwrap();
+        assert_eq!(overlay.chunk_count, 1);
+        assert!(overlay.chunk_count <= V2_DIRTY_CHUNK_LIMIT);
+        drop(overlay);
+        assert!(v2_object_count(&dir) > before);
+        for chunk in 0..=V2_DIRTY_CHUNK_LIMIT {
+            let offset = chunk as u64 * v2::CHUNK_SIZE as u64;
+            assert_eq!(
+                ztfs.read_v2_inode_range(ino, offset, 1).unwrap(),
+                [chunk as u8]
+            );
+        }
+        ztfs.fsync_inode(ino).unwrap();
+        ztfs.release_inode(ino).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn v2_overlay_pressure_failure_does_not_partially_accept_incoming_write() {
+        use crate::fault::FaultInjectionGuard;
+
+        let dir = PathBuf::from(format!(
+            "target/test-v2-dirty-overlay-pressure-failure-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let mut ztfs = ZeroTrustFs::new_v2("pw", dir.clone());
+        ztfs.stop_debounce_thread_for_test();
+        let ino = add_v2_file(&ztfs, "pressure-failure.bin");
+        ztfs.open_inode(ino).unwrap();
+        for chunk in 0..V2_DIRTY_CHUNK_LIMIT {
+            ztfs.write_inode_content(ino, chunk as u64 * v2::CHUNK_SIZE as u64, &[chunk as u8])
+                .unwrap();
+        }
+        let size_before = ztfs.inner.state.read().unwrap().inodes[&ino].size;
+
+        let injector = FaultInjectionGuard::fail_at(1);
+        let incoming_offset = V2_DIRTY_CHUNK_LIMIT as u64 * v2::CHUNK_SIZE as u64;
+        let result = ztfs.write_inode_content(ino, incoming_offset, b"x");
+        drop(injector);
+
+        assert!(result.is_err());
+        assert_eq!(
+            ztfs.inner.state.read().unwrap().inodes[&ino].size,
+            size_before
+        );
+        assert_eq!(ztfs.inner.v2_dirty.lock().unwrap().chunk_count, 16);
+        assert!(
+            ztfs.read_v2_inode_range(ino, incoming_offset, 1)
+                .unwrap()
+                .is_empty(),
+            "failed pressure flush must not acknowledge the incoming chunk"
+        );
+        for chunk in 0..V2_DIRTY_CHUNK_LIMIT {
+            assert_eq!(
+                ztfs.read_v2_inode_range(ino, chunk as u64 * v2::CHUNK_SIZE as u64, 1)
+                    .unwrap(),
+                [chunk as u8],
+                "failed pressure flush discarded prior chunk {chunk}"
+            );
+        }
+        *ztfs.inner.persistence_failure.lock().unwrap() =
+            Some("stop pressure-failure test retry".to_string());
+        drop(ztfs);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn v2_overlay_shrink_then_grow_never_resurrects_discarded_bytes() {
+        let dir = PathBuf::from("target/test-v2-dirty-overlay-truncate");
+        let _ = fs::remove_dir_all(&dir);
+        let ztfs = ZeroTrustFs::new_v2("pw", dir.clone());
+        let ino = add_v2_file(&ztfs, "truncate.bin");
+        ztfs.open_inode(ino).unwrap();
+        ztfs.write_inode_content(ino, 0, b"abcdefgh").unwrap();
+        ztfs.fsync_inode(ino).unwrap();
+
+        ztfs.truncate_inode(ino, 3).unwrap();
+        ztfs.truncate_inode(ino, 8).unwrap();
+        assert_eq!(
+            ztfs.read_v2_inode_range(ino, 0, 16).unwrap(),
+            b"abc\0\0\0\0\0"
+        );
+        ztfs.fsync_inode(ino).unwrap();
+        ztfs.release_inode(ino).unwrap();
+        drop(ztfs);
+
+        let reopened = ZeroTrustFs::new_v2("pw", dir.clone());
+        assert_eq!(
+            reopened.read_v2_inode_range(ino, 0, 16).unwrap(),
+            b"abc\0\0\0\0\0"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn v2_dirty_unlink_fails_closed_without_discarding_overlay() {
+        let dir = PathBuf::from("target/test-v2-dirty-unlink-core");
+        let _ = fs::remove_dir_all(&dir);
+        let ztfs = ZeroTrustFs::new_v2("pw", dir.clone());
+        let ino = add_v2_file(&ztfs, "dirty.txt");
+        ztfs.open_inode(ino).unwrap();
+        ztfs.write_inode_content(ino, 0, b"acknowledged-dirty-bytes")
+            .unwrap();
+        let root_before = fs::read(dir.join(v2::ROOT_FILE)).unwrap();
+        leave_v2_overlay_after_failed_last_release(&ztfs, ino);
+
+        let error = ztfs.unlink_name(1, "dirty.txt").unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EBUSY));
+        assert_eq!(
+            ZeroTrustFs::find_child(&ztfs.inner.state.read().unwrap(), 1, "dirty.txt"),
+            Some(ino)
+        );
+        assert_eq!(
+            ztfs.read_v2_inode_range(ino, 0, 64).unwrap(),
+            b"acknowledged-dirty-bytes"
+        );
+        assert!(ztfs.has_v2_dirty_inode(ino));
+        assert_eq!(fs::read(dir.join(v2::ROOT_FILE)).unwrap(), root_before);
+
+        ztfs.fsync_inode(ino).unwrap();
+        ztfs.unlink_name(1, "dirty.txt").unwrap();
+        assert!(
+            ZeroTrustFs::find_child(&ztfs.inner.state.read().unwrap(), 1, "dirty.txt").is_none()
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unlink_core_rejects_a_non_directory_parent() {
+        let dir = PathBuf::from(format!(
+            "target/test-v2-unlink-nondirectory-parent-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let ztfs = ZeroTrustFs::new_v2("pw", dir.clone());
+        let file = add_v2_file(&ztfs, "not-a-directory");
+
+        let error = ztfs.unlink_name(file, "child").unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::ENOTDIR));
+        assert_eq!(
+            ZeroTrustFs::find_child(&ztfs.inner.state.read().unwrap(), 1, "not-a-directory"),
+            Some(file)
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn v2_dirty_rename_preserves_overlay_and_commits_new_namespace() {
+        let dir = PathBuf::from("target/test-v2-dirty-rename-core");
+        let _ = fs::remove_dir_all(&dir);
+        let ztfs = ZeroTrustFs::new_v2("pw", dir.clone());
+        let ino = add_v2_file(&ztfs, "before.txt");
+        ztfs.open_inode(ino).unwrap();
+        ztfs.write_inode_content(ino, 0, b"dirty-content-follows-inode")
+            .unwrap();
+        leave_v2_overlay_after_failed_last_release(&ztfs, ino);
+
+        ztfs.rename_name(1, "before.txt", 1, "after.txt").unwrap();
+        let state = ztfs.inner.state.read().unwrap();
+        assert!(ZeroTrustFs::find_child(&state, 1, "before.txt").is_none());
+        assert_eq!(ZeroTrustFs::find_child(&state, 1, "after.txt"), Some(ino));
+        assert_eq!(state.inodes[&ino].name, "after.txt");
+        drop(state);
+        assert_eq!(
+            ztfs.read_v2_inode_range(ino, 0, 64).unwrap(),
+            b"dirty-content-follows-inode"
+        );
+
+        ztfs.fsync_inode(ino).unwrap();
+        drop(ztfs);
+        let reopened = ZeroTrustFs::new_v2("pw", dir.clone());
+        let state = reopened.inner.state.read().unwrap();
+        assert!(ZeroTrustFs::find_child(&state, 1, "before.txt").is_none());
+        assert_eq!(ZeroTrustFs::find_child(&state, 1, "after.txt"), Some(ino));
+        drop(state);
+        assert_eq!(
+            reopened.read_v2_inode_range(ino, 0, 64).unwrap(),
+            b"dirty-content-follows-inode"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn v2_rename_over_dirty_target_is_busy_and_preserves_both_names() {
+        let dir = PathBuf::from("target/test-v2-dirty-rename-target-core");
+        let _ = fs::remove_dir_all(&dir);
+        let ztfs = ZeroTrustFs::new_v2("pw", dir.clone());
+        let source = add_v2_file(&ztfs, "source.txt");
+        let target = add_v2_file(&ztfs, "target.txt");
+        ztfs.open_inode(target).unwrap();
+        ztfs.write_inode_content(target, 0, b"target-dirty-evidence")
+            .unwrap();
+        let root_before = fs::read(dir.join(v2::ROOT_FILE)).unwrap();
+        leave_v2_overlay_after_failed_last_release(&ztfs, target);
+
+        let error = ztfs
+            .rename_name(1, "source.txt", 1, "target.txt")
+            .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EBUSY));
+        let state = ztfs.inner.state.read().unwrap();
+        assert_eq!(
+            ZeroTrustFs::find_child(&state, 1, "source.txt"),
+            Some(source)
+        );
+        assert_eq!(
+            ZeroTrustFs::find_child(&state, 1, "target.txt"),
+            Some(target)
+        );
+        drop(state);
+        assert_eq!(
+            ztfs.read_v2_inode_range(target, 0, 64).unwrap(),
+            b"target-dirty-evidence"
+        );
+        assert_eq!(fs::read(dir.join(v2::ROOT_FILE)).unwrap(), root_before);
+        ztfs.fsync_inode(target).unwrap();
+        drop(ztfs);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn v2_rename_over_clean_empty_target_commits_before_return() {
+        let dir = PathBuf::from("target/test-v2-rename-clean-empty-target");
+        let _ = fs::remove_dir_all(&dir);
+        let ztfs = ZeroTrustFs::new_v2("pw", dir.clone());
+        let source = add_v2_file(&ztfs, "source.txt");
+        let target = add_v2_file(&ztfs, "target.txt");
+        ztfs.open_inode(source).unwrap();
+        ztfs.write_inode_content(source, 0, b"source survives overwrite")
+            .unwrap();
+        ztfs.fsync_inode(source).unwrap();
+        ztfs.release_inode(source).unwrap();
+        assert!(
+            ztfs.inner.state.read().unwrap().inodes[&target]
+                .disk_filename
+                .is_empty(),
+            "the overwrite target must exercise the clean empty-root path"
+        );
+        let root_before = fs::read(dir.join(v2::ROOT_FILE)).unwrap();
+
+        ztfs.rename_name(1, "source.txt", 1, "target.txt").unwrap();
+        let root_after = fs::read(dir.join(v2::ROOT_FILE)).unwrap();
+        assert_ne!(
+            root_after, root_before,
+            "a successful overwrite must publish its namespace before returning"
+        );
+        drop(ztfs);
+
+        let reopened = ZeroTrustFs::new_v2("pw", dir.clone());
+        let state = reopened.inner.state.read().unwrap();
+        assert!(ZeroTrustFs::find_child(&state, 1, "source.txt").is_none());
+        assert_eq!(
+            ZeroTrustFs::find_child(&state, 1, "target.txt"),
+            Some(source)
+        );
+        assert!(!state.inodes.contains_key(&target));
+        drop(state);
+        assert_eq!(
+            reopened.read_v2_inode_range(source, 0, 64).unwrap(),
+            b"source survives overwrite"
+        );
+        drop(reopened);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn every_clean_empty_target_overwrite_checkpoint_recovers_old_or_new() {
+        use crate::fault::{DurabilityEvent, FaultInjectionGuard};
+
+        let process = std::process::id();
+        let baseline = PathBuf::from(format!("target/test-v2-empty-overwrite-baseline-{process}"));
+        let successful = PathBuf::from(format!("target/test-v2-empty-overwrite-success-{process}"));
+        let _ = fs::remove_dir_all(&baseline);
+        let _ = fs::remove_dir_all(&successful);
+        let (source, target);
+        {
+            let ztfs = ZeroTrustFs::new_v2("pw", baseline.clone());
+            source = add_v2_file(&ztfs, "source.txt");
+            target = add_v2_file(&ztfs, "target.txt");
+            ztfs.open_inode(source).unwrap();
+            ztfs.write_inode_content(source, 0, b"source generation")
+                .unwrap();
+            ztfs.fsync_inode(source).unwrap();
+            ztfs.release_inode(source).unwrap();
+        }
+        let old_root = fs::read(baseline.join(v2::ROOT_FILE)).unwrap();
+
+        copy_test_directory(&baseline, &successful);
+        let ztfs = ZeroTrustFs::new_v2("pw", successful.clone());
+        let recorder = FaultInjectionGuard::record();
+        ztfs.rename_name(1, "source.txt", 1, "target.txt").unwrap();
+        let events = recorder.events();
+        drop(recorder);
+        for required in [
+            DurabilityEvent::Write,
+            DurabilityEvent::FileSync,
+            DurabilityEvent::Rename,
+            DurabilityEvent::DirectorySync,
+            DurabilityEvent::Cleanup,
+        ] {
+            assert!(
+                events.contains(&required),
+                "overwrite trace omitted {required:?}"
+            );
+        }
+        let new_root = fs::read(successful.join(v2::ROOT_FILE)).unwrap();
+        assert_ne!(new_root, old_root);
+        drop(ztfs);
+        fs::remove_dir_all(&successful).unwrap();
+
+        for checkpoint in 1..=events.len() {
+            let crashed = PathBuf::from(format!(
+                "target/test-v2-empty-overwrite-{process}-checkpoint-{checkpoint}"
+            ));
+            copy_test_directory(&baseline, &crashed);
+            fs::write(crashed.join("rename-evidence.keep"), b"preserve me").unwrap();
+            let ztfs = ZeroTrustFs::new_v2("pw", crashed.clone());
+            let injector = FaultInjectionGuard::fail_at(checkpoint);
+            let result = ztfs.rename_name(1, "source.txt", 1, "target.txt");
+            drop(injector);
+            assert!(result.is_err(), "checkpoint {checkpoint} was not exercised");
+            *ztfs.inner.persistence_failure.lock().unwrap() =
+                Some("stop test retry before simulated remount".to_string());
+            drop(ztfs);
+
+            let reopened = ZeroTrustFs::new_v2("pw", crashed.clone());
+            let state = reopened.inner.state.read().unwrap();
+            let source_name = ZeroTrustFs::find_child(&state, 1, "source.txt");
+            let target_name = ZeroTrustFs::find_child(&state, 1, "target.txt");
+            let old_visible = source_name == Some(source) && target_name == Some(target);
+            let new_visible = source_name.is_none() && target_name == Some(source);
+            assert!(
+                old_visible || new_visible,
+                "checkpoint {checkpoint} exposed a mixed overwrite namespace"
+            );
+            let visible_root = fs::read(crashed.join(v2::ROOT_FILE)).unwrap();
+            if old_visible {
+                assert_eq!(
+                    visible_root, old_root,
+                    "checkpoint {checkpoint} changed the exact old root"
+                );
+            } else {
+                assert_ne!(
+                    visible_root, old_root,
+                    "checkpoint {checkpoint} exposed the old root with the new namespace"
+                );
+            }
+            drop(state);
+            assert_eq!(
+                reopened.read_v2_inode_range(source, 0, 64).unwrap(),
+                b"source generation"
+            );
+            assert_eq!(
+                fs::read(crashed.join("rename-evidence.keep")).unwrap(),
+                b"preserve me"
+            );
+            drop(reopened);
+            fs::remove_dir_all(crashed).unwrap();
+        }
+
+        fs::remove_dir_all(baseline).unwrap();
+    }
+
+    #[test]
+    fn v2_flush_conflict_keeps_dirty_overlay_readable() {
+        let dir = PathBuf::from("target/test-v2-dirty-overlay-conflict");
+        let _ = fs::remove_dir_all(&dir);
+        let ztfs = ZeroTrustFs::new_v2("pw", dir.clone());
+        let ino = add_v2_file(&ztfs, "retained.bin");
+        ztfs.open_inode(ino).unwrap();
+        ztfs.write_inode_content(ino, 0, b"not-lost").unwrap();
+        let old_root = fs::read(dir.join(v2::ROOT_FILE)).unwrap();
+        fs::write(dir.join("_root (conflicted copy).age"), b"evidence").unwrap();
+
+        assert!(ztfs.fsync_inode(ino).is_err());
+        assert_eq!(fs::read(dir.join(v2::ROOT_FILE)).unwrap(), old_root);
+        assert!(ztfs.has_v2_dirty_inode(ino));
+        assert_eq!(ztfs.read_v2_inode_range(ino, 0, 32).unwrap(), b"not-lost");
+        assert_eq!(
+            fs::read(dir.join("_root (conflicted copy).age")).unwrap(),
+            b"evidence"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn every_overlay_flush_checkpoint_recovers_old_or_new_and_keeps_evidence() {
+        use crate::fault::{DurabilityEvent, FaultInjectionGuard};
+
+        let baseline = PathBuf::from("target/test-v2-overlay-crash-baseline");
+        let successful = PathBuf::from("target/test-v2-overlay-crash-success");
+        let _ = fs::remove_dir_all(&baseline);
+        let _ = fs::remove_dir_all(&successful);
+        let ino;
+        {
+            let ztfs = ZeroTrustFs::new_v2("pw", baseline.clone());
+            ino = add_v2_file(&ztfs, "generation.bin");
+            ztfs.open_inode(ino).unwrap();
+            ztfs.write_inode_content(ino, 0, b"old-generation").unwrap();
+            ztfs.fsync_inode(ino).unwrap();
+            ztfs.release_inode(ino).unwrap();
+        }
+        let old_root = fs::read(baseline.join(v2::ROOT_FILE)).unwrap();
+
+        copy_test_directory(&baseline, &successful);
+        let ztfs = ZeroTrustFs::new_v2("pw", successful.clone());
+        ztfs.open_inode(ino).unwrap();
+        ztfs.write_inode_content(ino, 0, b"new-generation").unwrap();
+        let recorder = FaultInjectionGuard::record();
+        ztfs.fsync_inode(ino).unwrap();
+        let events = recorder.events();
+        drop(recorder);
+        assert!(events.contains(&DurabilityEvent::Write));
+        assert!(events.contains(&DurabilityEvent::FileSync));
+        assert!(events.contains(&DurabilityEvent::Rename));
+        assert!(events.contains(&DurabilityEvent::DirectorySync));
+        assert!(events.contains(&DurabilityEvent::Cleanup));
+        ztfs.release_inode(ino).unwrap();
+        drop(ztfs);
+        fs::remove_dir_all(&successful).unwrap();
+
+        for checkpoint in 1..=events.len() {
+            let crashed = PathBuf::from(format!(
+                "target/test-v2-overlay-crash-checkpoint-{checkpoint}"
+            ));
+            copy_test_directory(&baseline, &crashed);
+            fs::write(crashed.join("conflict-evidence.keep"), b"preserve me").unwrap();
+            let ztfs = ZeroTrustFs::new_v2("pw", crashed.clone());
+            ztfs.open_inode(ino).unwrap();
+            ztfs.write_inode_content(ino, 0, b"new-generation").unwrap();
+            let injector = FaultInjectionGuard::fail_at(checkpoint);
+            let result = ztfs.fsync_inode(ino);
+            drop(injector);
+            assert!(result.is_err(), "checkpoint {checkpoint} was not exercised");
+            assert_eq!(
+                ztfs.read_v2_inode_range(ino, 0, 64).unwrap(),
+                b"new-generation",
+                "checkpoint {checkpoint} discarded the acknowledged overlay"
+            );
+            *ztfs.inner.persistence_failure.lock().unwrap() =
+                Some("stop test retry before simulated remount".to_string());
+            drop(ztfs);
+
+            let reopened = ZeroTrustFs::new_v2("pw", crashed.clone());
+            let visible = reopened.read_v2_inode_range(ino, 0, 64).unwrap();
+            assert!(
+                visible == b"old-generation" || visible == b"new-generation",
+                "checkpoint {checkpoint} exposed a mixed generation: {visible:?}"
+            );
+            if visible == b"old-generation" {
+                assert_eq!(
+                    fs::read(crashed.join(v2::ROOT_FILE)).unwrap(),
+                    old_root,
+                    "checkpoint {checkpoint} changed the exact old root"
+                );
+            }
+            assert_eq!(
+                fs::read(crashed.join("conflict-evidence.keep")).unwrap(),
+                b"preserve me"
+            );
+            drop(reopened);
+            fs::remove_dir_all(crashed).unwrap();
+        }
+
+        fs::remove_dir_all(baseline).unwrap();
     }
 
     #[test]

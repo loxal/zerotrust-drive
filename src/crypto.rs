@@ -209,7 +209,31 @@ pub fn load_kdf(base_path: &std::path::Path) -> Result<Option<KdfParams>, String
 /// becoming undecryptable. A hard-link publication keeps the fully fsynced
 /// temp atomic; filesystems without hard links use `create_new` and fail
 /// closed with a partial target after a crash.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn save_kdf(base_path: &std::path::Path, params: &KdfParams) -> Result<(), String> {
+    save_kdf_with_publication_guard(base_path, params, |_| Ok(()))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum KdfPublicationPhase {
+    Before,
+    After,
+}
+
+/// Publish brand-new KDF metadata while a caller-supplied read-only guard
+/// verifies that no encrypted head or recovery intent arrived concurrently.
+/// The guard runs after the durable temp is staged, immediately before the
+/// canonical name is created, and immediately after it becomes visible. A
+/// failed guard preserves the staged temp and any canonical KDF already
+/// published so no local or provider evidence is silently discarded.
+fn save_kdf_with_publication_guard<F>(
+    base_path: &std::path::Path,
+    params: &KdfParams,
+    mut publication_guard: F,
+) -> Result<(), String>
+where
+    F: FnMut(KdfPublicationPhase) -> Result<(), String>,
+{
     use std::io::Write;
     params.validate()?;
     let path = kdf_path(base_path);
@@ -244,6 +268,8 @@ pub fn save_kdf(base_path: &std::path::Path, params: &KdfParams) -> Result<(), S
         // Make the complete temp name durable before attempting publication.
         sync_parent()?;
         preserve_temp_on_error = true;
+        publication_guard(KdfPublicationPhase::Before)
+            .map_err(|error| format!("refuse new KDF publication: {error}"))?;
         match std::fs::hard_link(&tmp, &path) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -253,6 +279,11 @@ pub fn save_kdf(base_path: &std::path::Path, params: &KdfParams) -> Result<(), S
                 ));
             }
             Err(link_error) => {
+                // The failed hard-link attempt may have taken arbitrarily
+                // long. Recheck immediately before the non-atomic fallback
+                // makes its canonical name visible.
+                publication_guard(KdfPublicationPhase::Before)
+                    .map_err(|error| format!("refuse fallback KDF publication: {error}"))?;
                 let mut options = std::fs::OpenOptions::new();
                 options.create_new(true).write(true);
                 #[cfg(unix)]
@@ -274,6 +305,11 @@ pub fn save_kdf(base_path: &std::path::Path, params: &KdfParams) -> Result<(), S
                     .map_err(|e| format!("sync new KDF metadata {}: {e}", path.display()))?;
             }
         }
+        publication_guard(KdfPublicationPhase::After).map_err(|error| {
+            format!(
+                "encrypted controls appeared across new KDF publication; preserving the canonical KDF and its durable staging file: {error}"
+            )
+        })?;
         // Persist the canonical publication before dropping its recovery name.
         sync_parent()?;
         std::fs::remove_file(&tmp)
@@ -301,11 +337,21 @@ pub fn load_or_create_kdf(base_path: &std::path::Path) -> Result<KdfParams, Stri
 pub(crate) fn load_or_create_kdf_with_fingerprint(
     base_path: &std::path::Path,
 ) -> Result<(KdfParams, RecoveryFingerprint), String> {
+    load_or_create_kdf_with_fingerprint_guarded(base_path, |_| Ok(()))
+}
+
+pub(crate) fn load_or_create_kdf_with_fingerprint_guarded<F>(
+    base_path: &std::path::Path,
+    publication_guard: F,
+) -> Result<(KdfParams, RecoveryFingerprint), String>
+where
+    F: FnMut(KdfPublicationPhase) -> Result<(), String>,
+{
     if let Some(loaded) = load_kdf_with_fingerprint(base_path)? {
         return Ok(loaded);
     }
     let params = KdfParams::new_random();
-    save_kdf(base_path, &params)?;
+    save_kdf_with_publication_guard(base_path, &params, publication_guard)?;
     load_kdf_with_fingerprint(base_path)?.ok_or_else(|| {
         format!(
             "new KDF metadata {} disappeared immediately after publication",
@@ -422,7 +468,7 @@ pub fn derive_key_legacy_tagged(passphrase: &str) -> [u8; 32] {
 /// BLAKE2s-256 digest of every byte; nonce, tag, and length retain diagnostics
 /// and compatibility with manifests created before full digests were added.
 /// `_kdf.json` uses an exact fingerprint because it is plaintext and tiny.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum RecoveryFingerprint {
     Ciphertext {
