@@ -7,7 +7,7 @@
 //! replaced or deleted; `_root.age` is published last through the normal v2
 //! transaction, after every receipt and immutable object is durable.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 
@@ -37,8 +37,42 @@ const MAX_PLAN_CIPHERTEXT: u64 = 64 * 1024 * 1024;
 const MAX_RECEIPT_CIPHERTEXT: u64 = 64 * 1024;
 const MAX_COMPLETION_CIPHERTEXT: u64 = 64 * 1024;
 const MAX_MIGRATION_FILES: usize = 100_000;
+pub(crate) const MAX_GC_SCAN_ENTRIES: usize = 250_000;
 const PLAN_AAD: &[u8] = b"zerotrust-drive\0v2\0migration-plan\0";
 const COMPLETION_AAD_PREFIX: &[u8] = b"zerotrust-drive\0v2\0migration-completion\0";
+
+pub(crate) struct GcScanBudget {
+    consumed: usize,
+    maximum: usize,
+}
+
+impl GcScanBudget {
+    pub(crate) fn production() -> Self {
+        Self {
+            consumed: 0,
+            maximum: MAX_GC_SCAN_ENTRIES,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_limit(maximum: usize) -> Self {
+        Self {
+            consumed: 0,
+            maximum,
+        }
+    }
+
+    pub(crate) fn charge(&mut self, context: &str) -> Result<(), String> {
+        if self.consumed >= self.maximum {
+            return Err(format!(
+                "{context} exceeds the shared fail-closed GC scan limit of {} entries",
+                self.maximum
+            ));
+        }
+        self.consumed += 1;
+        Ok(())
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -59,7 +93,7 @@ struct SourceFile {
     source: Option<RecoveryFingerprint>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FileReceipt {
     receipt_version: u32,
@@ -354,12 +388,50 @@ fn read_completion(
     decode_completion(key, plan, plan_ciphertext, ciphertext).map(Some)
 }
 
+fn retain_known_evidence(
+    base_path: &Path,
+    path: &Path,
+    expected: &[u8],
+    evidence_stem: &str,
+    context: &str,
+    namespace_pin: Option<&v2::V2NamespacePin>,
+) -> std::io::Result<()> {
+    match namespace_pin {
+        Some(pin) => {
+            v2::retain_known_file_with_pin(base_path, path, expected, evidence_stem, context, pin)
+        }
+        None => v2::retain_known_file(base_path, path, expected, evidence_stem, context),
+    }
+}
+
+fn retain_untrusted_evidence(
+    base_path: &Path,
+    path: &Path,
+    expected: &[u8],
+    evidence_stem: &str,
+    context: &str,
+    namespace_pin: Option<&v2::V2NamespacePin>,
+) -> std::io::Result<()> {
+    match namespace_pin {
+        Some(pin) => v2::retain_untrusted_file_with_pin(
+            base_path,
+            path,
+            expected,
+            evidence_stem,
+            context,
+            pin,
+        ),
+        None => v2::retain_untrusted_file(base_path, path, evidence_stem, context),
+    }
+}
+
 fn publish_completion(
     base_path: &Path,
     key: &[u8; 32],
     plan: &MigrationPlan,
     plan_ciphertext: &[u8],
     migration_generation: v2::ObjectRef,
+    namespace_pin: Option<&v2::V2NamespacePin>,
 ) -> Result<(), String> {
     let expected_completion = MigrationCompletion {
         completion_version: COMPLETION_VERSION,
@@ -405,10 +477,11 @@ fn publish_completion(
         .map_err(|error| error.to_string())?;
         match read_bounded_backing_file(&ready, MAX_COMPLETION_CIPHERTEXT) {
             Ok(ready_ciphertext) => {
+                let rejected_ciphertext = ready_ciphertext.clone();
                 match decode_completion(key, plan, plan_ciphertext, ready_ciphertext) {
                     Ok((ready_completion, ready_ciphertext)) => {
                         validate_state(&ready_completion)?;
-                        v2::retain_known_file(
+                        retain_known_evidence(
                             base_path,
                             &ready,
                             &ready_ciphertext,
@@ -417,6 +490,7 @@ fn publish_completion(
                                 to_hex(&plan.transaction_id)
                             ),
                             "retain duplicate v2 migration completion ready evidence",
+                            namespace_pin,
                         )
                         .map_err(|error| error.to_string())?;
                     }
@@ -426,14 +500,16 @@ fn publish_completion(
                             "identify invalid duplicate migration completion staging file",
                         )
                         .map_err(|fault| fault.to_string())?;
-                        v2::retain_untrusted_file(
+                        retain_untrusted_evidence(
                             base_path,
                             &ready,
+                            &rejected_ciphertext,
                             &format!(
                                 "migration-{}-completion-duplicate-invalid",
                                 to_hex(&plan.transaction_id)
                             ),
                             "retain invalid duplicate migration completion evidence",
+                            namespace_pin,
                         )
                         .map_err(|retain| {
                             format!(
@@ -466,37 +542,42 @@ fn publish_completion(
         Ok(ciphertext)
     };
     let ciphertext = match read_bounded_backing_file(&ready, MAX_COMPLETION_CIPHERTEXT) {
-        Ok(ciphertext) => match decode_completion(key, plan, plan_ciphertext, ciphertext) {
-            Ok((completion, ciphertext)) => {
-                validate_state(&completion)?;
-                ciphertext
-            }
-            Err(error) => {
-                fault::checkpoint(
-                    DurabilityEvent::Recovery,
-                    "identify incomplete migration completion staging file",
-                )
-                .map_err(|fault| fault.to_string())?;
-                v2::retain_untrusted_file(
+        Ok(ciphertext) => {
+            let rejected_ciphertext = ciphertext.clone();
+            match decode_completion(key, plan, plan_ciphertext, ciphertext) {
+                Ok((completion, ciphertext)) => {
+                    validate_state(&completion)?;
+                    ciphertext
+                }
+                Err(error) => {
+                    fault::checkpoint(
+                        DurabilityEvent::Recovery,
+                        "identify incomplete migration completion staging file",
+                    )
+                    .map_err(|fault| fault.to_string())?;
+                    retain_untrusted_evidence(
                     base_path,
                     &ready,
+                    &rejected_ciphertext,
                     &format!(
                         "migration-{}-completion-partial",
                         to_hex(&plan.transaction_id)
                     ),
                     "retain incomplete migration completion staging evidence",
+                    namespace_pin,
                 )
                 .map_err(|retain| {
                     format!(
                         "{error}; also failed to retain incomplete completion evidence: {retain}"
                     )
                 })?;
-                eprintln!(
-                    "zerotrust-drive: retained incomplete migration-completion staging evidence; rebuilding it from authenticated plan and origin"
-                );
-                stage_new()?
+                    eprintln!(
+                        "zerotrust-drive: retained incomplete migration-completion staging evidence; rebuilding it from authenticated plan and origin"
+                    );
+                    stage_new()?
+                }
             }
-        },
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => stage_new()?,
         Err(error) => return Err(format!("inspect completion ready evidence: {error}")),
     };
@@ -519,7 +600,7 @@ fn publish_completion(
     )
     .map_err(|error| error.to_string())?;
     if retained || backing_entry_exists(&ready).map_err(|error| error.to_string())? {
-        v2::retain_known_file(
+        retain_known_evidence(
             base_path,
             &ready,
             &ciphertext,
@@ -528,6 +609,7 @@ fn publish_completion(
                 to_hex(&plan.transaction_id)
             ),
             "retain v2 migration completion ready evidence",
+            namespace_pin,
         )
         .map_err(|error| error.to_string())?;
     }
@@ -543,6 +625,7 @@ fn publish_plan(
     source_index: RecoveryFingerprint,
     kdf_fingerprint: RecoveryFingerprint,
     index: &DiskIndex,
+    namespace_pin: Option<&v2::V2NamespacePin>,
 ) -> Result<(MigrationPlan, Vec<u8>), String> {
     let mut transaction_id = [0u8; 16];
     OsRng.fill_bytes(&mut transaction_id);
@@ -569,12 +652,13 @@ fn publish_plan(
     )
     .map_err(|error| error.to_string())?;
     if retained {
-        v2::retain_known_file(
+        retain_known_evidence(
             base_path,
             &ready,
             &ciphertext,
             &format!("migration-{}-plan-ready", to_hex(&transaction_id)),
             "retain v2 migration plan ready evidence",
+            namespace_pin,
         )
         .map_err(|error| error.to_string())?;
         File::open(base_path)
@@ -621,22 +705,47 @@ fn ensure_progress_directory(base_path: &Path) -> Result<PathBuf, String> {
     Ok(path)
 }
 
-fn validate_progress_inventory(progress: &Path, plan: &MigrationPlan) -> Result<(), String> {
-    let mut allowed = HashSet::new();
-    for source in &plan.files {
-        allowed.insert(receipt_name(source.inode));
-        allowed.insert(receipt_ready_name(source.inode));
+fn progress_name_is_planned(name: &str, plan: &MigrationPlan) -> bool {
+    let inode_hex = name.strip_suffix(".done.age").or_else(|| {
+        name.strip_prefix('.')
+            .and_then(|name| name.strip_suffix(".done.ready"))
+    });
+    let Some(inode_hex) = inode_hex else {
+        return false;
+    };
+    if inode_hex.len() != 16
+        || !inode_hex
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return false;
     }
+    let Ok(inode) = u64::from_str_radix(inode_hex, 16) else {
+        return false;
+    };
+    plan.files
+        .binary_search_by_key(&inode, |source| source.inode)
+        .is_ok()
+}
+
+fn validate_progress_inventory(
+    progress: &Path,
+    plan: &MigrationPlan,
+    mut budget: Option<&mut GcScanBudget>,
+) -> Result<(), String> {
     for entry in fs::read_dir(progress)
         .map_err(|error| format!("inspect migration progress {}: {error}", progress.display()))?
     {
         let entry = entry.map_err(|error| format!("inspect migration progress entry: {error}"))?;
+        if let Some(budget) = budget.as_deref_mut() {
+            budget.charge("completed migration receipt inventory")?;
+        }
         let Some(name) = entry.file_name().to_str().map(str::to_string) else {
             return Err(invalid(
                 "migration progress contains a non-UTF-8 conflict artifact; preserving it",
             ));
         };
-        if !allowed.contains(&name) {
+        if !progress_name_is_planned(&name, plan) {
             return Err(format!(
                 "migration progress contains unexpected artifact {name:?}; preserving every entry"
             ));
@@ -701,6 +810,7 @@ fn read_resumable_ready_receipt(
     key: &[u8; 32],
     plan: &MigrationPlan,
     source: &SourceFile,
+    namespace_pin: Option<&v2::V2NamespacePin>,
 ) -> Result<Option<(FileReceipt, Vec<u8>)>, String> {
     let ciphertext = match read_bounded_backing_file(path, MAX_RECEIPT_CIPHERTEXT) {
         Ok(ciphertext) => ciphertext,
@@ -712,6 +822,7 @@ fn read_resumable_ready_receipt(
             ));
         }
     };
+    let rejected_ciphertext = ciphertext.clone();
     match decode_receipt(path, key, plan, source, ciphertext) {
         Ok(receipt) => Ok(Some(receipt)),
         Err(error) => {
@@ -720,15 +831,17 @@ fn read_resumable_ready_receipt(
                 "identify incomplete migration receipt staging file",
             )
             .map_err(|fault| fault.to_string())?;
-            v2::retain_untrusted_file(
+            retain_untrusted_evidence(
                 base_path,
                 path,
+                &rejected_ciphertext,
                 &format!(
                     "migration-{}-receipt-{}-partial",
                     to_hex(&plan.transaction_id),
                     source.inode
                 ),
                 "retain incomplete migration receipt staging evidence",
+                namespace_pin,
             )
             .map_err(|retain| {
                 format!("{error}; also failed to retain incomplete receipt evidence: {retain}")
@@ -749,6 +862,7 @@ fn publish_receipt(
     plan: &MigrationPlan,
     source: &SourceFile,
     receipt: &FileReceipt,
+    namespace_pin: Option<&v2::V2NamespacePin>,
 ) -> Result<(FileReceipt, Vec<u8>), String> {
     let json = serde_json::to_vec(receipt)
         .map_err(|error| format!("serialize migration receipt: {error}"))?;
@@ -769,7 +883,7 @@ fn publish_receipt(
     )
     .map_err(|error| error.to_string())?;
     if retained {
-        v2::retain_known_file(
+        retain_known_evidence(
             base_path,
             &ready,
             &ciphertext,
@@ -779,6 +893,7 @@ fn publish_receipt(
                 source.inode
             ),
             "retain migration receipt ready evidence",
+            namespace_pin,
         )
         .map_err(|error| error.to_string())?;
         File::open(progress)
@@ -793,7 +908,12 @@ fn publish_receipt(
     Ok((receipt.clone(), ciphertext))
 }
 
-fn migrate_source(base_path: &Path, key: &[u8; 32], source: &SourceFile) -> Result<String, String> {
+fn migrate_source(
+    base_path: &Path,
+    key: &[u8; 32],
+    source: &SourceFile,
+    namespace_pin: &v2::V2NamespacePin,
+) -> Result<String, String> {
     let Some(expected) = &source.source else {
         return Ok(String::new());
     };
@@ -819,7 +939,7 @@ fn migrate_source(base_path: &Path, key: &[u8; 32], source: &SourceFile) -> Resu
             source.disk_filename
         ));
     }
-    v2::import_authenticated_file(base_path, key, &plaintext)
+    v2::import_authenticated_file_with_pin(base_path, key, &plaintext, namespace_pin)
         .map_err(|error| format!("write final v2 tree for inode {}: {error}", source.inode))
 }
 
@@ -888,6 +1008,32 @@ pub(crate) fn validate_completed_migration_evidence(
     kdf_fingerprint: &RecoveryFingerprint,
     current: &v2::CommitState,
 ) -> Result<bool, String> {
+    validate_completed_migration_evidence_internal(base_path, key, kdf_fingerprint, current, None)
+}
+
+pub(crate) fn validate_completed_migration_evidence_with_pin(
+    base_path: &Path,
+    key: &[u8; 32],
+    kdf_fingerprint: &RecoveryFingerprint,
+    current: &v2::CommitState,
+    namespace_pin: &v2::V2NamespacePin,
+) -> Result<bool, String> {
+    validate_completed_migration_evidence_internal(
+        base_path,
+        key,
+        kdf_fingerprint,
+        current,
+        Some(namespace_pin),
+    )
+}
+
+fn validate_completed_migration_evidence_internal(
+    base_path: &Path,
+    key: &[u8; 32],
+    kdf_fingerprint: &RecoveryFingerprint,
+    current: &v2::CommitState,
+    namespace_pin: Option<&v2::V2NamespacePin>,
+) -> Result<bool, String> {
     let plan_exists = backing_entry_exists(&base_path.join(PLAN_FILE))
         .map_err(|error| format!("inspect retained migration plan: {error}"))?;
     let completion_exists = backing_entry_exists(&base_path.join(COMPLETION_FILE))
@@ -911,15 +1057,199 @@ pub(crate) fn validate_completed_migration_evidence(
     }
     let (completion, _) = read_completion(base_path, key, &plan, &plan_ciphertext)?
         .ok_or_else(|| invalid("authenticated migration completion disappeared"))?;
-    v2::validate_lineage_origin(
-        base_path,
-        key,
-        current,
-        completion.migration_generation,
-        completion.lineage_id,
-    )
+    match namespace_pin {
+        Some(pin) => v2::validate_lineage_origin_with_pin(
+            base_path,
+            key,
+            current,
+            completion.migration_generation,
+            completion.lineage_id,
+            pin,
+        ),
+        None => v2::validate_lineage_origin(
+            base_path,
+            key,
+            current,
+            completion.migration_generation,
+            completion.lineage_id,
+        ),
+    }
     .map_err(|error| format!("validate completed migration lineage: {error}"))?;
     Ok(true)
+}
+
+/// Authenticated v2 roots retained by a completed v1-to-v2 migration.
+///
+/// Offline GC calls this before considering any object unreachable. It keeps
+/// the migration generation and every receipt file root strong, and returns
+/// the exact canonical evidence files which must remain unchanged throughout
+/// a quarantine plan.
+pub(crate) struct GcMigrationEvidence {
+    pub(crate) generations: Vec<v2::ObjectRef>,
+    pub(crate) file_roots: Vec<(v2::ObjectRef, u64)>,
+    pub(crate) anchor_paths: Vec<PathBuf>,
+}
+
+pub(crate) fn gc_completed_evidence_roots(
+    base_path: &Path,
+    key: &[u8; 32],
+    kdf_fingerprint: &RecoveryFingerprint,
+    current: &v2::CommitState,
+    budget: &mut GcScanBudget,
+) -> Result<GcMigrationEvidence, String> {
+    let plan_path = base_path.join(PLAN_FILE);
+    let completion_path = base_path.join(COMPLETION_FILE);
+    let plan_exists = backing_entry_exists(&plan_path)
+        .map_err(|error| format!("inspect retained migration plan: {error}"))?;
+    let completion_exists = backing_entry_exists(&completion_path)
+        .map_err(|error| format!("inspect migration completion: {error}"))?;
+    if !plan_exists && !completion_exists {
+        if backing_entry_exists(&base_path.join(PROGRESS_DIRECTORY))
+            .map_err(|error| format!("inspect orphan migration progress: {error}"))?
+        {
+            return Err(invalid(
+                "migration progress exists without an authenticated plan; preserving every v2 object",
+            ));
+        }
+        return Ok(GcMigrationEvidence {
+            generations: Vec::new(),
+            file_roots: Vec::new(),
+            anchor_paths: Vec::new(),
+        });
+    }
+    if !validate_completed_migration_evidence(base_path, key, kdf_fingerprint, current)? {
+        return Err(invalid(
+            "migration evidence disappeared during offline GC validation",
+        ));
+    }
+
+    let (index, _) = load_v1_index(base_path, key)?;
+    let (plan, plan_ciphertext) = read_plan(base_path, key)?
+        .ok_or_else(|| invalid("retained migration plan disappeared during GC validation"))?;
+    validate_plan(&plan, &index)?;
+    let (completion, completion_ciphertext) =
+        read_completion(base_path, key, &plan, &plan_ciphertext)?
+            .ok_or_else(|| invalid("migration completion disappeared during GC validation"))?;
+
+    let progress = base_path.join(PROGRESS_DIRECTORY);
+    let metadata = fs::symlink_metadata(&progress)
+        .map_err(|error| format!("inspect completed migration receipts: {error}"))?;
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        return Err(invalid(
+            "completed migration receipt path is not a real directory",
+        ));
+    }
+    validate_progress_inventory(&progress, &plan, Some(budget))?;
+
+    let mut file_roots = Vec::new();
+    let mut anchor_paths = Vec::new();
+    budget.charge("completed migration canonical plan anchor")?;
+    anchor_paths.push(plan_path);
+    budget.charge("completed migration canonical completion anchor")?;
+    anchor_paths.push(completion_path);
+    let mut retained_expectations = HashMap::new();
+    retained_expectations.insert(
+        format!("migration-{}-plan-ready", to_hex(&plan.transaction_id)),
+        ciphertext_bytes_fingerprint(&plan_ciphertext)
+            .map_err(|error| format!("fingerprint migration plan for GC: {error}"))?,
+    );
+    retained_expectations.insert(
+        format!(
+            "migration-{}-completion-ready",
+            to_hex(&plan.transaction_id)
+        ),
+        ciphertext_bytes_fingerprint(&completion_ciphertext)
+            .map_err(|error| format!("fingerprint migration completion for GC: {error}"))?,
+    );
+    for source in &plan.files {
+        budget.charge("completed migration canonical receipt")?;
+        let canonical = progress.join(receipt_name(source.inode));
+        let (receipt, canonical_ciphertext) = read_receipt(&canonical, key, &plan, source)?
+            .ok_or_else(|| {
+                format!(
+                    "completed migration receipt {} is missing; preserving every v2 object",
+                    canonical.display()
+                )
+            })?;
+        anchor_paths.push(canonical.clone());
+        retained_expectations.insert(
+            format!(
+                "migration-{}-receipt-{}-ready",
+                to_hex(&plan.transaction_id),
+                source.inode
+            ),
+            ciphertext_bytes_fingerprint(&canonical_ciphertext).map_err(|error| {
+                format!(
+                    "fingerprint migration receipt {} for GC: {error}",
+                    source.inode
+                )
+            })?,
+        );
+        budget.charge("completed migration ready-receipt probe")?;
+        let ready = progress.join(receipt_ready_name(source.inode));
+        if let Some((ready_receipt, ready_ciphertext)) = read_receipt(&ready, key, &plan, source)? {
+            if ready_receipt != receipt || ready_ciphertext != canonical_ciphertext {
+                return Err(format!(
+                    "completed migration receipt {} has a different ready copy; preserving every v2 object",
+                    canonical.display()
+                ));
+            }
+            anchor_paths.push(ready);
+        }
+        if !receipt.file_root.is_empty() {
+            let reference = v2::decode_file_root(&receipt.file_root).ok_or_else(|| {
+                format!(
+                    "completed migration receipt {} has an invalid file root",
+                    canonical.display()
+                )
+            })?;
+            file_roots.push((reference, receipt.size));
+        }
+    }
+
+    let evidence = v2::selected_object_directory(base_path)
+        .map_err(|error| format!("select v2 object directory for GC: {error}"))?
+        .join("evidence");
+    for entry in fs::read_dir(&evidence)
+        .map_err(|error| format!("inspect retained migration evidence: {error}"))?
+    {
+        let entry = entry.map_err(|error| format!("inspect migration evidence entry: {error}"))?;
+        budget.charge("retained migration evidence inventory")?;
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            return Err(invalid(
+                "migration evidence contains a non-UTF-8 artifact; preserving every object",
+            ));
+        };
+        if !name.starts_with("migration-") {
+            continue;
+        }
+        let stem = name.strip_suffix(".retained").or_else(|| {
+            let (stem, number) = name.rsplit_once(".retained-")?;
+            (!number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit())).then_some(stem)
+        });
+        let Some(expected) = stem.and_then(|stem| retained_expectations.get(stem)) else {
+            return Err(format!(
+                "unsupported or untrusted migration evidence {name:?}; preserving every object"
+            ));
+        };
+        let actual = read_bounded_backing_file(&entry.path(), MAX_PLAN_CIPHERTEXT)
+            .map_err(|error| format!("read retained migration evidence {name:?}: {error}"))?;
+        let actual = ciphertext_bytes_fingerprint(&actual).map_err(|error| {
+            format!("fingerprint retained migration evidence {name:?}: {error}")
+        })?;
+        if &actual != expected {
+            return Err(format!(
+                "retained migration evidence {name:?} differs from its authenticated canonical anchor"
+            ));
+        }
+        anchor_paths.push(entry.path());
+    }
+    anchor_paths.sort();
+    Ok(GcMigrationEvidence {
+        generations: vec![completion.migration_generation],
+        file_roots,
+        anchor_paths,
+    })
 }
 
 pub(crate) fn migrate_v1_to_v2(passphrase: &str, base_path: &Path) -> Result<(), String> {
@@ -927,10 +1257,55 @@ pub(crate) fn migrate_v1_to_v2(passphrase: &str, base_path: &Path) -> Result<(),
         .ok_or_else(|| "v1-to-v2 migration requires existing Argon2id KDF metadata".to_string())?;
     let key = try_derive_key(passphrase, &kdf)?;
     let (index, source_index) = load_v1_index(base_path, &key)?;
-    v2::probe_atomic_exchange(base_path).map_err(|error| {
-        format!("backing store cannot provide the atomic exchange required by writable v2: {error}")
-    })?;
-    v2::recover(base_path, &key, &kdf_fingerprint)
+    if backing_entry_exists(&base_path.join(PROGRESS_DIRECTORY))
+        .map_err(|error| format!("inspect migration progress before namespace pinning: {error}"))?
+    {
+        let (preflight_plan, _) = read_plan(base_path, &key)?
+            .ok_or_else(|| "migration progress exists without an authenticated plan".to_string())?;
+        validate_plan(&preflight_plan, &index)?;
+        if preflight_plan.source_index != source_index
+            || preflight_plan.kdf_fingerprint != kdf_fingerprint
+        {
+            return Err(invalid(
+                "v1 index/KDF changed since the authenticated migration plan was published",
+            ));
+        }
+        validate_progress_inventory(&base_path.join(PROGRESS_DIRECTORY), &preflight_plan, None)?;
+    }
+    let existing_v2_state = [
+        v2::ROOT_FILE,
+        v2::WRITE_MANIFEST,
+        PLAN_FILE,
+        COMPLETION_FILE,
+        PROGRESS_DIRECTORY,
+    ]
+    .iter()
+    .try_fold(false, |found, name| {
+        backing_entry_exists(&base_path.join(name)).map(|exists| found || exists)
+    })
+    .map_err(|error| format!("inspect existing v2 migration state: {error}"))?;
+    let namespace_pin = if existing_v2_state {
+        let pin = v2::V2NamespacePin::capture(base_path).map_err(|error| {
+            format!(
+                "existing v2 migration state has an incomplete or replaced immutable namespace: {error}"
+            )
+        })?;
+        v2::probe_atomic_exchange_with_pin(base_path, &pin).map_err(|error| {
+            format!(
+                "backing store cannot provide the atomic exchange required by writable v2: {error}"
+            )
+        })?;
+        pin
+    } else {
+        v2::probe_atomic_exchange(base_path).map_err(|error| {
+            format!(
+                "backing store cannot provide the atomic exchange required by writable v2: {error}"
+            )
+        })?;
+        v2::V2NamespacePin::capture(base_path)
+            .map_err(|error| format!("pin new immutable v2 migration namespace: {error}"))?
+    };
+    v2::recover_with_namespace_pin(base_path, &key, &kdf_fingerprint, &namespace_pin)
         .map_err(|error| format!("recover interrupted v2 root commit: {error}"))?;
     let (plan, plan_ciphertext) = match read_plan(base_path, &key)? {
         Some((plan, ciphertext)) => {
@@ -947,12 +1322,13 @@ pub(crate) fn migrate_v1_to_v2(passphrase: &str, base_path: &Path) -> Result<(),
             )?;
             match read_bounded_backing_file(&ready, MAX_PLAN_CIPHERTEXT) {
                 Ok(ready_ciphertext) if ready_ciphertext == ciphertext => {
-                    v2::retain_known_file(
+                    retain_known_evidence(
                         base_path,
                         &ready,
                         &ciphertext,
                         &format!("migration-{}-plan-ready", to_hex(&plan.transaction_id)),
                         "retain verified duplicate v2 migration plan ready evidence",
+                        Some(&namespace_pin),
                     )
                     .map_err(|error| error.to_string())?;
                     File::open(base_path)
@@ -987,18 +1363,25 @@ pub(crate) fn migrate_v1_to_v2(passphrase: &str, base_path: &Path) -> Result<(),
             source_index.clone(),
             kdf_fingerprint.clone(),
             &index,
+            Some(&namespace_pin),
         )?,
     };
     if backing_entry_exists(&base_path.join(COMPLETION_FILE))
         .map_err(|error| format!("inspect migration completion: {error}"))?
     {
-        let (_, current) = v2::load(base_path, &key)
+        let (_, current) = v2::load_with_pin(base_path, &key, &namespace_pin)
             .map_err(|error| format!("load completed v2 migration root: {error}"))?;
-        validate_completed_migration_evidence(base_path, &key, &kdf_fingerprint, &current)?;
+        validate_completed_migration_evidence_with_pin(
+            base_path,
+            &key,
+            &kdf_fingerprint,
+            &current,
+            &namespace_pin,
+        )?;
         return Ok(());
     }
     let progress = ensure_progress_directory(base_path)?;
-    validate_progress_inventory(&progress, &plan)?;
+    validate_progress_inventory(&progress, &plan, None)?;
 
     let mut target_index = index.clone();
     for source in &plan.files {
@@ -1006,16 +1389,21 @@ pub(crate) fn migrate_v1_to_v2(passphrase: &str, base_path: &Path) -> Result<(),
         let receipt = match read_receipt(&canonical, &key, &plan, source)? {
             Some(receipt) => {
                 let ready = progress.join(receipt_ready_name(source.inode));
-                if let Some((_ready_receipt, ready_ciphertext)) =
-                    read_resumable_ready_receipt(base_path, &ready, &key, &plan, source)?
-                {
+                if let Some((_ready_receipt, ready_ciphertext)) = read_resumable_ready_receipt(
+                    base_path,
+                    &ready,
+                    &key,
+                    &plan,
+                    source,
+                    Some(&namespace_pin),
+                )? {
                     if ready_ciphertext != receipt.1 {
                         return Err(format!(
                             "migration receipt {} has a different valid ready copy; preserving both as conflict evidence",
                             canonical.display()
                         ));
                     }
-                    v2::retain_known_file(
+                    retain_known_evidence(
                         base_path,
                         &ready,
                         &receipt.1,
@@ -1025,6 +1413,7 @@ pub(crate) fn migrate_v1_to_v2(passphrase: &str, base_path: &Path) -> Result<(),
                             source.inode
                         ),
                         "retain verified duplicate migration receipt ready evidence",
+                        Some(&namespace_pin),
                     )
                     .map_err(|error| error.to_string())?;
                     File::open(&progress)
@@ -1042,9 +1431,14 @@ pub(crate) fn migrate_v1_to_v2(passphrase: &str, base_path: &Path) -> Result<(),
             }
             None => {
                 let ready = progress.join(receipt_ready_name(source.inode));
-                if let Some((receipt, ciphertext)) =
-                    read_resumable_ready_receipt(base_path, &ready, &key, &plan, source)?
-                {
+                if let Some((receipt, ciphertext)) = read_resumable_ready_receipt(
+                    base_path,
+                    &ready,
+                    &key,
+                    &plan,
+                    source,
+                    Some(&namespace_pin),
+                )? {
                     let retained = v2::publish_noreplace(&ready, &canonical)
                         .map_err(|error| format!("resume receipt publication: {error}"))?;
                     File::open(&progress)
@@ -1056,7 +1450,7 @@ pub(crate) fn migrate_v1_to_v2(passphrase: &str, base_path: &Path) -> Result<(),
                     )
                     .map_err(|error| error.to_string())?;
                     if retained {
-                        v2::retain_known_file(
+                        retain_known_evidence(
                             base_path,
                             &ready,
                             &ciphertext,
@@ -1066,6 +1460,7 @@ pub(crate) fn migrate_v1_to_v2(passphrase: &str, base_path: &Path) -> Result<(),
                                 source.inode
                             ),
                             "retain resumed migration receipt ready evidence",
+                            Some(&namespace_pin),
                         )
                         .map_err(|error| error.to_string())?;
                         File::open(&progress)
@@ -1079,7 +1474,7 @@ pub(crate) fn migrate_v1_to_v2(passphrase: &str, base_path: &Path) -> Result<(),
                     }
                     (receipt, ciphertext)
                 } else {
-                    let file_root = migrate_source(base_path, &key, source)?;
+                    let file_root = migrate_source(base_path, &key, source, &namespace_pin)?;
                     let receipt = FileReceipt {
                         receipt_version: RECEIPT_VERSION,
                         transaction_id: plan.transaction_id,
@@ -1088,19 +1483,32 @@ pub(crate) fn migrate_v1_to_v2(passphrase: &str, base_path: &Path) -> Result<(),
                         size: source.size,
                         file_root,
                     };
-                    publish_receipt(base_path, &progress, &key, &plan, source, &receipt)?
+                    publish_receipt(
+                        base_path,
+                        &progress,
+                        &key,
+                        &plan,
+                        source,
+                        &receipt,
+                        Some(&namespace_pin),
+                    )?
                 }
             }
         };
         let receipt = receipt.0;
-        v2::validate_reachable_file(base_path, &key, &receipt.file_root, receipt.size).map_err(
-            |error| {
-                format!(
-                    "verify immutable v2 objects for migrated inode {}: {error}",
-                    source.inode
-                )
-            },
-        )?;
+        v2::validate_reachable_file_with_pin(
+            base_path,
+            &key,
+            &receipt.file_root,
+            receipt.size,
+            &namespace_pin,
+        )
+        .map_err(|error| {
+            format!(
+                "verify immutable v2 objects for migrated inode {}: {error}",
+                source.inode
+            )
+        })?;
         target_index
             .inodes
             .get_mut(&source.inode)
@@ -1110,27 +1518,59 @@ pub(crate) fn migrate_v1_to_v2(passphrase: &str, base_path: &Path) -> Result<(),
     let index_json = serialize_index_bounded_v2(&target_index)
         .map_err(|error| format!("serialize v2 migration index: {error}"))?;
     revalidate_plan_inputs(base_path, &plan)?;
+    namespace_pin
+        .verify(base_path)
+        .map_err(|error| format!("immutable v2 namespace changed during migration: {error}"))?;
 
     let root_exists =
         backing_entry_exists(&base_path.join(v2::ROOT_FILE)).map_err(|error| error.to_string())?;
     if !root_exists {
-        v2::commit_initial_lineage(
+        v2::commit_initial_lineage_pinned(
             base_path,
             &key,
             &index_json,
             &kdf_fingerprint,
             plan.transaction_id,
+            &namespace_pin,
         )
         .map_err(|error| format!("publish migrated v2 generation: {error}"))?;
     }
-    let (_visible, state) = v2::load(base_path, &key)
+    namespace_pin.verify(base_path).map_err(|error| {
+        format!("immutable v2 namespace changed across migration root publication: {error}")
+    })?;
+    let (_visible, state) = v2::load_with_pin(base_path, &key, &namespace_pin)
         .map_err(|error| format!("verify committed v2 generation: {error}"))?;
-    let origin =
-        v2::validate_migration_target(base_path, &key, &state, plan.transaction_id, &target_index)
-            .map_err(|error| format!("validate v2 migration origin: {error}"))?;
+    let origin = v2::validate_migration_target_with_pin(
+        base_path,
+        &key,
+        &state,
+        plan.transaction_id,
+        &target_index,
+        &namespace_pin,
+    )
+    .map_err(|error| format!("validate v2 migration origin: {error}"))?;
     revalidate_plan_inputs(base_path, &plan)?;
-    publish_completion(base_path, &key, &plan, &plan_ciphertext, origin)?;
-    validate_completed_migration_evidence(base_path, &key, &kdf_fingerprint, &state)?;
+    namespace_pin.verify(base_path).map_err(|error| {
+        format!("immutable v2 namespace changed before migration completion: {error}")
+    })?;
+    publish_completion(
+        base_path,
+        &key,
+        &plan,
+        &plan_ciphertext,
+        origin,
+        Some(&namespace_pin),
+    )?;
+    namespace_pin.verify(base_path).map_err(|error| {
+        format!("immutable v2 namespace changed across migration completion: {error}")
+    })?;
+    validate_completed_migration_evidence_with_pin(
+        base_path,
+        &key,
+        &kdf_fingerprint,
+        &state,
+        &namespace_pin,
+    )?;
     // Retain the authenticated plan, receipts, and v1 source blobs as explicit
     // recovery evidence. Garbage collection is deliberately a separate future
     // operation: a cloud provider acknowledging the new root locally does not
@@ -1322,6 +1762,41 @@ mod tests {
     }
 
     #[test]
+    fn migration_keeps_one_namespace_pin_through_initial_root_publication() {
+        let path = directory("namespace-pin");
+        let content = b"migration bytes stay in the pinned namespace";
+        fixture(&path, content);
+        let action_path = path.clone();
+        let hook = v2::arm_namespace_test_hook("before v2 root publication", move || {
+            let canonical = action_path.join(v2::OBJECT_DIRECTORY);
+            fs::rename(
+                &canonical,
+                action_path.join("provider-displaced-namespace-evidence"),
+            )
+            .unwrap();
+            fs::create_dir(&canonical).unwrap();
+            fs::create_dir(canonical.join(v2::OBJECTS_DIRECTORY)).unwrap();
+            fs::create_dir(canonical.join(v2::EVIDENCE_DIRECTORY)).unwrap();
+        });
+        let error = migrate_v1_to_v2("migration-passphrase", &path).unwrap_err();
+        drop(hook);
+        assert!(error.contains("immutable v2 namespace"), "{error}");
+        assert!(!path.join(v2::ROOT_FILE).exists());
+        assert!(path.join(PLAN_FILE).exists());
+        assert!(path.join(PROGRESS_DIRECTORY).exists());
+
+        let canonical = path.join(v2::OBJECT_DIRECTORY);
+        let displaced = path.join("provider-displaced-namespace-evidence");
+        let replacement = path.join("provider-replacement-evidence");
+        fs::rename(&canonical, &replacement).unwrap();
+        fs::rename(&displaced, &canonical).unwrap();
+        migrate_v1_to_v2("migration-passphrase", &path).unwrap();
+        assert_eq!(read_migrated(&path), content);
+        assert!(replacement.is_dir());
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
     fn garbage_plan_cannot_authorize_dual_format_heads() {
         let path = directory("garbage-plan");
         fixture(&path, b"source");
@@ -1389,7 +1864,7 @@ mod tests {
         let (kdf, kdf_fingerprint) = load_kdf_with_fingerprint(&path).unwrap().unwrap();
         let key = derive_key("migration-passphrase", &kdf);
         let (index, source_index) = load_v1_index(&path, &key).unwrap();
-        let _ = publish_plan(&path, &key, source_index, kdf_fingerprint, &index).unwrap();
+        let _ = publish_plan(&path, &key, source_index, kdf_fingerprint, &index, None).unwrap();
         let progress = ensure_progress_directory(&path).unwrap();
         fs::write(progress.join("provider-conflicted-copy"), b"evidence").unwrap();
 

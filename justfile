@@ -70,13 +70,11 @@ release-linux:
     @echo "built: target/dist/zdrive-linux-x86_64"
 
 release-windows:
-    cross build --release --target x86_64-pc-windows-gnu
-    @mkdir -p target/dist
-    @cp target/x86_64-pc-windows-gnu/release/zerotrust-drive.exe target/dist/zdrive-windows-x86_64.exe
-    @echo "built: target/dist/zdrive-windows-x86_64.exe"
+    @echo "ERROR: Windows is unsupported because fuser requires Unix; use a WinFSP backend before adding a Windows artifact" >&2
+    @exit 1
 
-release-all: release-macos release-linux release-windows
-    @echo "all platforms built in target/dist/"
+release-all: release-macos release-linux
+    @echo "all supported platforms built in target/dist/"
     @ls -lh target/dist/zdrive-*
 
 clean:

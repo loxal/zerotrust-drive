@@ -10,9 +10,11 @@ Offer iCloud Drive as a beta backend on macOS, with the complete store folder ma
 
 Offer Yandex Disk only as an experimental secondary backend, or as a Linux-focused option where its official console sync client is a decisive advantage. Use a fully local synchronized folder, not WebDAV, for a writable store.
 
-This recommendation is about filesystem behavior, diagnostics, and portability rather than a claim that Google has better cloud-service uptime. Google Mirror mode gives `zerotrust-drive` ordinary, permanently local files, which best match its POSIX and FUSE assumptions. iCloud has lower onboarding friction for an Apple-only user, but it always uses Apple's File Provider model and therefore has more placeholder, materialization, and coordination behavior to account for. Yandex has useful REST, WebDAV, and Linux surfaces, but its rolling upload allowance is a poor match for copy-on-write churn and its macOS integration is less clearly documented than either American provider.
+This recommendation is about filesystem behavior, diagnostics, and portability rather than a claim that Google has better cloud-service uptime. Google Mirror mode gives `zerotrust-drive` ordinary, permanently local files, which best match its POSIX and FUSE assumptions. iCloud has lower onboarding friction for an Apple-only user, but current macOS iCloud Drive exposes File Provider-style placeholder, materialization, and coordination behavior that the client must account for. Yandex has useful REST, WebDAV, and Linux surfaces, but its 30-day upload allowance is a poor match for copy-on-write churn and its macOS integration is less clearly documented than either American provider.
 
 On macOS, Google or Yandex storage also creates a useful organizational split: Apple controls the operating system, another company stores ciphertext, and an independent open-source project handles client-side encryption. iCloud still keeps storage separate from the encryption project, but Apple controls both the OS and storage surface. In every case, the important boundary is that the storage provider does not also supply the only opaque client and update channel that handles the encryption key. A vendor privacy promise is not a substitute for that technical and organizational separation. Client-side encryption limits what a provider can learn from content; it does not prevent the provider from observing metadata or delaying, duplicating, blocking, or deleting ciphertext.
+
+This organizational split is not endpoint sandboxing. Google Drive for desktop, the Yandex sync client, or another provider process can still have permission to inspect the separate plaintext mount on the same computer. Endpoint permissions, operating-system integrity, and all software update paths remain in the threat model.
 
 None of these backends is a database, a shared POSIX filesystem, or a backup. One store must have only one active writer at a time.
 
@@ -28,11 +30,11 @@ None of these backends is a database, a shared POSIX filesystem, or a backup. On
 
 The v1 format writes changed whole-file blobs and then replaces `_index.age`; a local or remote interruption can therefore leave v1 material from different commits without a recoverable normal-write intent. Those legacy stores retain their original caveats.
 
-The v2 format removes that blob/index publication dependency locally. It writes immutable authenticated chunks, tree objects, file roots, an index object, and a generation record before publishing an authenticated normal-write manifest and atomically exchanging the small authenticated `_root.age` pointer last. The displaced root and verified transaction manifests are retained as evidence. Deterministic tests return an injected error after write, file `fsync`, rename, directory `fsync`, evidence-retention, and recovery checkpoints, then retry recovery against that state. They do not emulate process death or pre-fsync cache loss; the old-or-new crash argument also depends on the documented local filesystem contract.
+The v2 format removes that blob/index publication dependency locally. It writes immutable authenticated chunks, tree objects, file roots, an index object, and a generation record before publishing an authenticated normal-write manifest and atomically exchanging the small authenticated `_root.age` pointer last. The displaced root and verified transaction manifests are retained as evidence. Deterministic tests return an injected error after write, file `fsync`, rename, directory `fsync`, evidence-retention, and recovery checkpoints, then retry recovery against that state. A separate subprocess harness delivers real `SIGKILL` at the same normal-write and recovery boundaries and verifies state in another process. Its complete 64-kill matrix passes on local APFS and on a real loopback ext4 filesystem inside the local OrbStack Linux aarch64 VM; the hosted x86 ext4 CI gate is configured but has not yet run. The harness drives `ZeroTrustFs` directly rather than a live kernel-mounted FUSE filesystem. Neither method emulates power loss or a storage device that lies about `fsync`, so the old-or-new crash argument still depends on the documented local filesystem contract.
 
 Cloud replication can still reorder those already durable files. A second machine may temporarily receive a new `_root.age` before every immutable object it references, or receive objects while retaining the old root. The first state fails closed on missing or incorrectly digested authenticated objects; the second continues to expose the complete old generation. The client does not synthesize missing data, fall back to an unrelated root, or expose a partially materialized generation. Users must wait for provider synchronization to finish and remount after the referenced objects arrive. Cloud sync remains asynchronous replication, not the store's concurrency protocol.
 
-Writable v2 startup now traverses and authenticates every reachable file root, tree, and chunk before accepting mutations. This prevents committing on top of a partially delivered generation, but startup work is proportional to live data and may force placeholder downloads. V2 also performs chunk/tree/file-root COW for every small FUSE write, not only at flush. Repeated writes within one 4 MiB chunk can amplify uploads substantially. There is no garbage collector, so immutable orphan objects, old generations, displaced roots, and retained manifests accumulate. This makes the current implementation a durability-focused beta and a poor fit for sustained write-heavy use with any consumer sync provider.
+Writable v2 startup now traverses and authenticates every reachable file root, tree, and chunk before accepting mutations. This prevents committing on top of incompleteness already present at startup, but startup work is proportional to live data and may force placeholder downloads. It is not a continuous full-data scrub: post-mount in-place removal or corruption of an otherwise unchanged immutable object can be inherited by a later metadata generation. The client separately pins the namespace, objects, and evidence directory identities, but a complete per-commit content scrub would be proportional to all live data. A mount-wide 64 MiB dirty-chunk overlay coalesces repeated small writes until capacity pressure, close, `fsync`, or the dirty timer publishes a root-last generation. Commit-heavy workloads can still amplify uploads substantially. Evidence-aware offline handling provides preview, reversible quarantine, and additive restore. New destructive purge is disabled because current platforms provide no atomic way to exclude a final concurrent rename, write, or hard-link mutation; quarantine therefore reclaims no storage. Historical growth, the unrun hosted x86 durability gate, incomplete iCloud coordination, provider ordering uncertainty, and the absence of provider transactions keep the implementation a durability-focused beta and a poor fit for sustained write-heavy use with any consumer sync provider.
 
 ### Google Drive in Mirror mode
 
@@ -47,7 +49,7 @@ Mirror mode is the better fit because:
 
 - Files remain present when the Drive application is stopped or its cache has a problem.
 - Reads do not need to materialize placeholders over the network.
-- Unsynced data is not confined to the streaming cache. Google warns that unsynced streaming-cache changes can be lost if that cache is cleared or corrupted.
+- Unsynced data is not confined to the streaming cache. Google specifically warns that manipulating DriveFS configuration/cache data or disconnecting an account can lose unsynced or Lost & Found content; this is not evidence that every generic cache fault loses data.
 - The local tree behaves more like the ordinary filesystem assumed by the current durable-write implementation.
 
 Costs and limitations:
@@ -61,8 +63,10 @@ Sources:
 
 - [Google Drive API](https://developers.google.com/workspace/drive/api/reference/rest/v3)
 - [Google Drive API limits](https://developers.google.com/workspace/drive/api/guides/limits)
+- [Google Drive item, folder-child, and folder-depth limits](https://developers.google.com/workspace/drive/api/guides/folder)
 - [Google Drive resumable uploads](https://developers.google.com/workspace/drive/api/guides/manage-uploads)
 - [Google Drive change tracking](https://developers.google.com/workspace/drive/api/guides/about-changes)
+- [Google Drive for desktop on macOS File Provider](https://support.google.com/drive/answer/12178485?hl=en)
 - [Google Drive for desktop system requirements](https://support.google.com/drive/answer/2375082?co=GENIE.Platform%3DDesktop&hl=en)
 
 Google documents a Pause Sync control. This is useful for rekey and migration operations. Its troubleshooting documentation also describes conflict copies, Lost & Found recovery, quota failures, retry behavior, and File Provider initialization errors.
@@ -78,13 +82,15 @@ Google retains revisions for ordinary non-Google files under documented retentio
 
 Apple documents several iCloud Drive states. An item can exist only in iCloud and require a network download, be downloaded locally, be waiting to upload, or be marked Keep Downloaded. Optimize Mac Storage may remove older local downloads when space is needed unless they are kept downloaded.
 
-Apple also documents a 50 GB limit for an individual iCloud Drive folder or file; an oversized item is marked Ineligible and cannot be stored in iCloud. This is a release-level constraint for the current v2 layout. The backing folder accumulates immutable copy-on-write objects, orphan objects, old generations, and retained conflict evidence because safe garbage collection is not implemented yet. Therefore the relevant size is accumulated encrypted backing data, not the current visible plaintext tree. An iCloud beta store must remain small and low-write, its backing folder must be monitored, and it must be moved to another backend comfortably before it approaches 50 GB. A store can hit this boundary even when its live data is much smaller.
+Apple says an item marked Ineligible is "usually" an individual iCloud Drive file or folder exceeding 50 GB. Apple does not document this as a precise recursive-quota contract, but treating the accumulated encrypted store folder as a conservative 50 GB operational ceiling is appropriate for the current v2 layout. Offline quarantine identifies proven-unreachable objects but does not currently reclaim their space, and committed generation history plus conflict/recovery evidence also remain. Therefore the relevant planning number is accumulated encrypted backing data, not the current visible plaintext tree. An iCloud beta store must remain small and low-write, its backing folder must be monitored, and it must be moved to another backend comfortably before it approaches 50 GB. A store can hit this boundary even when its live data is much smaller.
 
 Sources:
 
 - [Apple: Check iCloud Drive file and folder status](https://support.apple.com/en-ie/guide/mac-help/mchlc994344b/mac)
 - [Apple: Work with folders and files in iCloud Drive](https://support.apple.com/en-euro/guide/mac-help/mchl1a02d711/mac)
 - [Apple File Provider synchronization](https://developer.apple.com/documentation/FileProvider/synchronizing-the-file-provider-extension)
+- [Apple File Provider unsynced-edit eviction error](https://developer.apple.com/documentation/fileprovider/nsfileprovidererror/unsyncededits)
+- [Apple File Provider item eviction](https://developer.apple.com/documentation/fileprovider/nsfileprovidermanager/evictitem(identifier:completionhandler:))
 
 iCloud's strengths are:
 
@@ -95,9 +101,9 @@ iCloud's strengths are:
 
 Its limitations for this implementation are:
 
-- iCloud Drive is File Provider-managed. Without Keep Downloaded, reads may encounter placeholders and network materialization.
-- An individual folder or file over 50 GB becomes ineligible. Current v2 retention can reach this limit well before live plaintext does.
-- Apple recommends coordinated access through `NSFileCoordinator` for shared and iCloud locations. The current Rust implementation uses POSIX file operations and does not yet participate in that native coordination mechanism. Correct integration must cover every exact v1 index/blob path and every v2 root/object/manifest/staging/rename/deletion path; coordinating only the parent directory, `_index.age`, or `_root.age` would be misleading.
+- Current macOS iCloud Drive behavior exposes File Provider-style placeholders and materialization. Without Keep Downloaded, reads may require network materialization.
+- Apple says an individual folder or file over 50 GB is usually marked Ineligible. V2's deliberately retained authenticated history and evidence can approach this conservative operational ceiling well before live plaintext does, even after orphan GC.
+- Apple describes coordinated access as essential for shared and iCloud files. The current Rust implementation uses POSIX file operations and does not yet participate in `NSFileCoordinator`. Correct integration must cover exact KDF and maintenance controls; v1 indexes, blobs, reads, writes, migration, and cleanup; and every v2 root, object, manifest, staging, evidence, GC, migration, read, rename, and deletion path. Coordinating only the parent directory, `_index.age`, or `_root.age` would be misleading.
 - Apple provides native clients for its platforms and Windows, but no general iCloud Drive REST API or native Linux filesystem client.
 - Finder exposes current per-item state, but troubleshooting and historical incident information are less detailed than Google's.
 - Neither Apple nor Google documents a contract for every internal filename used by this format. New stores avoid leading-dot and AppleDouble-like v2 names, but a two-device round trip of the complete backing folder is still required before trusting a provider/client version.
@@ -140,21 +146,21 @@ The consumer sync and quota behavior makes Yandex a poor default for a frequentl
 
 - Yandex says the desktop client uploads only the changed part of an ordinary modified file, but also warns that simultaneous multi-device edits can duplicate or lose files. V2 avoids in-place data-object replacement, yet concurrent `_root.age` publication still requires the one-writer rule and sibling preservation.
 - Free accounts accept files up to 1 GB and paid Yandex 360 plans up to 50 GB. V2's bounded chunks avoid this per-file limit.
-- The rolling 30-day upload allowance is only twice the account's storage capacity. Once reached, writes and uploads are disabled until the period resets. Immutable COW write amplification, initial migration, and later evidence-preserving retention all consume that allowance even when the live plaintext size is unchanged.
+- The upload allowance is only twice the account's current storage capacity. Its 30-day accounting period begins with the first upload and resets every 30 days; it is not a continuously rolling window. Once reached, writes and uploads are disabled until the period resets. Creating immutable COW objects, migration output, and new evidence files consumes that allowance even when live plaintext size is unchanged; merely retaining old bytes consumes storage capacity rather than additional upload allowance.
 - WebDAV has required a paid Yandex 360 plan since June 22, 2026. Yandex describes it as network-only, dependent on stable connectivity, and less capable than its desktop app. WebDAV deletion bypasses Trash permanently. It is unsuitable as the primary writable filesystem under `zerotrust-drive`; use a fully synchronized local folder instead.
 
 Sources:
 
 - [Yandex Disk synchronization and conflict behavior](https://yandex.com/support/yandex-360/customers/disk/desktop/macos/en/sync-how-works)
 - [Yandex Disk upload size limits](https://yandex.com/support/yandex-360/customers/disk/web/en/uploading)
-- [Yandex Disk storage and rolling upload allowance](https://yandex.com/support/yandex-360/customers/disk/web/en/enlarge/disk-space)
+- [Yandex Disk storage and 30-day upload allowance](https://yandex.com/support/yandex-360/customers/disk/web/en/enlarge/disk-space)
 - [Yandex Disk WebDAV](https://yandex.com/support/yandex-360/customers/disk/web/en/webdav)
 
 Account availability and legal responsibility are more complex than a single country label suggests. Current international Yandex 360 terms name a Dubai entity and English law. Current Yandex ID terms assign the account entity according to the linked phone number: Russian or Belarusian numbers map to a Russian entity, several other named countries map to local entities, and most other numbers map to a Serbian entity. The privacy policy says processing may involve YANDEX LLC, incorporated in Russia, or affiliates and that cross-border protection levels may differ. The consumer material reviewed does not provide a storage-residency commitment.
 
-Yandex ID depends materially on a current mobile number for registration and recovery, may restrict access when account identity data is incomplete, and may request supporting documents. Disk terms permit blocking after 44 days over capacity and permanent deletion 90 days after blocking; they also define a notice, block, and deletion path after two years without Disk activity. Yandex 360 is provided without a consumer warranty of uninterrupted, error-free operation or file safety. Its terms also say that functions may differ by account and country. These are availability and procurement risks, not evidence that a specific account will be blocked. Signup, card payment, renewal, recovery, and full export must be tested in the user's actual locale rather than inferred from another country's offer.
+Yandex ID ordinarily depends materially on a current mobile number for registration and recovery, although its terms also recognize accounts registered without one. It may restrict access when account identity data is incomplete and may request supporting documents. Disk terms permit blocking after 44 days over capacity and permanent deletion 90 days after blocking; they also define a notice, block, and deletion path after two years without Disk activity. Yandex 360 is provided without a consumer warranty of uninterrupted, error-free operation or file safety. Its terms also say that functions may differ by account and country. These are availability and procurement risks, not evidence that a specific account will be blocked. Signup, card payment, renewal, recovery, and full export must be tested in the user's actual locale rather than inferred from another country's offer.
 
-Client-side encryption remains necessary. Yandex's security documentation says transport is encrypted, but also says stored files up to 1 GB are scanned. V2 prevents the storage provider from reading or meaningfully classifying plaintext content, while leaving object sizes, timing, account metadata, and the power to withhold or delete ciphertext visible to the provider.
+Client-side encryption remains necessary. Yandex's security documentation says transport is encrypted, but also says stored files up to 1 GB are scanned. Assuming the endpoint and sync client remain honest, v2 prevents the stored backing ciphertext and cloud account alone from revealing plaintext content. Object sizes, timing, account metadata, possible traffic-analysis inferences, and the power to withhold or delete ciphertext remain visible to the provider.
 
 Sources:
 
@@ -186,16 +192,15 @@ The following are self-selected reports, not incidence-rate evidence. They are u
 
 - May 2023: a small folder reportedly remained at Waiting to Upload for weeks despite available capacity. [Apple Community report](https://discussions.apple.com/thread/254881484)
 - December 2024: users described stuck uploads and limited diagnostic feedback, while other participants reported normal operation. [Reddit discussion](https://www.reddit.com/r/MacOS/comments/1h8gz9z)
-- April 2025: one user reported that files marked Keep Downloaded unexpectedly needed downloading again. [Apple Community report](https://discussions.apple.com/thread/256047681)
 - June 2025: a user reported placeholders for important files and a Download Now action that had no effect. [Apple Community report](https://discussions.apple.com/thread/256084740)
 - October 2025, macOS 26: users reported uploads repeatedly stalling, with rebooting helping only temporarily. [Apple Community report](https://discussions.apple.com/thread/256158466)
-- April 2025, iCloud for Windows: Excel's temporary-save pattern reportedly left a temporary file and removed the original. [Apple Community report](https://discussions.apple.com/thread/255997623)
+- March 6, 2025, iCloud for Windows: Excel's temporary-save pattern reportedly left a temporary file and removed the original. [Apple Community report](https://discussions.apple.com/thread/255997623)
 
 Recurring reported failure modes: opaque upload queues, placeholder materialization failures, Keep Downloaded surprises, and poor diagnostics around temporary-file replacement.
 
 ### Google Drive reports
 
-- April 2024 and February 2026: Mac users reported persistent File Provider initialization failures despite reinstall and restart attempts. [April 2024 report](https://support.google.com/drive/thread/271338406/) and [February 2026 report](https://support.google.com/drive/thread/408023483/)
+- April 2024 and February 25, 2026: Mac users reported persistent File Provider initialization or extension-crash failures despite reinstall and restart attempts. [April 2024 report](https://support.google.com/drive/thread/271338406/) and [February 2026 report](https://support.google.com/drive/thread/412987809/google-drive-for-desktop-on-macos-crashes-immediately-after-opening?hl=en)
 - May 2024: a design team described recurring Fetching new items stalls and resource usage; replies contained mixed experiences. [Reddit discussion](https://www.reddit.com/r/MacOS/comments/1cocgsw/is_google_drive_driving_everyone_else_up_the_ing/)
 - September 2024: users reported divergent copies across several Macs without clear errors. [Google Drive Community report](https://support.google.com/drive/thread/298176131/)
 - December 2024, Mirror mode: a large upload reportedly looped until DriveFS was reset and reinstalled. [Google Drive Community report](https://support.google.com/drive/thread/314655237/)
@@ -224,7 +229,7 @@ Only one mounted `zerotrust-drive` instance may write a store at a time. Before 
 
 Provider conflict resolution is not a concurrency mechanism. In v1, encrypted index versions cannot be merged, and provider-generated sibling indexes can strand otherwise valid encrypted blobs. In v2, `_root.age` is the sole mutable visibility pointer and each authenticated generation names its parent, but two concurrent children of one parent are still divergent histories that require human reconciliation. The application fingerprints the complete active `_index.age` for v1 or `_root.age` for v2 and the exact `_kdf.json`, scans for alternate control artifacts, and refuses a local commit when a check indicates a competing or interrupted generation. Maintenance locks contain a hashed operating-system machine identity and PID so a lock synchronized from another device is not declared stale by probing its PID on the wrong host. These controls are detection, not a cross-machine lease or remote transaction, so the one-writer rule remains mandatory.
 
-After a mounted instance detects such a conflict, it latches persistence off until remount. Writes return read-only errors and flush/fsync report the stored conflict even if the provider later removes or hides the sibling. V2 recovery moves only byte-for-byte verified transaction artifacts into transaction-bound evidence names after authenticating the intent and generation relationship; it does not unlink roots or manifests. A separately fsynced manifest anchor lets remount detect a provider replacement raced with that move. This prevents an apparently self-healing sync state from silently resuming commits or discarding conflict evidence before a human has reconciled the generations.
+After a mounted instance detects such a conflict, it latches persistence off until remount. Writes return read-only errors and flush/fsync report the stored conflict even if the provider later removes or hides the sibling. V2 recovery moves only byte-for-byte verified transaction artifacts into transaction-bound evidence names after authenticating the intent and generation relationship; it does not unlink roots or manifests. A separately fsynced manifest anchor lets remount detect a provider replacement raced with that move. Exact directory pins and checks prevent a persistent replacement visible at a validation boundary from looking self-healed or silently discarding evidence. They cannot atomically exclude an ABA provider rename or a change in the final check-to-root-exchange interval, so the local old-or-new proof assumes a stable selected namespace during publication and does not claim a provider transaction.
 
 Remote partial materialization is also an error, not an empty store. If `_kdf.json`, `_root.age`, a v2 write manifest, or referenced immutable objects arrive without their required counterparts, do not delete the directory and do not initialize a replacement drive. Wait for synchronization, preserve every artifact, and retry with the same passphrase. A missing object, digest mismatch, unsupported root, or root that is neither the authenticated old nor new generation fails closed.
 
@@ -250,13 +255,34 @@ The explicit `--migrate-v2` operation is resumable. It authenticates a migration
 8. For v1, wait until every changed blob and `_index.age` is fully uploaded. For v2, wait until every new immutable object, authenticated migration or write artifact, and `_root.age` is fully uploaded. Do not mount the store elsewhere during this interval.
 9. Only after synchronization completes may another device download the complete store and mount it.
 
+### Safe offline v2 orphan quarantine
+
+Apply the same unmount, synchronization, independent-snapshot, and provider-pause sequence before
+GC. Run `--gc-v2` first; it does not modify the encrypted backing store or persist a plan and prints
+a deterministic plan ID. Use that exact ID with `--gc-v2-quarantine` and
+`--confirm-sync-paused`. Quarantine is resumable and moves exact object bytes without unlinking them.
+After validation, restore that exact plan when the objects should return to the live namespace.
+New physical purge is unavailable. `--gc-v2-purge` authenticates and revalidates a new plan, then
+returns read-only before intent, tombstone creation, or any byte/name change. The flag remains only
+to complete authenticated compatibility evidence when every candidate already has an exact
+zero-length tombstone; a full tombstone or quarantined object is preserved and refused.
+
+Do not delete the authenticated GC operation directory by hand. Preview, quarantine, and purge
+stop on pending migration/rekey state, provider siblings, unknown or untrusted evidence, or a
+stale live inventory. Restore is intentionally narrower and additive before purge intent: it
+authenticates the current key, stored GC operation, and exact candidate state and remains available
+after unrelated live-root or evidence drift so it can put authenticated quarantined bytes back.
+Missing/corrupt planned objects or ambiguous source/quarantine copies still fail closed. The
+confirmation flag records an operator assertion; it cannot pause a provider, exclude a remote
+writer, or prove that every replica has converged.
+
 V2 deliberately retains immutable objects from more than one generation, so a mixture of object generations in the cloud directory is expected and is not itself corruption. Only the authenticated `_root.age` selects the visible generation. A provider may nevertheless deliver that root before its dependencies; the receiving client must remain unavailable and fail closed until all authenticated objects materialize. The root-last proof applies to the local durability protocol and its recovery model, not to provider upload order. The one-writer rule and waiting for complete replication remain mandatory.
 
 ## Support wording
 
 - **Recommended:** Google Drive `My Drive`, Mirror files, dedicated backing folder, one active mount.
 - **Constrained beta:** iCloud Drive only for small, low-write stores whose accumulated encrypted backing footprint stays comfortably below Apple's 50 GB per-folder limit; complete backing folder marked Keep Downloaded, one active mount.
-- **Experimental secondary:** Yandex Disk fully local synchronized folder, preferably for Linux or cold secondary storage, one active mount, account and rolling-upload monitoring.
+- **Experimental secondary:** Yandex Disk fully local synchronized folder, preferably for Linux or cold secondary storage, one active mount, account and 30-day-upload monitoring.
 - **Unsupported:** Google Drive Stream mode, Shared Drives, Yandex WebDAV for writable mounts, concurrent mounts, network-mounted provider caches, or treating any provider as the only backup.
 
-All three labels assume low-write beta use until bounded dirty-chunk coalescing and evidence-aware garbage collection exist. Yandex's rolling upload allowance makes the current write amplification especially unfavorable there.
+All three labels still assume low-write beta use. Bounded dirty-chunk coalescing reduces write amplification, and evidence-aware orphan quarantine prevents unsafe opportunistic deletion, but it does not reclaim crash leftovers. Committed history/evidence retention, close/fsync-heavy commits, and unqualified remote-provider ordering remain. Yandex's 30-day upload allowance makes residual write amplification especially unfavorable there.

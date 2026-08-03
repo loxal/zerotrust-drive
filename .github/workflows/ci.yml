@@ -18,8 +18,46 @@ jobs:
       - name: Run tests
         run: cargo test
 
+  durability-ext4:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install FUSE and ext4 tools
+        run: sudo apt-get update && sudo apt-get install -y libfuse3-dev fuse3 e2fsprogs
+      - name: Create isolated ext4 test filesystem
+        run: |
+          truncate -s 1G "$RUNNER_TEMP/zerotrust-drive-ext4.img"
+          mkfs.ext4 -F "$RUNNER_TEMP/zerotrust-drive-ext4.img"
+          sudo mkdir -p /mnt/zerotrust-drive-ext4
+          sudo mount -o loop "$RUNNER_TEMP/zerotrust-drive-ext4.img" /mnt/zerotrust-drive-ext4
+          sudo chown "$(id -u):$(id -g)" /mnt/zerotrust-drive-ext4
+      - name: Run real SIGKILL durability matrix on ext4
+        env:
+          ZDRIVE_RUN_PROCESS_CRASH_TESTS: "1"
+          ZDRIVE_CRASH_TEST_ROOT: /mnt/zerotrust-drive-ext4
+        run: cargo test subprocess_sigkill_v2_durability_ext4 -- --ignored --nocapture
+      - name: Unmount ext4 test filesystem
+        if: always()
+        run: sudo umount /mnt/zerotrust-drive-ext4 || true
+
+  durability-apfs:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install macFUSE
+        run: brew install macfuse
+      - name: Run real SIGKILL durability matrix on APFS
+        env:
+          ZDRIVE_RUN_PROCESS_CRASH_TESTS: "1"
+          ZDRIVE_CRASH_TEST_ROOT: ${{ runner.temp }}
+        run: cargo test subprocess_sigkill_v2_durability_apfs -- --ignored --nocapture
+
   release-linux:
-    needs: test
+    needs: [test, durability-ext4, durability-apfs]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
@@ -37,7 +75,7 @@ jobs:
           path: zdrive-linux-x86_64
 
   release-macos:
-    needs: test
+    needs: [test, durability-ext4, durability-apfs]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: macos-latest
     steps:
