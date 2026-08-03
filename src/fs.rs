@@ -3324,6 +3324,24 @@ impl ZeroTrustFs {
         let _persistence = self.inner.persistence_mutex.lock().unwrap();
         self.flush_pending_state_locked(true)
     }
+
+    /// Remove wall-clock scheduling from tests that specifically exercise
+    /// capacity-pressure flushing. The caller must explicitly fsync or release
+    /// every accepted mutation because Drop no longer owns a worker to stop.
+    #[cfg(test)]
+    fn stop_debounce_thread_for_test(&mut self) {
+        let Some(handle) = self.debounce_thread.take() else {
+            return;
+        };
+        {
+            let mut stop = self.inner.debounce_mutex.lock().unwrap();
+            *stop = true;
+            self.inner.debounce_notify.notify_one();
+        }
+        handle
+            .join()
+            .expect("debounce test worker must stop cleanly");
+    }
 }
 
 impl Drop for ZeroTrustFs {
@@ -6230,9 +6248,13 @@ mod tests {
 
     #[test]
     fn v2_overlay_pressure_flushes_before_accepting_another_chunk() {
-        let dir = PathBuf::from("target/test-v2-dirty-overlay-pressure");
+        let dir = PathBuf::from(format!(
+            "target/test-v2-dirty-overlay-pressure-{}",
+            std::process::id()
+        ));
         let _ = fs::remove_dir_all(&dir);
-        let ztfs = ZeroTrustFs::new_v2("pw", dir.clone());
+        let mut ztfs = ZeroTrustFs::new_v2("pw", dir.clone());
+        ztfs.stop_debounce_thread_for_test();
         let ino = add_v2_file(&ztfs, "pressure.bin");
         ztfs.open_inode(ino).unwrap();
         let before = v2_object_count(&dir);
@@ -6264,9 +6286,13 @@ mod tests {
     fn v2_overlay_pressure_failure_does_not_partially_accept_incoming_write() {
         use crate::fault::FaultInjectionGuard;
 
-        let dir = PathBuf::from("target/test-v2-dirty-overlay-pressure-failure");
+        let dir = PathBuf::from(format!(
+            "target/test-v2-dirty-overlay-pressure-failure-{}",
+            std::process::id()
+        ));
         let _ = fs::remove_dir_all(&dir);
-        let ztfs = ZeroTrustFs::new_v2("pw", dir.clone());
+        let mut ztfs = ZeroTrustFs::new_v2("pw", dir.clone());
+        ztfs.stop_debounce_thread_for_test();
         let ino = add_v2_file(&ztfs, "pressure-failure.bin");
         ztfs.open_inode(ino).unwrap();
         for chunk in 0..V2_DIRTY_CHUNK_LIMIT {
