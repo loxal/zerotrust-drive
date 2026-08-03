@@ -468,7 +468,8 @@ macOS APFS durability job in 1m17s, and the x86 Linux loopback-ext4 durability
 job in 1m23s. Release jobs continue to depend on both hosted APFS and ext4
 durability jobs.
 
-Dedicated maintenance matrices now also pass locally on APFS: 22 real
+Dedicated maintenance matrices now also pass locally on APFS and in hosted
+APFS/x86_64 loopback ext4: 22 real
 `SIGKILL` points for GC quarantine plus 14 from its canonical post-rename
 recovery state, 9 for GC restore plus 8 from its canonical post-rename recovery
 state, and 65 for resumable v1-to-v2 migration plus 29 from its authenticated
@@ -476,8 +477,11 @@ pending-root state. The migration matrix exposed completed-migration and
 late-completion-publication paths that could accept a provider-generated root
 sibling during that invocation; the implementation now rechecks around
 completion and before every successful return, fails closed, and retains the
-evidence. The new dedicated matrices have not yet run in hosted APFS or x86
-ext4 jobs.
+evidence. Expanded PR run
+[`30805725643`](https://github.com/loxal/zerotrust-drive/actions/runs/30805725643)
+passed the 216-test job in 1m58s, macOS APFS in 1m19s, and asserted-x86_64
+loopback ext4 in 1m06s. Both durability jobs ran the baseline, GC, and migration
+matrices and the ext4 job unmounted its loopback filesystem cleanly.
 
 The harness drives one representative open, write, `fsync`, and release
 transaction through direct `ZeroTrustFs` calls. It is not a live
@@ -491,14 +495,14 @@ and idempotence transitions.
 storage device remain powered. It does not emulate torn sectors, volatile disk
 caches, sudden power loss, remote cloud reordering, or a second writer. macOS
 `File::sync_all` is not claimed to provide `F_FULLFSYNC` semantics. Real
-migration and GC process-death testing has passed locally on APFS, while hosted
-and ext4 qualification of those dedicated matrices remains pending. Both also
-retain deterministic returned-error coverage at every checkpoint.
+migration and GC process-death testing has passed locally on APFS and in hosted
+APFS/x86_64 loopback ext4. Both also retain deterministic returned-error
+coverage at every checkpoint.
 
 The durability-focused beta label remains unchanged. Live kernel-mounted FUSE
-coverage, hosted APFS and x86 ext4 qualification of the new migration/GC
-matrices, complete iCloud and Proton File Provider coordination,
-remote-provider ordering, and evidence-retirement policy remain open.
+coverage, production wiring of the complete iCloud and Proton File Provider
+path inventory, real-provider materialization and kill tests, remote-provider
+ordering, and evidence-retirement policy remain open.
 
 ## Final local verification
 
@@ -520,7 +524,10 @@ Package version after this change set: `0.12.0`.
 - Local APFS dedicated maintenance matrices: 22 GC-quarantine plus 14
   quarantine-recovery, 9 GC-restore plus 8 restore-recovery, and 65 v1-to-v2
   migration plus 29 pending-root-recovery deaths, passed.
+- Expanded hosted PR run `30805725643`: 216-test job 1m58s, APFS 1m19s, and
+  asserted-x86_64 loopback ext4 1m06s; both filesystem jobs ran baseline, GC,
+  and migration matrices, passed.
 
-The baseline now has hosted APFS and x86 evidence. The stronger raw-root
-baseline and new maintenance results remain local-only until the updated commit
-passes both hosted jobs; no result in this report promotes the beta posture.
+The stronger raw-root baseline and dedicated maintenance matrices now have
+local APFS and hosted APFS/x86-ext4 evidence. No result in this report promotes
+the beta posture.

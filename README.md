@@ -103,11 +103,12 @@ evidence-retention, and recovery checkpoint, then retry recovery against that st
 subprocess matrix also uses real `SIGKILL` after every checkpoint and verifies recovery in a fresh
 process. The baseline 64-kill normal-write/recovery matrix passes on local APFS, local loopback
 ext4, hosted APFS, and hosted x86 loopback ext4. [GitHub PR #1](https://github.com/loxal/zerotrust-drive/pull/1) recorded the hosted unit job in
-2m19s, APFS in 1m17s, and x86 ext4 in 1m23s. Dedicated local APFS matrices also pass 22 GC
+2m19s, APFS in 1m17s, and x86 ext4 in 1m23s. Dedicated local and hosted matrices also pass 22 GC
 quarantine plus 14 quarantine-recovery deaths, 9 GC restore plus 8 restore-recovery deaths, and
 65 v1-to-v2 migration plus 29 pending-root recovery deaths. The migration matrix exposed and
-helped fix completed-migration and late-publication root-sibling bypasses. Hosted runs of these new
-dedicated matrices remain pending. The harnesses exercise `ZeroTrustFs` and maintenance
+helped fix completed-migration and late-publication root-sibling bypasses. The final expanded
+[hosted run](https://github.com/loxal/zerotrust-drive/actions/runs/30805725643) passed the 216-test job in 1m58s,
+APFS in 1m19s, and x86_64 loopback ext4 in 1m06s. The harnesses exercise `ZeroTrustFs` and maintenance
 entrypoints directly; they are not live kernel-mounted FUSE tests. The maintenance suites repeat
 death from selected canonical post-rename and pending-root recovery states, not every synthetic
 malformed-artifact combination. Neither test emulates power loss,
@@ -160,10 +161,9 @@ it safe against concurrent inode mutation. The quarantine framework selects only
 unreachable, never committed history or conflict/recovery evidence, but currently reclaims no
 storage. Sustained write-heavy production use is not yet recommended.
 
-The hosted baseline filesystem gates are green, but the beta status is unchanged. Hosted
-qualification of the dedicated migration and GC matrices, live kernel-mounted FUSE coverage,
-complete File Provider coordination, remote-provider ordering, and safe evidence retirement
-remain open.
+The expanded hosted filesystem gates are green, but the beta status is unchanged. Live
+kernel-mounted FUSE coverage, complete File Provider coordination, real iCloud-backed tests,
+remote-provider ordering, and safe evidence retirement remain open.
 
 Legacy v1 commits still have the historical blob-before-index crash window. Migrate important v1
 stores before relying on root-last atomicity.

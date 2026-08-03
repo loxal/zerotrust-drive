@@ -344,15 +344,16 @@ gate pins audited checkpoint counts and critical root/manifest contexts, fails
 if its opt-in environment is missing, and CI verifies the exact fully qualified
 test name before execution.
 
-Dedicated local APFS suites also pass 22 GC-quarantine plus 14 canonical
+Dedicated local and hosted APFS/x86-ext4 suites also pass 22 GC-quarantine plus 14 canonical
 post-rename quarantine-recovery deaths, 9 restore plus 8 canonical post-rename
 restore-recovery deaths, and 65 v1-to-v2 migration plus 29 authenticated
 pending-root-recovery deaths. Every GC case leaves exactly one byte-identical
 live or quarantine name and retains passive and recognized conflict evidence.
 Every migration case retains exact v1 sources, and every visible v2 root
 authenticates a complete generation. These are selected reachable mutation
-states, not a Cartesian matrix of manually malformed staging artifacts. Hosted
-qualification of the dedicated suites remains pending.
+states, not a Cartesian matrix of manually malformed staging artifacts.
+Expanded hosted run `30805725643` passed the 216-test job in 1m58s, APFS in
+1m19s, and asserted-x86_64 loopback ext4 in 1m06s.
 
 The harness uses direct `ZeroTrustFs` calls for one representative open,
 write, `fsync`, and release sequence; it is not a live kernel-mounted FUSE
@@ -415,10 +416,9 @@ store.
   authenticated objects are local. The scrub is not repeated over all live
   data before every commit; post-mount in-place object loss or corruption can
   be inherited by a later metadata generation.
-- Baseline subprocess-kill qualification has local and hosted APFS and
-  loopback-ext4 results. Migration and GC have dedicated local APFS real-kill
-  matrices, while their hosted APFS/x86-ext4 qualification remains pending.
-  The normal-write harness does not mount through the kernel FUSE path.
+- Baseline, migration, and GC subprocess-kill qualification has local APFS and
+  hosted APFS/x86-ext4 results. The normal-write harness does not mount through
+  the kernel FUSE path.
 
 V2 is therefore a durability-focused beta/source preview. It is appropriate
 for controlled testing and low-write workloads with one active writer and an
