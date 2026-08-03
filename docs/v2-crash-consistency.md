@@ -78,9 +78,14 @@ V2 never puts a complete open file in the legacy `open_files` map.
 - The kernel write request is capped at 4 MiB. An unaligned request can touch
   two chunk slots; every required base chunk is authenticated before the
   request changes acknowledged dirty state.
-- A mount-wide overlay retains at most sixteen dirty 4 MiB slots (64 MiB) and
-  256 dirty inode records. Writes to the same slot coalesce. Capacity pressure
-  commits the complete prior overlay before accepting another slot.
+- A mount-wide overlay retains at most sixteen dirty 4 MiB slots (64 MiB of
+  logical retained bytes and requested steady-state capacities) and 256 dirty
+  inode records. New, sparse, and short tails reserve compactly; changing an
+  existing full base chunk still retains that authenticated complete chunk.
+  Allocator over-allocation and a transient old-plus-new allocation while one
+  vector grows are additional bounded-operation overhead, so 64 MiB is not a
+  hard RSS ceiling. Writes to the same slot coalesce. Capacity pressure commits
+  the complete prior overlay before accepting another slot.
 - Flush holds no complete file content. It materializes one dirty immutable
   path at a time, then serializes the metadata index, which has an independent
   64 MiB limit. Dirty state is cleared only after the root-last transaction
@@ -344,16 +349,33 @@ gate pins audited checkpoint counts and critical root/manifest contexts, fails
 if its opt-in environment is missing, and CI verifies the exact fully qualified
 test name before execution.
 
-Dedicated local and hosted APFS/x86-ext4 suites also pass 22 GC-quarantine plus 14 canonical
-post-rename quarantine-recovery deaths, 9 restore plus 8 canonical post-rename
-restore-recovery deaths, and 65 v1-to-v2 migration plus 29 authenticated
-pending-root-recovery deaths. Every GC case leaves exactly one byte-identical
+A separate ignored iCloud/File Provider gate runs the same 46 plus 18 deaths
+below an explicitly user-selected folder marked Keep Downloaded. Unlike the
+ordinary local APFS/ext4 harness, it never removes a successful trace or a
+synthetic recognized conflict sibling. Each death state gets a separate
+conflict-bearing copy, the clean copy alone is recovered, and both remain for
+descriptor-rooted post-settlement inventory. Authentication is a separate
+pathname-based pass while the retained child identity remains unchanged. A
+second ignored gate below the same Keep Downloaded root verifies inherited
+policy and exact nested fixture bytes. The third gate requires another
+user-selected iCloud folder that is explicitly not marked Keep Downloaded for
+the eviction-to-`NotDownloaded`-to-materialized transition; Keep Downloaded
+and eviction cannot form one reliable test. Neither real-iCloud root has been
+exercised in this change set, so none of the three gates adds provider
+qualification.
+
+The current `0.13.0` tree passes dedicated matrices locally on APFS: 22
+GC-quarantine plus 14 canonical post-rename quarantine-recovery deaths, 9
+restore plus 8 canonical post-rename restore-recovery deaths, and 65
+v1-to-v2 migration plus 29 authenticated pending-root-recovery deaths. Every GC case leaves exactly one byte-identical
 live or quarantine name and retains passive and recognized conflict evidence.
 Every migration case retains exact v1 sources, and every visible v2 root
 authenticates a complete generation. These are selected reachable mutation
 states, not a Cartesian matrix of manually malformed staging artifacts.
-Expanded hosted run `30805725643` passed the 216-test job in 1m58s, APFS in
-1m19s, and asserted-x86_64 loopback ext4 in 1m06s.
+Historical expanded PR #1 run `30805725643` passed the 216-test job in 1m58s,
+APFS in 1m19s, and asserted-x86_64 loopback ext4 in 1m06s. The current
+`0.13.0` StoreRoot, compact-tail, and native-probe diff has not yet run in
+hosted APFS or x86_64 loopback-ext4 CI.
 
 The harness uses direct `ZeroTrustFs` calls for one representative open,
 write, `fsync`, and release sequence; it is not a live kernel-mounted FUSE
@@ -406,19 +428,21 @@ store.
   is therefore about process crashes with a stable selected namespace, not an
   adversarial sync client mutating directory names during publication.
 - A no-presenter, exact-URL `NSFileCoordinator` shim and capability-rooted
-  storage boundary are implemented and tested, but production POSIX paths are
-  intentionally not wired through them yet. Partial coordination would imply a
-  guarantee the complete path inventory does not provide. iCloud remains a
-  macOS beta target, the folder must be marked Keep Downloaded, and its backing
-  store must pass the runtime atomic-exchange probe.
+  storage boundary are implemented and tested. Pinned immutable-object
+  publication now uses its direct backend, but coordinated mode and every
+  remaining production POSIX path are intentionally unwired. Partial
+  coordination would imply a guarantee the complete path inventory does not
+  provide. iCloud remains a macOS beta target, the folder must be marked Keep
+  Downloaded, and its backing store must pass the runtime atomic-exchange probe.
 - The full mount scrub favors integrity over availability and startup speed. A
   partially synchronized generation cannot mount writable until all of its
   authenticated objects are local. The scrub is not repeated over all live
   data before every commit; post-mount in-place object loss or corruption can
   be inherited by a later metadata generation.
-- Baseline, migration, and GC subprocess-kill qualification has local APFS and
-  hosted APFS/x86-ext4 results. The normal-write harness does not mount through
-  the kernel FUSE path.
+- Current `0.13.0` baseline, migration, and GC subprocess-kill qualification
+  has local APFS results. Hosted APFS/x86_64 loopback-ext4 results are inherited
+  from PR #1; the current diff still needs those hosted gates. The normal-write
+  harness does not mount through the kernel FUSE path.
 
 V2 is therefore a durability-focused beta/source preview. It is appropriate
 for controlled testing and low-write workloads with one active writer and an

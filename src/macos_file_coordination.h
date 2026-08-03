@@ -28,6 +28,7 @@ enum {
     ZTD_MAC_ERROR_ACCESSOR = 2,
     ZTD_MAC_ERROR_EXCEPTION = 3,
     ZTD_MAC_ERROR_INVALID_INPUT = 4,
+    ZTD_MAC_ERROR_TIMEOUT = 5,
 };
 
 enum {
@@ -57,6 +58,12 @@ typedef struct {
     char download_error[ZTD_MAC_ERROR_MESSAGE_CAPACITY];
     char upload_error[ZTD_MAC_ERROR_MESSAGE_CAPACITY];
 } ztd_mac_ubiquity_status;
+
+typedef struct {
+    int32_t relinquish_writer_count;
+    int32_t move_count;
+    int32_t destination_matches;
+} ztd_mac_presenter_probe_result;
 
 typedef int32_t (*ztd_mac_accessor)(
     void *context,
@@ -121,6 +128,34 @@ int32_t ztd_mac_start_download(
     const uint8_t *path,
     size_t path_len,
     int32_t is_directory,
+    ztd_mac_error *error);
+
+// Test-only callers use this to prove a real dataless-to-materialized iCloud
+// transition. FileManager eviction removes only the local copy; it does not
+// delete the remote item.
+int32_t ztd_mac_evict_ubiquitous_item(
+    const uint8_t *path,
+    size_t path_len,
+    int32_t is_directory,
+    ztd_mac_error *error);
+
+// Test probe for the exact move shim. It registers an independent
+// NSFilePresenter for source_path, performs the existing coordinated move, and
+// waits at most timeout_millis for the move notification. The accessor remains
+// synchronous and caller-owned exactly as in ztd_mac_coordinate_move.
+int32_t ztd_mac_probe_coordinated_move(
+    const uint8_t *purpose,
+    size_t purpose_len,
+    const uint8_t *source_path,
+    size_t source_path_len,
+    int32_t source_is_directory,
+    const uint8_t *destination_path,
+    size_t destination_path_len,
+    int32_t destination_is_directory,
+    uint64_t timeout_millis,
+    ztd_mac_accessor accessor,
+    void *context,
+    ztd_mac_presenter_probe_result *result,
     ztd_mac_error *error);
 
 #endif

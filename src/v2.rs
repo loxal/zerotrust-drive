@@ -16,7 +16,9 @@ use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd};
 #[cfg(unix)]
-use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::ffi::OsStrExt;
+#[cfg(all(test, target_os = "linux"))]
+use std::os::unix::ffi::OsStringExt;
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
@@ -33,6 +35,7 @@ use crate::fs::{
     DiskIndex, backing_entry_exists, ensure_no_index_siblings, read_bounded_backing_file,
     validate_disk_index_v2, validate_reachable_v2_files, validate_reachable_v2_files_with_pin,
 };
+use crate::storage::{AccessIntent, RelativeStorePath, StoreRoot};
 
 #[path = "v2_gc.rs"]
 mod gc;
@@ -148,6 +151,11 @@ pub(crate) struct V2NamespacePin {
     namespace: File,
     objects: File,
     evidence: File,
+    /// Direct-only backing-store boundary for the exact immutable-object write
+    /// family. Coordinated mode remains disabled until every other v1/v2 path
+    /// family has moved behind the same root.
+    store_root: StoreRoot,
+    objects_relative_path: PathBuf,
     #[cfg(unix)]
     namespace_identity: (u64, u64),
     #[cfg(unix)]
@@ -174,6 +182,12 @@ impl V2NamespacePin {
             let namespace = open_directory_nofollow(&namespace_path)?;
             let objects = open_directory_nofollow(&objects_path)?;
             let evidence = open_directory_nofollow(&evidence_path)?;
+            let namespace_name = namespace_path.file_name().ok_or_else(|| {
+                io_invalid("selected immutable v2 namespace has no final component")
+            })?;
+            let objects_relative_path = PathBuf::from(namespace_name).join(OBJECTS_DIRECTORY);
+            RelativeStorePath::new(&objects_relative_path)?;
+            let store_root = StoreRoot::open_direct(base_path)?;
             let namespace_identity = directory_identity(&namespace, &namespace_path)?;
             let objects_identity = directory_identity(&objects, &objects_path)?;
             let evidence_identity = directory_identity(&evidence, &evidence_path)?;
@@ -184,6 +198,8 @@ impl V2NamespacePin {
                 namespace,
                 objects,
                 evidence,
+                store_root,
+                objects_relative_path,
                 namespace_identity,
                 objects_identity,
                 evidence_identity,
@@ -259,92 +275,23 @@ impl V2NamespacePin {
         }
         #[cfg(unix)]
         {
-            let name = CString::new(name)
-                .map_err(|_| io_invalid("immutable v2 object name contains NUL"))?;
-            let fd = unsafe {
-                libc::openat(
-                    self.objects.as_raw_fd(),
-                    name.as_ptr(),
-                    libc::O_WRONLY
-                        | libc::O_CREAT
-                        | libc::O_EXCL
-                        | libc::O_NOFOLLOW
-                        | libc::O_CLOEXEC,
-                    0o600,
-                )
-            };
-            if fd < 0 {
-                let error = std::io::Error::last_os_error();
-                if error.kind() == std::io::ErrorKind::AlreadyExists {
-                    return Ok(false);
-                }
-                return Err(error);
-            }
-            let mut file = unsafe { File::from_raw_fd(fd) };
-            let created_metadata = file.metadata()?;
-            if !created_metadata.is_file() || created_metadata.nlink() != 1 {
-                return Err(namespace_changed(
-                    "new immutable v2 object did not begin as an exclusive regular file",
-                ));
-            }
-            let created_identity = (created_metadata.dev(), created_metadata.ino());
-            file.write_all(bytes)?;
-            fault::checkpoint(DurabilityEvent::Write, context)?;
-            file.sync_all()?;
-            fault::checkpoint(DurabilityEvent::FileSync, context)?;
-            drop(file);
-            self.objects.sync_all()?;
-            fault::checkpoint(DurabilityEvent::DirectorySync, context)?;
-            #[cfg(test)]
-            namespace_test_hook::checkpoint("before pinned v2 object name verification");
-            let verify_fd = unsafe {
-                libc::openat(
-                    self.objects.as_raw_fd(),
-                    name.as_ptr(),
-                    libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                )
-            };
-            if verify_fd < 0 {
-                return Err(namespace_changed(format!(
-                    "new immutable v2 object {name:?} disappeared before publication verification: {}",
-                    std::io::Error::last_os_error()
-                )));
-            }
-            let mut verified = unsafe { File::from_raw_fd(verify_fd) };
-            let verified_metadata = verified.metadata()?;
-            if !verified_metadata.is_file()
-                || verified_metadata.nlink() != 1
-                || (verified_metadata.dev(), verified_metadata.ino()) != created_identity
-                || verified_metadata.len() != bytes.len() as u64
-            {
-                return Err(namespace_changed(format!(
-                    "new immutable v2 object {name:?} changed identity, link count, type, or length before publication verification"
-                )));
-            }
-            let mut compared = 0usize;
-            let mut buffer = [0u8; 64 * 1024];
-            loop {
-                let read = verified.read(&mut buffer)?;
-                if read == 0 {
-                    break;
-                }
-                let end = compared
-                    .checked_add(read)
-                    .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EFBIG))?;
-                if bytes.get(compared..end) != Some(&buffer[..read]) {
-                    return Err(namespace_changed(format!(
-                        "new immutable v2 object {name:?} changed bytes before publication verification"
-                    )));
-                }
-                compared = end;
-            }
-            if compared != bytes.len() {
-                return Err(namespace_changed(format!(
-                    "new immutable v2 object {name:?} changed length while being verified"
-                )));
-            }
+            let relative = RelativeStorePath::new(&self.objects_relative_path.join(name))?;
+            let entry = self.store_root.entry(relative)?;
+            let created = self.store_root.coordinate_one(
+                &entry,
+                false,
+                AccessIntent::Write,
+                |parent, exact_name| {
+                    require_same_directory(
+                        &self.objects,
+                        parent.as_file(),
+                        "immutable v2 objects directory",
+                    )?;
+                    write_exclusive_verified_file_at(parent.as_file(), exact_name, bytes, context)
+                },
+            )?;
             self.verify(base_path)?;
-            Ok(true)
+            Ok(created)
         }
     }
 
@@ -434,6 +381,96 @@ impl V2NamespacePin {
     fn read_evidence_file(&self, name: &OsStr, max_len: u64) -> std::io::Result<Vec<u8>> {
         read_bounded_regular_at(&self.evidence, name, max_len)
     }
+}
+
+#[cfg(unix)]
+fn require_same_directory(first: &File, second: &File, label: &str) -> std::io::Result<()> {
+    let first = first.metadata()?;
+    let second = second.metadata()?;
+    if !first.is_dir()
+        || !second.is_dir()
+        || first.ino() == 0
+        || second.ino() == 0
+        || (first.dev(), first.ino()) != (second.dev(), second.ino())
+    {
+        return Err(namespace_changed(format!(
+            "the StoreRoot {label} capability differs from the transaction pin"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn write_exclusive_verified_file_at(
+    directory: &File,
+    name: &OsStr,
+    bytes: &[u8],
+    context: &str,
+) -> std::io::Result<bool> {
+    let mut file = match openat_nofollow(
+        directory,
+        name,
+        libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+        0o600,
+    ) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let created_metadata = file.metadata()?;
+    if !created_metadata.is_file() || created_metadata.nlink() != 1 {
+        return Err(namespace_changed(
+            "new immutable v2 object did not begin as an exclusive regular file",
+        ));
+    }
+    let created_identity = (created_metadata.dev(), created_metadata.ino());
+    file.write_all(bytes)?;
+    fault::checkpoint(DurabilityEvent::Write, context)?;
+    file.sync_all()?;
+    fault::checkpoint(DurabilityEvent::FileSync, context)?;
+    drop(file);
+    directory.sync_all()?;
+    fault::checkpoint(DurabilityEvent::DirectorySync, context)?;
+    #[cfg(test)]
+    namespace_test_hook::checkpoint("before pinned v2 object name verification");
+    let mut verified = openat_nofollow(directory, name, libc::O_RDONLY, 0).map_err(|error| {
+        namespace_changed(format!(
+            "new immutable v2 object {name:?} disappeared before publication verification: {error}"
+        ))
+    })?;
+    let verified_metadata = verified.metadata()?;
+    if !verified_metadata.is_file()
+        || verified_metadata.nlink() != 1
+        || (verified_metadata.dev(), verified_metadata.ino()) != created_identity
+        || verified_metadata.len() != bytes.len() as u64
+    {
+        return Err(namespace_changed(format!(
+            "new immutable v2 object {name:?} changed identity, link count, type, or length before publication verification"
+        )));
+    }
+    let mut compared = 0usize;
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = verified.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        let end = compared
+            .checked_add(read)
+            .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EFBIG))?;
+        if bytes.get(compared..end) != Some(&buffer[..read]) {
+            return Err(namespace_changed(format!(
+                "new immutable v2 object {name:?} changed bytes before publication verification"
+            )));
+        }
+        compared = end;
+    }
+    if compared != bytes.len() {
+        return Err(namespace_changed(format!(
+            "new immutable v2 object {name:?} changed length while being verified"
+        )));
+    }
+    Ok(true)
 }
 
 #[cfg(unix)]
@@ -591,8 +628,10 @@ fn for_each_directory_entry_name(
         }
         let raw_name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
         if raw_name != b"." && raw_name != b".." {
-            let name = OsString::from_vec(raw_name.to_vec());
-            if let Err(error) = visit(&name) {
+            // `readdir` owns this buffer until the next call. The callback is
+            // synchronous, so it can inspect the exact non-UTF-8 name without
+            // allocating an OsString for every directory entry.
+            if let Err(error) = visit(OsStr::from_bytes(raw_name)) {
                 break Err(error);
             }
         }
@@ -1106,12 +1145,27 @@ fn read_object_with_pin(
         .checked_add(V1_CIPHERTEXT_OVERHEAD)
         .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EFBIG))?;
     let name = object_name(&reference.id);
-    let path = object_path(base_path, reference)?;
-    let ciphertext = match namespace_pin {
-        Some(pin) => pin.read_object_file(base_path, &name, max_ciphertext)?,
-        None => read_bounded_regular(&path, max_ciphertext)?,
+    let (ciphertext, unpinned_path) = match namespace_pin {
+        Some(pin) => (
+            pin.read_object_file(base_path, &name, max_ciphertext)?,
+            None,
+        ),
+        None => {
+            let path = object_path(base_path, reference)?;
+            let ciphertext = read_bounded_regular(&path, max_ciphertext)?;
+            (ciphertext, Some(path))
+        }
     };
     if digest_bytes(&ciphertext) != reference.digest {
+        // Pinned reads already retain the exact objects-directory capability.
+        // Build this diagnostic path only on corruption so the normal read
+        // path does not re-resolve provider-controlled namespace topology.
+        let path = match unpinned_path {
+            Some(path) => path,
+            None => namespace_pin
+                .map(|pin| pin.objects_path.join(&name))
+                .ok_or_else(|| io_invalid("v2 object read lost its namespace location"))?,
+        };
         return Err(io_invalid(format!(
             "immutable v2 object {} has the wrong complete ciphertext digest",
             path.display()
@@ -1556,9 +1610,6 @@ pub(crate) fn write_file_range_with_pin(
     }
     root.size = new_size;
     let encoded = write_file_root_with_pin(base_path, key, &root, namespace_pin)?;
-    if let Some(pin) = namespace_pin {
-        pin.verify(base_path)?;
-    }
     Ok((encoded, root.size))
 }
 
@@ -4218,6 +4269,53 @@ mod tests {
         )
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn descriptor_directory_scan_filters_dot_entries_without_allocating_names() {
+        let directory = test_directory("descriptor-directory-names");
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join("provider-conflict"), b"evidence").unwrap();
+        fs::write(directory.join("ordinary"), b"entry").unwrap();
+
+        let descriptor = File::open(&directory).unwrap();
+        let mut names = Vec::new();
+        for_each_directory_entry_name(&descriptor, |name| {
+            names.push(name.to_os_string());
+            Ok(())
+        })
+        .unwrap();
+
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                OsString::from("ordinary"),
+                OsString::from("provider-conflict")
+            ]
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn descriptor_directory_scan_preserves_non_utf8_provider_names() {
+        let directory = test_directory("descriptor-directory-non-utf8");
+        fs::create_dir_all(&directory).unwrap();
+        let non_utf8 = OsString::from_vec(b"provider-\xff-conflict".to_vec());
+        fs::write(directory.join(&non_utf8), b"evidence").unwrap();
+
+        let descriptor = File::open(&directory).unwrap();
+        let mut names = Vec::new();
+        for_each_directory_entry_name(&descriptor, |name| {
+            names.push(name.to_os_string());
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(names, vec![non_utf8]);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
     fn kdf_fingerprint() -> RecoveryFingerprint {
         RecoveryFingerprint::Exact {
             bytes: b"authenticated-test-kdf".to_vec(),
@@ -4286,6 +4384,138 @@ mod tests {
             .is_some()
         );
 
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pinned_object_publication_uses_exact_store_root_path_with_checkpoint_parity() {
+        for namespace_name in [OBJECT_DIRECTORY, LEGACY_OBJECT_DIRECTORY] {
+            let suffix = namespace_name.trim_start_matches('.');
+            let directory = test_directory(&format!("store-root-{suffix}"));
+            fs::create_dir_all(directory.join(namespace_name)).unwrap();
+            ensure_layout(&directory).unwrap();
+            let pin = V2NamespacePin::capture(&directory).unwrap();
+            let key = test_key();
+
+            let recorder = FaultInjectionGuard::record();
+            let reference = write_object_with_pin(
+                &directory,
+                &key,
+                ObjectKind::Data,
+                b"bounded exact-path payload",
+                Some(&pin),
+            )
+            .unwrap();
+            let store_root_checkpoints = recorder.checkpoints();
+            drop(recorder);
+
+            let operations = pin.store_root.exact_one_operations();
+            assert_eq!(operations.len(), 1);
+            assert_eq!(
+                operations[0],
+                crate::storage::ExactStoreOperation {
+                    path: fs::canonicalize(directory.join(namespace_name).join(OBJECTS_DIRECTORY))
+                        .unwrap()
+                        .join(object_name(&reference.id)),
+                    is_directory: false,
+                    intent: AccessIntent::Write,
+                }
+            );
+            assert_eq!(
+                read_object_with_pin(&directory, &key, ObjectKind::Data, &reference, Some(&pin),)
+                    .unwrap(),
+                b"bounded exact-path payload"
+            );
+            let object_path = object_path(&directory, &reference).unwrap();
+            let original_ciphertext = fs::read(&object_path).unwrap();
+            let recorder = FaultInjectionGuard::record();
+            assert!(
+                !pin.write_object_file(
+                    &directory,
+                    &object_name(&reference.id),
+                    b"must not replace immutable ciphertext",
+                    "publish immutable v2 object",
+                )
+                .unwrap()
+            );
+            assert!(
+                recorder.checkpoints().is_empty(),
+                "an EEXIST collision must not claim a durability boundary"
+            );
+            drop(recorder);
+            assert_eq!(fs::read(&object_path).unwrap(), original_ciphertext);
+            let collision_operations = pin.store_root.exact_one_operations();
+            assert_eq!(collision_operations.len(), 2);
+            assert_eq!(collision_operations[1], collision_operations[0]);
+
+            let comparison = test_directory(&format!("direct-helper-{suffix}"));
+            fs::create_dir_all(comparison.join(namespace_name)).unwrap();
+            ensure_layout(&comparison).unwrap();
+            let recorder = FaultInjectionGuard::record();
+            write_object(
+                &comparison,
+                &key,
+                ObjectKind::Data,
+                b"bounded exact-path payload",
+            )
+            .unwrap();
+            let direct_helper_checkpoints = recorder.checkpoints();
+            drop(recorder);
+
+            assert_eq!(
+                store_root_checkpoints, direct_helper_checkpoints,
+                "StoreRoot must not add, remove, reorder, or relabel an immutable-object durability checkpoint"
+            );
+            assert_eq!(store_root_checkpoints.len(), 3);
+            assert_eq!(store_root_checkpoints[0].event, DurabilityEvent::Write);
+            assert_eq!(store_root_checkpoints[1].event, DurabilityEvent::FileSync);
+            assert_eq!(
+                store_root_checkpoints[2].event,
+                DurabilityEvent::DirectorySync
+            );
+            assert!(
+                store_root_checkpoints
+                    .iter()
+                    .all(|checkpoint| { checkpoint.context == "publish immutable v2 object" })
+            );
+
+            fs::remove_dir_all(comparison).unwrap();
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pinned_object_read_reports_corruption_at_the_captured_exact_path() {
+        let directory = test_directory("pinned-corrupt-object-path");
+        fs::create_dir_all(&directory).unwrap();
+        ensure_layout(&directory).unwrap();
+        let pin = V2NamespacePin::capture(&directory).unwrap();
+        let key = test_key();
+        let reference = write_object_with_pin(
+            &directory,
+            &key,
+            ObjectKind::Data,
+            b"authenticated content",
+            Some(&pin),
+        )
+        .unwrap();
+        let exact_path = pin.objects_path.join(object_name(&reference.id));
+        fs::write(&exact_path, b"provider corruption").unwrap();
+
+        let error =
+            read_object_with_pin(&directory, &key, ObjectKind::Data, &reference, Some(&pin))
+                .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            error
+                .to_string()
+                .contains(&exact_path.display().to_string()),
+            "diagnostic did not retain the captured exact path: {error}"
+        );
+
+        drop(pin);
         fs::remove_dir_all(directory).unwrap();
     }
 

@@ -933,13 +933,18 @@ fn scan_v2_with_context(
     kdf_fingerprint: &RecoveryFingerprint,
     resume_plan_id: Option<&str>,
 ) -> std::io::Result<Scan> {
-    let live = collect_live_scan(base_path, key, kdf_fingerprint, resume_plan_id)?;
-    let mut walker = GraphWalker::new(base_path, key, &live.inventory);
-    walker.expectations = live.expectations.clone();
-    walker.protected = live.protected.clone();
+    let LiveScan {
+        object_namespace,
+        anchors,
+        inventory,
+        expectations,
+        protected,
+    } = collect_live_scan(base_path, key, kdf_fingerprint, resume_plan_id)?;
+    let mut walker = GraphWalker::new(base_path, key, &inventory);
+    walker.expectations = expectations;
+    walker.protected = protected;
 
-    let candidates: Vec<_> = live
-        .inventory
+    let candidates: Vec<_> = inventory
         .values()
         .filter(|identity| !walker.protected.contains(&identity.reference.id))
         .cloned()
@@ -949,14 +954,17 @@ fn scan_v2_with_context(
         walker.walk_orphan(candidate.reference, expected)?;
     }
 
-    let objects: Vec<_> = live.inventory.values().cloned().collect();
-    let reachable_objects = objects.len() - candidates.len();
+    let reachable_objects = inventory.len() - candidates.len();
+    drop(walker);
+    // The authenticated plan owns the complete inventory. Move it in BTree
+    // key order instead of retaining and cloning a second full object list.
+    let objects: Vec<_> = inventory.into_values().collect();
     let core = GcPlanCore {
         format_version: FORMAT_VERSION,
         canonical_drive_path: None,
-        object_namespace: live.object_namespace,
+        object_namespace,
         kdf_fingerprint: kdf_fingerprint.clone(),
-        anchors: live.anchors,
+        anchors,
         objects,
         candidates,
     };

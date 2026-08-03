@@ -3,6 +3,8 @@
 mod crypto;
 mod fault;
 mod fs;
+#[cfg(all(test, target_os = "macos"))]
+mod macos_integration_tests;
 mod migrate;
 mod rekey;
 #[allow(dead_code)]

@@ -23,7 +23,11 @@ of the ciphertext. Placeholder/on-demand storage is not a safe backing filesyste
 V2 does not buffer complete open files. Read, write, and flush memory are bounded independently of
 logical file size: a bounded read decrypts at most one fixed-size chunk at a time in addition to
 the bounded response buffer, and flush contains metadata rather than complete file content. Sparse
-writes do not materialize holes.
+writes do not materialize holes. New, sparse, and short dirty tails retain only the bytes reached by
+a write, beginning with a 4 KiB reservation and growing geometrically up to the 4 MiB chunk ceiling.
+Changing an existing full base chunk still authenticates and retains that complete chunk. The
+sixteen-slot limit caps retained logical dirty bytes and requested steady-state capacities at
+64 MiB; allocator over-allocation and one transient old-plus-new buffer during growth add overhead.
 Existing v1 stores still mount for compatibility and retain their legacy whole-file RAM behavior
 until explicitly migrated with `--migrate-v2`.
 
@@ -48,7 +52,7 @@ root as transaction evidence; the first generation is published with atomic no-r
 
 ### Cloud backend guidance
 
-The primary supported target is a dedicated folder in Google Drive `My Drive`, with Google
+The primary recommended beta backing target is a dedicated folder in Google Drive `My Drive`, with Google
 Drive for desktop configured to **Mirror files**. Mirror mode keeps ordinary local files and
 best matches the POSIX `fsync` and atomic-rename behavior used here. Do not use Google Drive
 Stream mode or a Shared Drive as the backing store.
@@ -57,8 +61,15 @@ iCloud Drive is a macOS-only beta target. Mark the complete encrypted backing fo
 **Keep Downloaded** before use. iCloud's File Provider placeholders and lack of a general
 user-facing pause-sync control make migration and recovery less predictable. A safe exact-URL,
 no-presenter `NSFileCoordinator` shim and capability-rooted storage boundary are implemented and
-tested, but production routing remains disabled and unwired. The current client does not yet coordinate every backing-store operation; enabling only
-partial coordination would give a false guarantee and can introduce nested-coordination failures.
+tested. Pinned v2 immutable-object publication now uses the direct `StoreRoot` backend while
+retaining descriptor-rooted `openat` writes and the same write, file-fsync, and directory-fsync
+checkpoints. Coordinated production mode and every remaining backing path family are still
+disabled and unwired; enabling only partial coordination would give a false guarantee and can
+introduce nested-coordination failures. A local `NSFilePresenter` probe verifies exact
+descriptor-rooted move notifications. Separate opt-in gates cover inherited Keep Downloaded
+behavior, an eviction/download transition in an explicitly non-Keep-Downloaded folder, and the
+complete normal-write/recovery `SIGKILL` matrix. They have not been run against user-selected
+iCloud folders in this change set.
 Apple says an individual iCloud Drive folder or file over 50 GB is usually marked Ineligible.
 Treat that as a conservative operational ceiling rather than a precisely specified recursive
 quota contract. The relevant planning number here is the complete accumulated ciphertext footprint,
@@ -103,8 +114,8 @@ evidence-retention, and recovery checkpoint, then retry recovery against that st
 subprocess matrix also uses real `SIGKILL` after every checkpoint and verifies recovery in a fresh
 process. The baseline 64-kill normal-write/recovery matrix passes on local APFS, local loopback
 ext4, hosted APFS, and hosted x86 loopback ext4. [GitHub PR #1](https://github.com/loxal/zerotrust-drive/pull/1) recorded the hosted unit job in
-2m19s, APFS in 1m17s, and x86 ext4 in 1m23s. Dedicated local and hosted matrices also pass 22 GC
-quarantine plus 14 quarantine-recovery deaths, 9 GC restore plus 8 restore-recovery deaths, and
+2m19s, APFS in 1m17s, and x86 ext4 in 1m23s. Dedicated matrices also pass locally on APFS and in
+hosted APFS/x86_64 loopback ext4: 22 GC quarantine plus 14 quarantine-recovery deaths, 9 GC restore plus 8 restore-recovery deaths, and
 65 v1-to-v2 migration plus 29 pending-root recovery deaths. The migration matrix exposed and
 helped fix completed-migration and late-publication root-sibling bypasses. The final expanded
 [hosted run](https://github.com/loxal/zerotrust-drive/actions/runs/30805725643) passed the 216-test job in 1m58s,
@@ -125,8 +136,10 @@ and hosted CI verifies each exact test name before executing it.
 The old-or-new proof is a local process-crash proof under the one-writer rule and a stable selected
 object namespace during the root-publication syscall. The mount retains exact namespace,
 `objects`, and `evidence` directory descriptors; immutable generation/index reads and writes use
-the pinned `objects` descriptor and verify each newly published final name, inode, link count,
-length, and bytes. Evidence inventory, atomic no-replace moves, and durable manifest hard links use
+the pinned `objects` descriptor. The v2 immutable-object write family enters through a direct
+exact-path `StoreRoot` operation, requires that its parent descriptor is the same pinned directory,
+and verifies each newly published final name, inode, link count, length, and bytes. Evidence
+inventory, atomic no-replace moves, and durable manifest hard links use
 the pinned `evidence` descriptor. Commit, recovery, and migration revalidate the canonical
 directory identities around publication and evidence retention.
 Those checks fail closed for a replacement present at a validation boundary, but POSIX cannot
@@ -151,19 +164,78 @@ complete new lineage and its exact displaced old root and lineage must already b
 the retained namespace. Recovery cannot make incomplete evidence look completed for one mount.
 
 V2 is currently a durability-focused beta. A bounded dirty overlay coalesces writes in up to sixteen
-4 MiB slots (64 MiB) across the mount before a root-last flush; pressure flushes the prior overlay
-before accepting another chunk. This removes complete-file buffering and repeated object creation
-for edits that remain in one dirty interval, but close/fsync-heavy workloads can still amplify
-copy-on-write uploads. Evidence-aware orphan handling is explicit and offline: preview does not
+4 MiB slots (64 MiB worst case) across the mount before a root-last flush; compact tails begin at
+4 KiB and grow only to the highest written byte. Pressure flushes the prior overlay before accepting
+another chunk. This removes complete-file buffering and repeated object creation for edits that
+remain in one dirty interval, but close/fsync-heavy workloads and many small files can still amplify
+copy-on-write object counts and uploads. Evidence-aware orphan handling is explicit and offline: preview does not
 modify the encrypted backing store or persist a plan, and quarantine is reversible. New physical
 purge is refused before intent or tombstone creation because no supported portable primitive makes
 it safe against concurrent inode mutation. The quarantine framework selects only authenticated objects proven
 unreachable, never committed history or conflict/recovery evidence, but currently reclaims no
 storage. Sustained write-heavy production use is not yet recommended.
 
-The expanded hosted filesystem gates are green, but the beta status is unchanged. Live
-kernel-mounted FUSE coverage, complete File Provider coordination, real iCloud-backed tests,
+The merged PR #1 hosted APFS and x86 loopback-ext4 gates are green. The compact-tail,
+direct-StoreRoot, native-probe, and retained-iCloud-evidence changes in `0.13.0` have local
+validation only. The beta status is unchanged: live kernel-mounted FUSE coverage, complete File
+Provider coordination, current hosted filesystem gates, passing real iCloud-backed tests,
 remote-provider ordering, and safe evidence retirement remain open.
+
+#### Opt-in iCloud integration gates
+
+Create a dedicated disposable folder inside iCloud Drive, mark that exact folder **Keep
+Downloaded** in Finder, wait for synchronization to settle, and pass its already-canonical absolute
+path to the Keep Downloaded and SIGKILL gates. The harness creates only a random child below it.
+A failed gate preserves that child for inspection. A successful gate also preserves the child: it
+rechecks identities and a bounded random owner marker, then records exact directory names/types and
+regular-file sizes/link counts/streaming byte digests. The SIGKILL gate retains its successful
+traces plus separate conflict-bearing copies of all 64 death states; it never unlinks those
+synthetic siblings or recursively deletes a provider-managed child.
+
+    set -x ZDRIVE_RUN_ICLOUD_TESTS 1
+    set -x ZDRIVE_ICLOUD_TEST_ROOT '/absolute/canonical/path/to/disposable iCloud folder'
+    set -x ZDRIVE_ICLOUD_TEST_CONFIRM disposable-keep-downloaded-folder
+    set keep_downloaded_test macos_integration_tests::real_icloud_keep_downloaded_gate
+    cargo test --locked -- --list | string match -q "$keep_downloaded_test: test"
+    cargo test --locked "$keep_downloaded_test" -- --exact --ignored --nocapture
+    set sigkill_test v2::process_crash_tests::subprocess_sigkill_v2_durability_icloud
+    cargo test --locked -- --list | string match -q "$sigkill_test: test"
+    cargo test --locked "$sigkill_test" -- --exact --ignored --nocapture
+
+Use a second disposable iCloud folder that is explicitly **not** marked Keep Downloaded for the
+eviction/materialization transition. Keeping this separate avoids a self-contradictory test in
+which iCloud correctly rematerializes an item because its parent is pinned locally. Wait until
+Finder reports this second folder fully downloaded and synchronized before starting the gate.
+
+    set -x ZDRIVE_RUN_ICLOUD_TESTS 1
+    set -x ZDRIVE_ICLOUD_MATERIALIZATION_ROOT '/absolute/canonical/path/to/disposable evictable iCloud folder'
+    set -x ZDRIVE_ICLOUD_MATERIALIZATION_CONFIRM disposable-evictable-folder
+    set materialization_test macos_integration_tests::real_icloud_materialization_transition_gate
+    cargo test --locked -- --list | string match -q "$materialization_test: test"
+    cargo test --locked "$materialization_test" -- --exact --ignored --nocapture
+
+Use these exact test names rather than a broad `cargo test --ignored`. An older
+query-only audit,
+`storage::tests::real_icloud_tree_is_currently_materialized_without_conflicts`,
+also consumes `ZDRIVE_ICLOUD_TEST_ROOT` and scans that selected root itself by
+pathname. It is retained for `StoreRoot` ubiquity-query coverage but does not
+allocate the isolated child or prove Keep Downloaded policy.
+
+The Keep Downloaded gate proves inherited policy, current/uploaded state, and exact fixture bytes.
+The evictable-folder gate asks Foundation to remove only the local fixture copy, requires an
+observed `NotDownloaded` state, downloads it again, and compares the complete tree inventory and
+freshly reopened bytes. The SIGKILL gate preflights the child before 64 local process deaths,
+compares its complete inventory after File Provider settles, and re-authenticates every clean and
+conflict-bearing crash state. Each selected root must have one unambiguous policy and recursive
+materialization state according to Apple's diagnostic `fileproviderctl evaluate`. Traversal is
+descriptor-rooted and bounded by entry/byte/depth limits, cooperative deadline checks, and a 1 MiB
+cap per diagnostic subprocess stream. One filesystem or Foundation call is not preemptible, so the
+configured timeout is not a hard wall-clock kill switch. Set
+`ZDRIVE_ICLOUD_TEST_TIMEOUT_SECS` to 30 through 3600 seconds when the default 900 seconds is
+unsuitable. Passing these gates proves point-in-time
+local APFS/File Provider behavior and settled retention of the synthetic recognized conflict
+siblings. It does not prove provider-generated conflict metadata handling, remote upload order, or
+atomic visibility on a second Mac.
 
 Legacy v1 commits still have the historical blob-before-index crash window. Migrate important v1
 stores before relying on root-last atomicity.

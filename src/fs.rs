@@ -128,6 +128,28 @@ impl V2DirtyFile {
         )
     }
 
+    fn reserve_compact_chunk(chunk: &mut Vec<u8>, required_len: usize) -> std::io::Result<()> {
+        if required_len > v2::CHUNK_SIZE {
+            return Err(std::io::Error::from_raw_os_error(libc::EFBIG));
+        }
+        if required_len == 0 {
+            return Ok(());
+        }
+        if chunk.capacity() >= required_len {
+            return Ok(());
+        }
+        // A small first allocation plus capped doubling avoids both the old
+        // eager 4 MiB tail and quadratic copying under sequential appends.
+        // Sixteen slots can still grow to at most sixteen complete chunks.
+        let target_capacity = required_len
+            .max(4 * 1024)
+            .max(chunk.capacity().saturating_mul(2))
+            .min(v2::CHUNK_SIZE);
+        chunk
+            .try_reserve_exact(target_capacity.saturating_sub(chunk.len()))
+            .map_err(|_| std::io::Error::from_raw_os_error(libc::ENOMEM))
+    }
+
     fn write(
         &mut self,
         base_path: &Path,
@@ -140,21 +162,55 @@ impl V2DirtyFile {
             .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EFBIG))?;
         let first = offset / v2::CHUNK_SIZE as u64;
         let last = (end - 1) / v2::CHUNK_SIZE as u64;
+        let mut required_lengths = Vec::with_capacity(2);
+        let mut planned = 0usize;
+        while planned < data.len() {
+            let absolute = offset
+                .checked_add(planned as u64)
+                .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EFBIG))?;
+            let chunk_index = absolute / v2::CHUNK_SIZE as u64;
+            let within = (absolute % v2::CHUNK_SIZE as u64) as usize;
+            let take = (v2::CHUNK_SIZE - within).min(data.len() - planned);
+            required_lengths.push((chunk_index, within + take));
+            planned += take;
+        }
+
+        // Authenticate every missing base chunk and reserve every affected
+        // vector before changing acknowledged bytes or logical size. Compact
+        // tails avoid turning a one-byte write into a 4 MiB allocation, while
+        // the unchanged sixteen-slot limit still bounds the worst case.
         let mut staged = Vec::with_capacity(self.missing_chunks(first, last));
-        for chunk_index in first..=last {
+        for &(chunk_index, required_len) in &required_lengths {
             if self.chunks.contains_key(&chunk_index) {
                 continue;
             }
             let mut chunk = self.load_visible_base_chunk(base_path, key, chunk_index)?;
-            chunk
-                .try_reserve_exact(v2::CHUNK_SIZE.saturating_sub(chunk.len()))
-                .map_err(|_| std::io::Error::from_raw_os_error(libc::ENOMEM))?;
-            chunk.resize(v2::CHUNK_SIZE, 0);
+            if chunk.len() < required_len {
+                Self::reserve_compact_chunk(&mut chunk, required_len)?;
+                chunk.resize(required_len, 0);
+            }
             staged.push((chunk_index, chunk));
+        }
+        for &(chunk_index, required_len) in &required_lengths {
+            let Some(chunk) = self.chunks.get_mut(&chunk_index) else {
+                continue;
+            };
+            if chunk.len() < required_len {
+                Self::reserve_compact_chunk(chunk, required_len)?;
+            }
         }
         let inserted = staged.len();
         for (chunk_index, chunk) in staged {
             self.chunks.insert(chunk_index, chunk);
+        }
+        for &(chunk_index, required_len) in &required_lengths {
+            let chunk = self
+                .chunks
+                .get_mut(&chunk_index)
+                .ok_or_else(|| std::io::Error::other("staged dirty chunk is missing"))?;
+            if chunk.len() < required_len {
+                chunk.resize(required_len, 0);
+            }
         }
 
         let mut consumed = 0usize;
@@ -196,7 +252,11 @@ impl V2DirtyFile {
             if tail != 0
                 && let Some(chunk) = self.chunks.get_mut(&last)
             {
-                chunk[tail..].fill(0);
+                // Bytes beyond the compact tail are no longer part of the
+                // dirty generation. Dropping them both prevents resurrection
+                // after a later grow and avoids indexing past a shorter sparse
+                // vector when the logical file was previously extended.
+                chunk.truncate(tail);
             }
         }
         before - self.chunks.len()
@@ -3325,11 +3385,11 @@ impl ZeroTrustFs {
         self.flush_pending_state_locked(true)
     }
 
-    /// Remove wall-clock scheduling from tests that specifically exercise
-    /// capacity-pressure flushing. The caller must explicitly fsync or release
-    /// every accepted mutation because Drop no longer owns a worker to stop.
+    /// Remove wall-clock scheduling from tests that require deterministic
+    /// flush ownership. The caller must explicitly fsync or release every
+    /// accepted mutation because Drop no longer owns a worker to stop.
     #[cfg(test)]
-    fn stop_debounce_thread_for_test(&mut self) {
+    pub(crate) fn stop_debounce_thread_for_test(&mut self) {
         let Some(handle) = self.debounce_thread.take() else {
             return;
         };
@@ -5588,6 +5648,219 @@ mod tests {
             .count()
     }
 
+    fn regular_file_summary(directory: &Path) -> (usize, u64) {
+        let mut count = 0usize;
+        let mut bytes = 0u64;
+        let mut stack = vec![directory.to_path_buf()];
+        while let Some(parent) = stack.pop() {
+            for entry in fs::read_dir(parent).unwrap() {
+                let entry = entry.unwrap();
+                let metadata = entry.metadata().unwrap();
+                if metadata.is_dir() {
+                    stack.push(entry.path());
+                } else {
+                    assert!(metadata.is_file());
+                    count += 1;
+                    bytes = bytes.checked_add(metadata.len()).unwrap();
+                }
+            }
+        }
+        (count, bytes)
+    }
+
+    fn report_small_file_measurement(
+        label: &str,
+        directory: &Path,
+        object_count_before: usize,
+        file_summary_before: (usize, u64),
+        checkpoints: &[crate::fault::DurabilityCheckpoint],
+        elapsed: Duration,
+    ) {
+        use crate::fault::DurabilityEvent;
+
+        let (file_count, bytes) = regular_file_summary(directory);
+        let count = |event| {
+            checkpoints
+                .iter()
+                .filter(|checkpoint| checkpoint.event == event)
+                .count()
+        };
+        eprintln!(
+            "ZDRIVE_SMALL_FILE_MEASUREMENT label={label} added_objects={} added_backing_regular_files={} added_backing_regular_file_st_size_bytes={} checkpoints={} writes={} file_syncs={} renames={} directory_syncs={} cleanups={} elapsed_ms={}",
+            v2_object_count(directory) - object_count_before,
+            file_count - file_summary_before.0,
+            bytes - file_summary_before.1,
+            checkpoints.len(),
+            count(DurabilityEvent::Write),
+            count(DurabilityEvent::FileSync),
+            count(DurabilityEvent::Rename),
+            count(DurabilityEvent::DirectorySync),
+            count(DurabilityEvent::Cleanup),
+            elapsed.as_millis(),
+        );
+    }
+
+    fn require_small_file_measurement_opt_in() {
+        assert_eq!(
+            std::env::var("ZDRIVE_RUN_SMALL_FILE_MEASUREMENTS").as_deref(),
+            Ok("1"),
+            "manual measurements require ZDRIVE_RUN_SMALL_FILE_MEASUREMENTS=1"
+        );
+    }
+
+    #[test]
+    #[ignore = "manual structural small-file measurement"]
+    fn measure_v2_batch_of_1000_empty_files() {
+        use crate::fault::FaultInjectionGuard;
+
+        require_small_file_measurement_opt_in();
+        let process = std::process::id();
+        let directory = PathBuf::from(format!("target/measure-v2-small-files-{process}-empty"));
+        let _ = fs::remove_dir_all(&directory);
+        let mut ztfs = ZeroTrustFs::new_v2("pw", directory.clone());
+        ztfs.stop_debounce_thread_for_test();
+        let objects_before = v2_object_count(&directory);
+        let files_before = regular_file_summary(&directory);
+        let recorder = FaultInjectionGuard::record();
+        let started = Instant::now();
+        for index in 0..1_000 {
+            add_v2_file(&ztfs, &format!("e{index:06}"));
+        }
+        ztfs.mark_dirty();
+        ztfs.flush_state().unwrap();
+        let elapsed = started.elapsed();
+        let checkpoints = recorder.checkpoints();
+        drop(recorder);
+        report_small_file_measurement(
+            "1000-empty",
+            &directory,
+            objects_before,
+            files_before,
+            &checkpoints,
+            elapsed,
+        );
+        drop(ztfs);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    #[ignore = "manual structural small-file measurement"]
+    fn measure_v2_batch_of_1000_one_byte_files() {
+        use crate::fault::FaultInjectionGuard;
+
+        require_small_file_measurement_opt_in();
+        let process = std::process::id();
+        let directory = PathBuf::from(format!("target/measure-v2-small-files-{process}-one-byte"));
+        let _ = fs::remove_dir_all(&directory);
+        let mut ztfs = ZeroTrustFs::new_v2("pw", directory.clone());
+        ztfs.stop_debounce_thread_for_test();
+        let objects_before = v2_object_count(&directory);
+        let files_before = regular_file_summary(&directory);
+        let recorder = FaultInjectionGuard::record();
+        let started = Instant::now();
+        let mut opened = Vec::with_capacity(1_000);
+        for index in 0..1_000 {
+            let ino = add_v2_file(&ztfs, &format!("t{index:06}"));
+            ztfs.open_inode(ino).unwrap();
+            ztfs.write_inode_content(ino, 0, &[((index % 255) + 1) as u8])
+                .unwrap();
+            opened.push(ino);
+        }
+        ztfs.flush_state().unwrap();
+        for ino in opened {
+            ztfs.release_inode(ino).unwrap();
+        }
+        let elapsed = started.elapsed();
+        let checkpoints = recorder.checkpoints();
+        drop(recorder);
+        report_small_file_measurement(
+            "1000-one-byte",
+            &directory,
+            objects_before,
+            files_before,
+            &checkpoints,
+            elapsed,
+        );
+        drop(ztfs);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    #[ignore = "manual structural small-file measurement"]
+    fn measure_v2_100_one_byte_files_with_last_close() {
+        use crate::fault::FaultInjectionGuard;
+
+        require_small_file_measurement_opt_in();
+        let process = std::process::id();
+        let directory = PathBuf::from(format!(
+            "target/measure-v2-small-files-{process}-last-close"
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        let mut ztfs = ZeroTrustFs::new_v2("pw", directory.clone());
+        ztfs.stop_debounce_thread_for_test();
+        let objects_before = v2_object_count(&directory);
+        let files_before = regular_file_summary(&directory);
+        let recorder = FaultInjectionGuard::record();
+        let started = Instant::now();
+        for index in 0..100 {
+            let ino = add_v2_file(&ztfs, &format!("c{index:06}"));
+            ztfs.open_inode(ino).unwrap();
+            ztfs.write_inode_content(ino, 0, &[((index % 255) + 1) as u8])
+                .unwrap();
+            ztfs.release_inode(ino).unwrap();
+        }
+        let elapsed = started.elapsed();
+        let checkpoints = recorder.checkpoints();
+        drop(recorder);
+        report_small_file_measurement(
+            "100-one-byte-last-close",
+            &directory,
+            objects_before,
+            files_before,
+            &checkpoints,
+            elapsed,
+        );
+        drop(ztfs);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    #[ignore = "manual structural small-file measurement"]
+    fn measure_v2_one_byte_file_with_100_fsyncs() {
+        use crate::fault::FaultInjectionGuard;
+
+        require_small_file_measurement_opt_in();
+        let process = std::process::id();
+        let directory = PathBuf::from(format!("target/measure-v2-small-files-{process}-fsync"));
+        let _ = fs::remove_dir_all(&directory);
+        let mut ztfs = ZeroTrustFs::new_v2("pw", directory.clone());
+        ztfs.stop_debounce_thread_for_test();
+        let objects_before = v2_object_count(&directory);
+        let files_before = regular_file_summary(&directory);
+        let ino = add_v2_file(&ztfs, "repeated");
+        ztfs.open_inode(ino).unwrap();
+        let recorder = FaultInjectionGuard::record();
+        let started = Instant::now();
+        for index in 0..100u8 {
+            ztfs.write_inode_content(ino, 0, &[1 + (index & 1)])
+                .unwrap();
+            ztfs.fsync_inode(ino).unwrap();
+        }
+        let elapsed = started.elapsed();
+        let checkpoints = recorder.checkpoints();
+        drop(recorder);
+        report_small_file_measurement(
+            "one-byte-100-fsyncs",
+            &directory,
+            objects_before,
+            files_before,
+            &checkpoints,
+            elapsed,
+        );
+        drop(ztfs);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
     fn leave_v2_overlay_after_failed_last_release(ztfs: &ZeroTrustFs, ino: u64) {
         use crate::fault::FaultInjectionGuard;
 
@@ -6166,13 +6439,27 @@ mod tests {
         ztfs.open_inode(ino).unwrap();
         let before = v2_object_count(&dir);
 
-        for (offset, byte) in b"bounded-overlay".iter().copied().enumerate() {
+        ztfs.write_inode_content(ino, 0, b"b").unwrap();
+        {
+            let overlay = ztfs.inner.v2_dirty.lock().unwrap();
+            let chunk = &overlay.files[&ino].chunks[&0];
+            assert_eq!(chunk.len(), 1);
+            assert!(chunk.capacity() < v2::CHUNK_SIZE);
+        }
+        for (offset, byte) in b"ounded-overlay".iter().copied().enumerate() {
+            let offset = offset + 1;
             ztfs.write_inode_content(ino, offset as u64, &[byte])
                 .unwrap();
         }
 
         assert_eq!(v2_object_count(&dir), before);
-        assert_eq!(ztfs.inner.v2_dirty.lock().unwrap().chunk_count, 1);
+        {
+            let overlay = ztfs.inner.v2_dirty.lock().unwrap();
+            assert_eq!(overlay.chunk_count, 1);
+            let chunk = &overlay.files[&ino].chunks[&0];
+            assert_eq!(chunk.len(), b"bounded-overlay".len());
+            assert!(chunk.capacity() < v2::CHUNK_SIZE);
+        }
         assert_eq!(
             ztfs.read_v2_inode_range(ino, 0, 64).unwrap(),
             b"bounded-overlay"
@@ -6193,6 +6480,80 @@ mod tests {
     }
 
     #[test]
+    fn v2_overlay_grows_only_to_the_highest_written_byte_within_a_chunk() {
+        let dir = PathBuf::from("target/test-v2-dirty-overlay-compact-growth");
+        let _ = fs::remove_dir_all(&dir);
+        let ztfs = ZeroTrustFs::new_v2("pw", dir.clone());
+        let ino = add_v2_file(&ztfs, "compact-growth.bin");
+        ztfs.open_inode(ino).unwrap();
+        let offset = 64 * 1024 + 7;
+
+        ztfs.write_inode_content(ino, offset as u64, b"x").unwrap();
+        {
+            let overlay = ztfs.inner.v2_dirty.lock().unwrap();
+            let chunk = &overlay.files[&ino].chunks[&0];
+            assert_eq!(chunk.len(), offset + 1);
+            assert!(chunk.capacity() < v2::CHUNK_SIZE);
+        }
+        assert_eq!(
+            ztfs.read_v2_inode_range(ino, offset as u64 - 2, 3).unwrap(),
+            b"\0\0x"
+        );
+
+        ztfs.write_inode_content(ino, v2::CHUNK_SIZE as u64 - 1, b"z")
+            .unwrap();
+        {
+            let overlay = ztfs.inner.v2_dirty.lock().unwrap();
+            let chunk = &overlay.files[&ino].chunks[&0];
+            assert_eq!(chunk.len(), v2::CHUNK_SIZE);
+        }
+        assert_eq!(
+            ztfs.read_v2_inode_range(ino, v2::CHUNK_SIZE as u64 - 3, 3)
+                .unwrap(),
+            b"\0\0z"
+        );
+        ztfs.fsync_inode(ino).unwrap();
+        ztfs.release_inode(ino).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn v2_compact_overlay_uses_capped_geometric_growth_for_byte_appends() {
+        let dir = PathBuf::from("target/test-v2-dirty-overlay-geometric-growth");
+        let _ = fs::remove_dir_all(&dir);
+        let mut ztfs = ZeroTrustFs::new_v2("pw", dir.clone());
+        ztfs.stop_debounce_thread_for_test();
+        let ino = add_v2_file(&ztfs, "geometric-growth.bin");
+        ztfs.open_inode(ino).unwrap();
+        let mut previous_capacity = 0usize;
+        let mut capacity_changes = 0usize;
+
+        for offset in 0..=8 * 1024 {
+            ztfs.write_inode_content(ino, offset as u64, b"x").unwrap();
+            let capacity = ztfs.inner.v2_dirty.lock().unwrap().files[&ino].chunks[&0].capacity();
+            if capacity != previous_capacity {
+                capacity_changes += 1;
+                previous_capacity = capacity;
+            }
+            if offset == 0 {
+                assert!(capacity >= 4 * 1024);
+                assert!(capacity < v2::CHUNK_SIZE);
+            }
+        }
+
+        let overlay = ztfs.inner.v2_dirty.lock().unwrap();
+        assert_eq!(overlay.files[&ino].chunks[&0].len(), 8 * 1024 + 1);
+        assert!(
+            capacity_changes <= 3,
+            "observed {capacity_changes} reallocations"
+        );
+        drop(overlay);
+        ztfs.fsync_inode(ino).unwrap();
+        ztfs.release_inode(ino).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn v2_overlay_handles_cross_chunk_write_and_read() {
         let dir = PathBuf::from("target/test-v2-dirty-overlay-cross-chunk");
         let _ = fs::remove_dir_all(&dir);
@@ -6203,7 +6564,13 @@ mod tests {
 
         ztfs.write_inode_content(ino, offset, b"abcdef").unwrap();
 
-        assert_eq!(ztfs.inner.v2_dirty.lock().unwrap().chunk_count, 2);
+        {
+            let overlay = ztfs.inner.v2_dirty.lock().unwrap();
+            assert_eq!(overlay.chunk_count, 2);
+            assert_eq!(overlay.files[&ino].chunks[&0].len(), v2::CHUNK_SIZE);
+            assert_eq!(overlay.files[&ino].chunks[&1].len(), 3);
+            assert!(overlay.files[&ino].chunks[&1].capacity() < v2::CHUNK_SIZE);
+        }
         assert_eq!(
             ztfs.read_v2_inode_range(ino, offset - 2, 10).unwrap(),
             b"\0\0abcdef"
@@ -6259,15 +6626,46 @@ mod tests {
         ztfs.open_inode(ino).unwrap();
         let before = v2_object_count(&dir);
 
-        for chunk in 0..=V2_DIRTY_CHUNK_LIMIT {
+        for chunk in 0..V2_DIRTY_CHUNK_LIMIT {
             let offset = chunk as u64 * v2::CHUNK_SIZE as u64;
             ztfs.write_inode_content(ino, offset, &[chunk as u8])
                 .unwrap();
         }
 
+        {
+            let overlay = ztfs.inner.v2_dirty.lock().unwrap();
+            assert_eq!(overlay.chunk_count, V2_DIRTY_CHUNK_LIMIT);
+            assert_eq!(
+                overlay
+                    .files
+                    .values()
+                    .flat_map(|file| file.chunks.values())
+                    .map(Vec::len)
+                    .sum::<usize>(),
+                V2_DIRTY_CHUNK_LIMIT
+            );
+            assert!(
+                overlay
+                    .files
+                    .values()
+                    .flat_map(|file| file.chunks.values())
+                    .all(|chunk| chunk.capacity() < v2::CHUNK_SIZE)
+            );
+        }
+
+        let incoming = V2_DIRTY_CHUNK_LIMIT;
+        ztfs.write_inode_content(
+            ino,
+            incoming as u64 * v2::CHUNK_SIZE as u64,
+            &[incoming as u8],
+        )
+        .unwrap();
+
         let overlay = ztfs.inner.v2_dirty.lock().unwrap();
         assert_eq!(overlay.chunk_count, 1);
         assert!(overlay.chunk_count <= V2_DIRTY_CHUNK_LIMIT);
+        assert_eq!(overlay.files[&ino].chunks[&(incoming as u64)].len(), 1);
+        assert!(overlay.files[&ino].chunks[&(incoming as u64)].capacity() < v2::CHUNK_SIZE);
         drop(overlay);
         assert!(v2_object_count(&dir) > before);
         for chunk in 0..=V2_DIRTY_CHUNK_LIMIT {
@@ -6312,6 +6710,25 @@ mod tests {
             size_before
         );
         assert_eq!(ztfs.inner.v2_dirty.lock().unwrap().chunk_count, 16);
+        {
+            let overlay = ztfs.inner.v2_dirty.lock().unwrap();
+            assert_eq!(
+                overlay
+                    .files
+                    .values()
+                    .flat_map(|file| file.chunks.values())
+                    .map(Vec::len)
+                    .sum::<usize>(),
+                V2_DIRTY_CHUNK_LIMIT
+            );
+            assert!(
+                overlay
+                    .files
+                    .values()
+                    .flat_map(|file| file.chunks.values())
+                    .all(|chunk| chunk.capacity() < v2::CHUNK_SIZE)
+            );
+        }
         assert!(
             ztfs.read_v2_inode_range(ino, incoming_offset, 1)
                 .unwrap()
@@ -6356,6 +6773,51 @@ mod tests {
         assert_eq!(
             reopened.read_v2_inode_range(ino, 0, 16).unwrap(),
             b"abc\0\0\0\0\0"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn v2_compact_overlay_grow_shrink_never_panics_or_reveals_discarded_bytes() {
+        let dir = PathBuf::from("target/test-v2-compact-overlay-truncate");
+        let _ = fs::remove_dir_all(&dir);
+        let ztfs = ZeroTrustFs::new_v2("pw", dir.clone());
+        let ino = add_v2_file(&ztfs, "compact-truncate.bin");
+        ztfs.open_inode(ino).unwrap();
+
+        ztfs.write_inode_content(ino, 0, b"x").unwrap();
+        ztfs.truncate_inode(ino, 1_000).unwrap();
+        ztfs.truncate_inode(ino, 500).unwrap();
+        {
+            let overlay = ztfs.inner.v2_dirty.lock().unwrap();
+            assert_eq!(overlay.files[&ino].chunks[&0].len(), 1);
+        }
+        assert_eq!(
+            ztfs.read_v2_inode_range(ino, 0, 500).unwrap(),
+            [&b"x"[..], &vec![0; 499]].concat()
+        );
+
+        ztfs.truncate_inode(ino, 1_000).unwrap();
+        ztfs.write_inode_content(ino, 900, b"y").unwrap();
+        assert_eq!(
+            ztfs.inner.v2_dirty.lock().unwrap().files[&ino].chunks[&0].len(),
+            901
+        );
+        ztfs.truncate_inode(ino, 500).unwrap();
+        assert_eq!(
+            ztfs.inner.v2_dirty.lock().unwrap().files[&ino].chunks[&0].len(),
+            500
+        );
+        ztfs.truncate_inode(ino, 1_000).unwrap();
+        assert_eq!(ztfs.read_v2_inode_range(ino, 899, 3).unwrap(), b"\0\0\0");
+
+        ztfs.fsync_inode(ino).unwrap();
+        ztfs.release_inode(ino).unwrap();
+        drop(ztfs);
+        let reopened = ZeroTrustFs::new_v2("pw", dir.clone());
+        assert_eq!(
+            reopened.read_v2_inode_range(ino, 899, 3).unwrap(),
+            b"\0\0\0"
         );
         let _ = fs::remove_dir_all(&dir);
     }
@@ -6643,6 +7105,12 @@ mod tests {
         assert_eq!(fs::read(dir.join(v2::ROOT_FILE)).unwrap(), old_root);
         assert!(ztfs.has_v2_dirty_inode(ino));
         assert_eq!(ztfs.read_v2_inode_range(ino, 0, 32).unwrap(), b"not-lost");
+        {
+            let overlay = ztfs.inner.v2_dirty.lock().unwrap();
+            let chunk = &overlay.files[&ino].chunks[&0];
+            assert_eq!(chunk.len(), b"not-lost".len());
+            assert!(chunk.capacity() < v2::CHUNK_SIZE);
+        }
         assert_eq!(
             fs::read(dir.join("_root (conflicted copy).age")).unwrap(),
             b"evidence"
@@ -6654,8 +7122,14 @@ mod tests {
     fn every_overlay_flush_checkpoint_recovers_old_or_new_and_keeps_evidence() {
         use crate::fault::{DurabilityEvent, FaultInjectionGuard};
 
-        let baseline = PathBuf::from("target/test-v2-overlay-crash-baseline");
-        let successful = PathBuf::from("target/test-v2-overlay-crash-success");
+        // Keep the long exhaustive fixture isolated from a second test
+        // process using the same checkout (for example a reviewer or another
+        // Cargo invocation). The per-test fault injector is thread-local, but
+        // fixed backing paths would still let two processes replace each
+        // other's crash-visible roots.
+        let process = std::process::id();
+        let baseline = PathBuf::from(format!("target/test-v2-overlay-crash-{process}-baseline"));
+        let successful = PathBuf::from(format!("target/test-v2-overlay-crash-{process}-success"));
         let _ = fs::remove_dir_all(&baseline);
         let _ = fs::remove_dir_all(&successful);
         let ino;
@@ -6688,7 +7162,7 @@ mod tests {
 
         for checkpoint in 1..=events.len() {
             let crashed = PathBuf::from(format!(
-                "target/test-v2-overlay-crash-checkpoint-{checkpoint}"
+                "target/test-v2-overlay-crash-{process}-checkpoint-{checkpoint}"
             ));
             copy_test_directory(&baseline, &crashed);
             fs::write(crashed.join("conflict-evidence.keep"), b"preserve me").unwrap();
@@ -6704,6 +7178,12 @@ mod tests {
                 b"new-generation",
                 "checkpoint {checkpoint} discarded the acknowledged overlay"
             );
+            {
+                let overlay = ztfs.inner.v2_dirty.lock().unwrap();
+                let chunk = &overlay.files[&ino].chunks[&0];
+                assert_eq!(chunk.len(), b"new-generation".len());
+                assert!(chunk.capacity() < v2::CHUNK_SIZE);
+            }
             *ztfs.inner.persistence_failure.lock().unwrap() =
                 Some("stop test retry before simulated remount".to_string());
             drop(ztfs);

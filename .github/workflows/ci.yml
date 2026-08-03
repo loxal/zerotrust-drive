@@ -28,6 +28,16 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libfuse3-dev fuse3 e2fsprogs
       - name: Verify x86_64 durability host
         run: uname -m | grep -Fx x86_64
+      - name: Verify exact ext4 durability test inventory
+        run: |
+          test_inventory="$(cargo test --locked -- --list)"
+          for test_name in \
+            'v2::process_crash_tests::subprocess_sigkill_v2_durability_ext4' \
+            'v2::process_crash_tests::subprocess_sigkill_v2_gc_ext4' \
+            'v2::process_crash_tests::subprocess_sigkill_v1_to_v2_migration_ext4'
+          do
+            printf '%s\n' "$test_inventory" | awk -v expected="$test_name: test" '$0 == expected { found += 1 } END { exit(found == 1 ? 0 : 1) }'
+          done
       - name: Create isolated ext4 test filesystem
         run: |
           truncate -s 1G "$RUNNER_TEMP/zerotrust-drive-ext4.img"
@@ -41,7 +51,6 @@ jobs:
           ZDRIVE_CRASH_TEST_ROOT: /mnt/zerotrust-drive-ext4
         run: |
           test_name='v2::process_crash_tests::subprocess_sigkill_v2_durability_ext4'
-          cargo test --locked -- --list | awk -v expected="$test_name: test" '$0 == expected { found += 1 } END { exit(found == 1 ? 0 : 1) }'
           cargo test --locked "$test_name" -- --exact --ignored --nocapture
       - name: Run real SIGKILL GC quarantine and restore matrices on ext4
         env:
@@ -49,7 +58,6 @@ jobs:
           ZDRIVE_CRASH_TEST_ROOT: /mnt/zerotrust-drive-ext4
         run: |
           test_name='v2::process_crash_tests::subprocess_sigkill_v2_gc_ext4'
-          cargo test --locked -- --list | awk -v expected="$test_name: test" '$0 == expected { found += 1 } END { exit(found == 1 ? 0 : 1) }'
           cargo test --locked "$test_name" -- --exact --ignored --nocapture
       - name: Run real SIGKILL v1-to-v2 migration matrix on ext4
         env:
@@ -57,7 +65,6 @@ jobs:
           ZDRIVE_CRASH_TEST_ROOT: /mnt/zerotrust-drive-ext4
         run: |
           test_name='v2::process_crash_tests::subprocess_sigkill_v1_to_v2_migration_ext4'
-          cargo test --locked -- --list | awk -v expected="$test_name: test" '$0 == expected { found += 1 } END { exit(found == 1 ? 0 : 1) }'
           cargo test --locked "$test_name" -- --exact --ignored --nocapture
       - name: Unmount ext4 test filesystem
         if: always()
@@ -74,13 +81,28 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Install macFUSE
         run: brew install macfuse
+      - name: Verify exact macOS inventory and run storage/presenter probes
+        run: |
+          test_inventory="$(cargo test --locked -- --list)"
+          for test_name in \
+            'storage::tests::macos_native_shim_coordinates_local_exact_paths' \
+            'storage::tests::native_cloud_errors_keep_machine_readable_io_kinds' \
+            'macos_integration_tests::ns_file_presenter_probe_observes_exact_descriptor_rooted_move' \
+            'v2::process_crash_tests::subprocess_sigkill_v2_durability_apfs' \
+            'v2::process_crash_tests::subprocess_sigkill_v2_gc_apfs' \
+            'v2::process_crash_tests::subprocess_sigkill_v1_to_v2_migration_apfs'
+          do
+            printf '%s\n' "$test_inventory" | awk -v expected="$test_name: test" '$0 == expected { found += 1 } END { exit(found == 1 ? 0 : 1) }'
+          done
+          cargo test --locked 'storage::tests::macos_native_shim_coordinates_local_exact_paths' -- --exact --nocapture
+          cargo test --locked 'storage::tests::native_cloud_errors_keep_machine_readable_io_kinds' -- --exact --nocapture
+          cargo test --locked 'macos_integration_tests::' -- --test-threads=1 --nocapture
       - name: Run real SIGKILL durability matrix on APFS
         env:
           ZDRIVE_RUN_PROCESS_CRASH_TESTS: "1"
           ZDRIVE_CRASH_TEST_ROOT: ${{ runner.temp }}
         run: |
           test_name='v2::process_crash_tests::subprocess_sigkill_v2_durability_apfs'
-          cargo test --locked -- --list | awk -v expected="$test_name: test" '$0 == expected { found += 1 } END { exit(found == 1 ? 0 : 1) }'
           cargo test --locked "$test_name" -- --exact --ignored --nocapture
       - name: Run real SIGKILL GC quarantine and restore matrices on APFS
         env:
@@ -88,7 +110,6 @@ jobs:
           ZDRIVE_CRASH_TEST_ROOT: ${{ runner.temp }}
         run: |
           test_name='v2::process_crash_tests::subprocess_sigkill_v2_gc_apfs'
-          cargo test --locked -- --list | awk -v expected="$test_name: test" '$0 == expected { found += 1 } END { exit(found == 1 ? 0 : 1) }'
           cargo test --locked "$test_name" -- --exact --ignored --nocapture
       - name: Run real SIGKILL v1-to-v2 migration matrix on APFS
         env:
@@ -96,7 +117,6 @@ jobs:
           ZDRIVE_CRASH_TEST_ROOT: ${{ runner.temp }}
         run: |
           test_name='v2::process_crash_tests::subprocess_sigkill_v1_to_v2_migration_apfs'
-          cargo test --locked -- --list | awk -v expected="$test_name: test" '$0 == expected { found += 1 } END { exit(found == 1 ? 0 : 1) }'
           cargo test --locked "$test_name" -- --exact --ignored --nocapture
 
   release-linux:

@@ -6,17 +6,27 @@
 //! These tests prove behavior across a userspace process SIGKILL. They do not
 //! simulate power loss, torn writes, controller caches, or storage-provider
 //! reordering. On macOS they exercise Rust's current `File::sync_all` path, not
-//! `F_FULLFSYNC`. Run the ignored platform test with an explicit path on the
+//! `F_FULLFSYNC`. Run the ignored platform tests with an explicit path on the
 //! filesystem under test:
 //!
-//! ```text
-//! ZDRIVE_RUN_PROCESS_CRASH_TESTS=1 \
-//! ZDRIVE_CRASH_TEST_ROOT=/path/on/test/filesystem \
-//! cargo test subprocess_sigkill -- --ignored --nocapture
+//! ```fish
+//! set -x ZDRIVE_RUN_PROCESS_CRASH_TESTS 1
+//! set -x ZDRIVE_CRASH_TEST_ROOT '/path/on/test/filesystem'
+//! # macOS/APFS:
+//! cargo test --locked 'v2::process_crash_tests::subprocess_sigkill_v2_durability_apfs' -- --exact --ignored --nocapture
+//! cargo test --locked 'v2::process_crash_tests::subprocess_sigkill_v2_gc_apfs' -- --exact --ignored --nocapture
+//! cargo test --locked 'v2::process_crash_tests::subprocess_sigkill_v1_to_v2_migration_apfs' -- --exact --ignored --nocapture
+//! # Linux/ext4:
+//! cargo test --locked 'v2::process_crash_tests::subprocess_sigkill_v2_durability_ext4' -- --exact --ignored --nocapture
+//! cargo test --locked 'v2::process_crash_tests::subprocess_sigkill_v2_gc_ext4' -- --exact --ignored --nocapture
+//! cargo test --locked 'v2::process_crash_tests::subprocess_sigkill_v1_to_v2_migration_ext4' -- --exact --ignored --nocapture
 //! ```
 //!
 //! Each case injects one real process death, verifies recognized provider
 //! conflict evidence in another process, then completes in a fresh verifier.
+//! Local APFS/ext4 gates remove their synthetic sibling after that proof. The
+//! real File Provider mode instead clones the death state, permanently retains
+//! the conflict-bearing copy, and recovers only the separate clean copy.
 //! The dedicated GC and migration matrices repeat real process deaths from the
 //! canonical post-rename and pending-root recovery states. They do not claim a
 //! Cartesian matrix of every synthetically malformed recovery artifact;
@@ -36,12 +46,15 @@ use crate::fs::{
     DirChild, DiskIndex, InodeEntry, InodeKind, ZeroTrustFs, ensure_no_index_siblings,
     validate_disk_index_v2, validate_reachable_v2_files,
 };
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 #[cfg(target_os = "macos")]
 use std::ffi::CString;
+use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
@@ -73,6 +86,11 @@ const MIGRATION_CONTENT: &[u8] = b"complete authenticated v1 source retained acr
 const PASSIVE_EVIDENCE_NAME: &str = "provider-evidence.keep";
 const PASSIVE_EVIDENCE_BYTES: &[u8] = b"never discard unrelated provider evidence";
 const CHILD_TIMEOUT: Duration = Duration::from_secs(30);
+const COPY_TIMEOUT: Duration = Duration::from_secs(300);
+const MAX_COPY_ENTRIES: usize = 250_000;
+const MAX_COPY_DEPTH: usize = 128;
+const MAX_COPY_FILE_BYTES: u64 = 65 * 1024 * 1024;
+const MAX_COPY_TOTAL_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
 static TEST_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -157,7 +175,8 @@ fn normal_write_commit(directory: &Path) -> std::io::Result<()> {
     // mounted FUSE write/fsync uses. Calling the lower-level v2 primitives here
     // would leave the overlay's acknowledgment and state-swap behavior outside
     // the real-process crash matrix.
-    let ztfs = ZeroTrustFs::new_v2(PASSPHRASE, directory.to_path_buf());
+    let mut ztfs = ZeroTrustFs::new_v2(PASSPHRASE, directory.to_path_buf());
+    ztfs.stop_debounce_thread_for_test();
     ztfs.open_inode(2)?;
     ztfs.write_inode_content(2, 0, NEW_CONTENT)?;
     ztfs.fsync_inode(2)?;
@@ -194,28 +213,493 @@ fn remove_provider_conflict_after_verification(store: &Path) {
         .expect("sync explicit conflict-fixture removal");
 }
 
-fn copy_directory_durable(source: &Path, destination: &Path) {
-    fs::create_dir(destination).expect("create crash-case directory");
-    for entry in fs::read_dir(source).expect("read crash baseline") {
-        let entry = entry.expect("read crash baseline entry");
-        let target = destination.join(entry.file_name());
-        let file_type = entry.file_type().expect("read crash baseline file type");
-        if file_type.is_dir() {
-            copy_directory_durable(&entry.path(), &target);
-        } else if file_type.is_file() {
-            fs::copy(entry.path(), &target).expect("copy crash baseline file");
-            File::open(&target)
-                .expect("open copied crash baseline file")
-                .sync_all()
-                .expect("sync copied crash baseline file");
-        } else {
-            panic!("crash baseline contains a non-regular entry");
+#[derive(Default)]
+struct CopyBudget {
+    entries: usize,
+    total_bytes: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CrashCopySnapshotEntry {
+    Directory,
+    File {
+        len: u64,
+        links: u64,
+        digest: [u8; 32],
+    },
+}
+
+type CrashCopySnapshot = BTreeMap<PathBuf, CrashCopySnapshotEntry>;
+
+fn ensure_copy_deadline(deadline: Instant) -> io::Result<()> {
+    if Instant::now() >= deadline {
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "descriptor-rooted crash fixture copy timed out",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn crash_copy_identity(file: &File) -> io::Result<(u64, u64, bool)> {
+    let metadata = file.metadata()?;
+    if metadata.ino() == 0 || (!metadata.is_dir() && !metadata.is_file()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "crash fixture entry has no stable regular-file or directory identity",
+        ));
+    }
+    Ok((metadata.dev(), metadata.ino(), metadata.is_dir()))
+}
+
+fn verify_crash_copy_entry(
+    parent: &File,
+    name: &OsStr,
+    retained: &File,
+    is_directory: bool,
+) -> io::Result<()> {
+    let retained_before = crash_copy_identity(retained)?;
+    if retained_before.2 != is_directory {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "retained crash fixture entry changed kind",
+        ));
+    }
+    let flags = if is_directory {
+        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NONBLOCK
+    } else {
+        libc::O_RDONLY | libc::O_NONBLOCK
+    };
+    let visible = openat_nofollow(parent, name, flags, 0)?;
+    if crash_copy_identity(&visible)? != retained_before
+        || crash_copy_identity(retained)? != retained_before
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "crash fixture entry changed identity during copy",
+        ));
+    }
+    Ok(())
+}
+
+fn create_crash_copy_directory(parent: &File, name: &OsStr) -> io::Result<File> {
+    let name_c = c_name(name, "crash fixture destination directory")?;
+    let status = unsafe { libc::mkdirat(parent.as_raw_fd(), name_c.as_ptr(), 0o700) };
+    if status != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    openat_nofollow(
+        parent,
+        name,
+        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NONBLOCK,
+        0,
+    )
+}
+
+fn copy_crash_regular_file(
+    source_parent: &File,
+    destination_parent: &File,
+    name: &OsStr,
+    deadline: Instant,
+    budget: &mut CopyBudget,
+) -> io::Result<()> {
+    let mut source = openat_nofollow(source_parent, name, libc::O_RDONLY | libc::O_NONBLOCK, 0)?;
+    let before = source.metadata()?;
+    if !before.is_file() || before.nlink() == 0 || before.len() > MAX_COPY_FILE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "crash fixture source is not a bounded linked regular file",
+        ));
+    }
+    budget.total_bytes = budget
+        .total_bytes
+        .checked_add(before.len())
+        .ok_or_else(|| io::Error::from_raw_os_error(libc::EFBIG))?;
+    if budget.total_bytes > MAX_COPY_TOTAL_BYTES {
+        return Err(io::Error::from_raw_os_error(libc::EFBIG));
+    }
+    let mut destination = openat_nofollow(
+        destination_parent,
+        name,
+        libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+        0o600,
+    )?;
+    let mut copied = 0u64;
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        ensure_copy_deadline(deadline)?;
+        let read = source.read(&mut buffer)?;
+        ensure_copy_deadline(deadline)?;
+        if read == 0 {
+            break;
+        }
+        copied = copied
+            .checked_add(read as u64)
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::EFBIG))?;
+        if copied > before.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "crash fixture source grew while being copied",
+            ));
+        }
+        destination.write_all(&buffer[..read])?;
+    }
+    let after = source.metadata()?;
+    if copied != before.len()
+        || !after.is_file()
+        || after.nlink() != before.nlink()
+        || after.len() != before.len()
+        || (after.dev(), after.ino()) != (before.dev(), before.ino())
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "crash fixture source changed while being copied",
+        ));
+    }
+    destination.sync_all()?;
+    let destination_metadata = destination.metadata()?;
+    if !destination_metadata.is_file()
+        || destination_metadata.nlink() != 1
+        || destination_metadata.len() != copied
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "crash fixture destination changed before its file sync completed",
+        ));
+    }
+    verify_crash_copy_entry(source_parent, name, &source, false)?;
+    verify_crash_copy_entry(destination_parent, name, &destination, false)
+}
+
+fn snapshot_crash_regular_file(
+    parent: &File,
+    name: &OsStr,
+    deadline: Instant,
+    budget: &mut CopyBudget,
+) -> io::Result<CrashCopySnapshotEntry> {
+    let mut file = openat_nofollow(parent, name, libc::O_RDONLY | libc::O_NONBLOCK, 0)?;
+    let before = file.metadata()?;
+    if !before.is_file() || before.nlink() == 0 || before.len() > MAX_COPY_FILE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "crash fixture snapshot encountered an unbounded or unlinked non-regular file",
+        ));
+    }
+    budget.total_bytes = budget
+        .total_bytes
+        .checked_add(before.len())
+        .ok_or_else(|| io::Error::from_raw_os_error(libc::EFBIG))?;
+    if budget.total_bytes > MAX_COPY_TOTAL_BYTES {
+        return Err(io::Error::from_raw_os_error(libc::EFBIG));
+    }
+
+    let mut hasher = Blake2s256::new();
+    let mut read_total = 0u64;
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        ensure_copy_deadline(deadline)?;
+        let read = file.read(&mut buffer)?;
+        ensure_copy_deadline(deadline)?;
+        if read == 0 {
+            break;
+        }
+        read_total = read_total
+            .checked_add(read as u64)
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::EFBIG))?;
+        if read_total > before.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "crash fixture snapshot source grew while it was read",
+            ));
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let after = file.metadata()?;
+    if read_total != before.len()
+        || !after.is_file()
+        || after.nlink() != before.nlink()
+        || after.len() != before.len()
+        || (after.dev(), after.ino()) != (before.dev(), before.ino())
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "crash fixture snapshot file changed while it was read",
+        ));
+    }
+    verify_crash_copy_entry(parent, name, &file, false)?;
+    Ok(CrashCopySnapshotEntry::File {
+        len: before.len(),
+        links: before.nlink(),
+        digest: hasher.finalize().into(),
+    })
+}
+
+fn snapshot_crash_directory_contents(
+    source: &File,
+    relative: &Path,
+    depth: usize,
+    deadline: Instant,
+    budget: &mut CopyBudget,
+    snapshot: &mut CrashCopySnapshot,
+) -> io::Result<()> {
+    if depth > MAX_COPY_DEPTH {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "crash fixture snapshot exceeded its directory depth limit",
+        ));
+    }
+    ensure_copy_deadline(deadline)?;
+    for_each_directory_entry_name(source, |name| {
+        ensure_copy_deadline(deadline)?;
+        budget.entries = budget
+            .entries
+            .checked_add(1)
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::EFBIG))?;
+        if budget.entries > MAX_COPY_ENTRIES {
+            return Err(io::Error::from_raw_os_error(libc::EFBIG));
+        }
+        let child_relative = relative.join(name);
+        let entry = match openat_nofollow(
+            source,
+            name,
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NONBLOCK,
+            0,
+        ) {
+            Ok(source_child) => {
+                verify_crash_copy_entry(source, name, &source_child, true)?;
+                snapshot_crash_directory_contents(
+                    &source_child,
+                    &child_relative,
+                    depth + 1,
+                    deadline,
+                    budget,
+                    snapshot,
+                )?;
+                verify_crash_copy_entry(source, name, &source_child, true)?;
+                CrashCopySnapshotEntry::Directory
+            }
+            Err(error) if error.raw_os_error() == Some(libc::ENOTDIR) => {
+                snapshot_crash_regular_file(source, name, deadline, budget)?
+            }
+            Err(error) => return Err(error),
+        };
+        if snapshot.insert(child_relative, entry).is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "crash fixture snapshot repeated one relative path",
+            ));
+        }
+        Ok(())
+    })
+}
+
+fn snapshot_crash_directory(source: &File, deadline: Instant) -> io::Result<CrashCopySnapshot> {
+    let mut budget = CopyBudget::default();
+    let mut snapshot = BTreeMap::new();
+    snapshot_crash_directory_contents(
+        source,
+        Path::new(""),
+        0,
+        deadline,
+        &mut budget,
+        &mut snapshot,
+    )?;
+    Ok(snapshot)
+}
+
+fn verify_crash_copy_snapshots(
+    source: &CrashCopySnapshot,
+    destination: &CrashCopySnapshot,
+) -> io::Result<()> {
+    if source.len() != destination.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "crash fixture destination inventory differs from its stable source",
+        ));
+    }
+    for (path, source_entry) in source {
+        let Some(destination_entry) = destination.get(path) else {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("crash fixture destination omitted {path:?}"),
+            ));
+        };
+        let matches = match (source_entry, destination_entry) {
+            (CrashCopySnapshotEntry::Directory, CrashCopySnapshotEntry::Directory) => true,
+            (
+                CrashCopySnapshotEntry::File {
+                    len: source_len,
+                    digest: source_digest,
+                    ..
+                },
+                CrashCopySnapshotEntry::File {
+                    len: destination_len,
+                    links: 1,
+                    digest: destination_digest,
+                },
+            ) => source_len == destination_len && source_digest == destination_digest,
+            _ => false,
+        };
+        if !matches {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("crash fixture destination changed type or bytes at {path:?}"),
+            ));
         }
     }
-    File::open(destination)
-        .expect("open copied crash baseline directory")
-        .sync_all()
-        .expect("sync copied crash baseline directory");
+    Ok(())
+}
+
+fn copy_crash_directory_contents(
+    source: &File,
+    destination: &File,
+    depth: usize,
+    deadline: Instant,
+    budget: &mut CopyBudget,
+) -> io::Result<()> {
+    if depth > MAX_COPY_DEPTH {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "crash fixture copy exceeded its directory depth limit",
+        ));
+    }
+    ensure_copy_deadline(deadline)?;
+    for_each_directory_entry_name(source, |name| {
+        ensure_copy_deadline(deadline)?;
+        budget.entries = budget
+            .entries
+            .checked_add(1)
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::EFBIG))?;
+        if budget.entries > MAX_COPY_ENTRIES {
+            return Err(io::Error::from_raw_os_error(libc::EFBIG));
+        }
+        match openat_nofollow(
+            source,
+            name,
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NONBLOCK,
+            0,
+        ) {
+            Ok(source_child) => {
+                let destination_child = create_crash_copy_directory(destination, name)?;
+                verify_crash_copy_entry(source, name, &source_child, true)?;
+                verify_crash_copy_entry(destination, name, &destination_child, true)?;
+                copy_crash_directory_contents(
+                    &source_child,
+                    &destination_child,
+                    depth + 1,
+                    deadline,
+                    budget,
+                )?;
+                destination_child.sync_all()?;
+                verify_crash_copy_entry(source, name, &source_child, true)?;
+                verify_crash_copy_entry(destination, name, &destination_child, true)
+            }
+            Err(error) if error.raw_os_error() == Some(libc::ENOTDIR) => {
+                copy_crash_regular_file(source, destination, name, deadline, budget)
+            }
+            Err(error) => Err(error),
+        }
+    })?;
+    destination.sync_all()
+}
+
+fn copy_directory_durable_at(
+    parent: &File,
+    source_name: &OsStr,
+    destination_name: &OsStr,
+) -> io::Result<()> {
+    if source_name == destination_name {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "crash fixture copy requires distinct source and destination names",
+        ));
+    }
+    let deadline = Instant::now()
+        .checked_add(COPY_TIMEOUT)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid copy timeout"))?;
+    let source_directory = openat_nofollow(
+        parent,
+        source_name,
+        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NONBLOCK,
+        0,
+    )?;
+    let source_identity = crash_copy_identity(&source_directory)?;
+    let source_before = snapshot_crash_directory(&source_directory, deadline)?;
+    let destination_directory = create_crash_copy_directory(parent, destination_name)?;
+    let mut budget = CopyBudget::default();
+    copy_crash_directory_contents(
+        &source_directory,
+        &destination_directory,
+        0,
+        deadline,
+        &mut budget,
+    )?;
+    destination_directory.sync_all()?;
+    parent.sync_all()?;
+    let source_after = snapshot_crash_directory(&source_directory, deadline)?;
+    if source_after != source_before {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "crash fixture source inventory or bytes changed during durable copy",
+        ));
+    }
+    drop(source_after);
+    let destination_snapshot = snapshot_crash_directory(&destination_directory, deadline)?;
+    verify_crash_copy_snapshots(&source_before, &destination_snapshot)?;
+    verify_crash_copy_entry(parent, destination_name, &destination_directory, true)?;
+    verify_crash_copy_entry(parent, source_name, &source_directory, true)?;
+    if crash_copy_identity(&source_directory)? != source_identity {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "crash fixture source root changed identity during copy",
+        ));
+    }
+    Ok(())
+}
+
+fn copy_directory_durable(source: &Path, destination: &Path) {
+    let result = (|| -> io::Result<()> {
+        let source_parent = source.parent().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "crash fixture source has no parent",
+            )
+        })?;
+        let destination_parent = destination.parent().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "crash fixture destination has no parent",
+            )
+        })?;
+        if source_parent != destination_parent {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "crash fixture source and destination must share one pinned parent",
+            ));
+        }
+        let source_name = source.file_name().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "crash fixture source has no final component",
+            )
+        })?;
+        let destination_name = destination.file_name().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "crash fixture destination has no final component",
+            )
+        })?;
+        let parent = open_directory_nofollow(source_parent)?;
+        copy_directory_durable_at(&parent, source_name, destination_name)
+    })();
+    result.unwrap_or_else(|error| {
+        panic!(
+            "descriptor-rooted durable copy {} -> {} failed closed: {error}",
+            source.display(),
+            destination.display()
+        )
+    });
 }
 
 fn create_baseline(path: &Path) {
@@ -893,22 +1377,65 @@ fn subprocess_crash_child() {
     }
 }
 
-fn trace_normal_write(baseline: &Path, trace: &Path) -> Vec<DurabilityCheckpoint> {
-    copy_directory_durable(baseline, trace);
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CrashMatrixRetention {
+    RemoveLocalFixtures,
+    PreserveProviderEvidence,
+}
+
+struct CrashMatrixRoot<'a> {
+    path: &'a Path,
+    capability: Option<&'a File>,
+}
+
+impl CrashMatrixRoot<'_> {
+    fn copy(&self, source: &Path, destination: &Path) {
+        assert_eq!(source.parent(), Some(self.path));
+        assert_eq!(destination.parent(), Some(self.path));
+        if let Some(capability) = self.capability {
+            let source_name = source.file_name().expect("crash copy source name");
+            let destination_name = destination
+                .file_name()
+                .expect("crash copy destination name");
+            copy_directory_durable_at(capability, source_name, destination_name).unwrap_or_else(
+                |error| {
+                    panic!(
+                        "capability-rooted durable copy {} -> {} failed closed: {error}",
+                        source.display(),
+                        destination.display()
+                    )
+                },
+            );
+        } else {
+            copy_directory_durable(source, destination);
+        }
+    }
+}
+
+fn trace_normal_write(
+    matrix: &CrashMatrixRoot<'_>,
+    baseline: &Path,
+    trace: &Path,
+    retention: CrashMatrixRetention,
+) -> Vec<DurabilityCheckpoint> {
+    matrix.copy(baseline, trace);
     let recorder = FaultInjectionGuard::record();
     normal_write_commit(trace).expect("trace complete normal v2 write");
     let checkpoints = recorder.checkpoints();
     drop(recorder);
-    fs::remove_dir_all(trace).expect("remove successful normal-write trace");
+    if retention == CrashMatrixRetention::RemoveLocalFixtures {
+        fs::remove_dir_all(trace).expect("remove successful normal-write trace");
+    }
     checkpoints
 }
 
 fn prepare_pending_recovery(
+    matrix: &CrashMatrixRoot<'_>,
     baseline: &Path,
     pending: &Path,
     normal_checkpoints: &[DurabilityCheckpoint],
 ) {
-    copy_directory_durable(baseline, pending);
+    matrix.copy(baseline, pending);
     let manifest_publish = normal_checkpoints
         .iter()
         .position(|checkpoint| {
@@ -929,8 +1456,13 @@ fn prepare_pending_recovery(
     );
 }
 
-fn trace_recovery(pending: &Path, trace: &Path) -> Vec<DurabilityCheckpoint> {
-    copy_directory_durable(pending, trace);
+fn trace_recovery(
+    matrix: &CrashMatrixRoot<'_>,
+    pending: &Path,
+    trace: &Path,
+    retention: CrashMatrixRetention,
+) -> Vec<DurabilityCheckpoint> {
+    matrix.copy(pending, trace);
     let recorder = FaultInjectionGuard::record();
     assert!(
         recover(trace, &test_key(), &kdf_fingerprint()).expect("trace complete v2 recovery"),
@@ -938,7 +1470,9 @@ fn trace_recovery(pending: &Path, trace: &Path) -> Vec<DurabilityCheckpoint> {
     );
     let checkpoints = recorder.checkpoints();
     drop(recorder);
-    fs::remove_dir_all(trace).expect("remove successful recovery trace");
+    if retention == CrashMatrixRetention::RemoveLocalFixtures {
+        fs::remove_dir_all(trace).expect("remove successful recovery trace");
+    }
     checkpoints
 }
 
@@ -984,11 +1518,20 @@ fn assert_checkpoint_count(label: &str, checkpoints: &[DurabilityCheckpoint], ex
     );
 }
 
-fn run_process_crash_matrix(suite: &Path) {
+fn run_process_crash_matrix(
+    suite: &Path,
+    suite_capability: Option<&File>,
+    retention: CrashMatrixRetention,
+) {
+    let matrix = CrashMatrixRoot {
+        path: suite,
+        capability: suite_capability,
+    };
     let baseline = suite.join("baseline");
     create_baseline(&baseline);
 
-    let normal_checkpoints = trace_normal_write(&baseline, &suite.join("normal-trace"));
+    let normal_checkpoints =
+        trace_normal_write(&matrix, &baseline, &suite.join("normal-trace"), retention);
     assert_normal_checkpoint_coverage(&normal_checkpoints);
     assert_checkpoint_count("normal write", &normal_checkpoints, 46);
     checkpoint_with_context(
@@ -1018,18 +1561,26 @@ fn run_process_crash_matrix(suite: &Path) {
     for (offset, expected) in normal_checkpoints.iter().enumerate() {
         let checkpoint = offset + 1;
         let crashed = suite.join(format!("normal-{checkpoint:03}"));
-        copy_directory_durable(&baseline, &crashed);
+        matrix.copy(&baseline, &crashed);
         let output = kill_child(&crashed, checkpoint, expected);
         assert_sigkill(&output, checkpoint, expected);
-        install_provider_conflict_evidence(&crashed);
-        verify_child(&crashed, &baseline, "verify-conflict");
-        remove_provider_conflict_after_verification(&crashed);
+        if retention == CrashMatrixRetention::PreserveProviderEvidence {
+            let conflicted = suite.join(format!("normal-conflict-{checkpoint:03}"));
+            matrix.copy(&crashed, &conflicted);
+            install_provider_conflict_evidence(&conflicted);
+            verify_child(&conflicted, &baseline, "verify-conflict");
+        } else {
+            install_provider_conflict_evidence(&crashed);
+            verify_child(&crashed, &baseline, "verify-conflict");
+            remove_provider_conflict_after_verification(&crashed);
+        }
         verify_child(&crashed, &baseline, "verify-commit");
     }
 
     let pending = suite.join("recovery-pending");
-    prepare_pending_recovery(&baseline, &pending, &normal_checkpoints);
-    let recovery_checkpoints = trace_recovery(&pending, &suite.join("recovery-trace"));
+    prepare_pending_recovery(&matrix, &baseline, &pending, &normal_checkpoints);
+    let recovery_checkpoints =
+        trace_recovery(&matrix, &pending, &suite.join("recovery-trace"), retention);
     assert_recovery_checkpoint_coverage(&recovery_checkpoints);
     assert_checkpoint_count("normal-write recovery", &recovery_checkpoints, 18);
     for context in [
@@ -1048,14 +1599,149 @@ fn run_process_crash_matrix(suite: &Path) {
     for (offset, expected) in recovery_checkpoints.iter().enumerate() {
         let checkpoint = offset + 1;
         let crashed = suite.join(format!("recovery-{checkpoint:03}"));
-        copy_directory_durable(&pending, &crashed);
+        matrix.copy(&pending, &crashed);
         let output = kill_recovery_child(&crashed, checkpoint, expected);
         assert_sigkill(&output, checkpoint, expected);
-        install_provider_conflict_evidence(&crashed);
-        verify_child(&crashed, &baseline, "verify-conflict");
-        remove_provider_conflict_after_verification(&crashed);
+        if retention == CrashMatrixRetention::PreserveProviderEvidence {
+            let conflicted = suite.join(format!("recovery-conflict-{checkpoint:03}"));
+            matrix.copy(&crashed, &conflicted);
+            install_provider_conflict_evidence(&conflicted);
+            verify_child(&conflicted, &baseline, "verify-conflict");
+        } else {
+            install_provider_conflict_evidence(&crashed);
+            verify_child(&crashed, &baseline, "verify-conflict");
+            remove_provider_conflict_after_verification(&crashed);
+        }
         verify_child(&crashed, &baseline, "verify-recovery");
     }
+}
+
+#[cfg(target_os = "macos")]
+fn verify_materialized_process_crash_matrix(suite: &Path) {
+    let baseline = suite.join("baseline");
+    ensure_no_index_siblings(&baseline)
+        .expect("materialized iCloud baseline has no provider conflict sibling");
+    let (baseline_index, _) =
+        load(&baseline, &test_key()).expect("authenticate materialized iCloud baseline");
+    assert_eq!(baseline_index, index_with_empty_file(FILE_NAME));
+    validate_reachable_v2_files(&baseline, &test_key(), &baseline_index)
+        .expect("authenticate every materialized iCloud baseline object");
+
+    let mut cases = vec![
+        suite.join("normal-trace"),
+        suite.join("recovery-pending"),
+        suite.join("recovery-trace"),
+    ];
+    cases.extend((1..=46).map(|checkpoint| suite.join(format!("normal-{checkpoint:03}"))));
+    cases.extend((1..=18).map(|checkpoint| suite.join(format!("recovery-{checkpoint:03}"))));
+    for case in cases {
+        ensure_no_index_siblings(&case).unwrap_or_else(|error| {
+            panic!(
+                "materialized iCloud crash case {} contains provider conflict evidence: {error}",
+                case.display()
+            )
+        });
+        verify_crash_visible_generation(&case, &baseline);
+    }
+    let mut conflict_cases: Vec<_> = (1..=46)
+        .map(|checkpoint| suite.join(format!("normal-conflict-{checkpoint:03}")))
+        .collect();
+    conflict_cases.extend(
+        (1..=18).map(|checkpoint| suite.join(format!("recovery-conflict-{checkpoint:03}"))),
+    );
+    for case in conflict_cases {
+        verify_conflict_evidence(&case);
+        verify_crash_visible_generation(&case, &baseline);
+    }
+}
+
+#[test]
+fn conflicted_crash_state_authenticates_without_unlinking_evidence() {
+    let id = TEST_ID.fetch_add(1, Ordering::Relaxed);
+    let suite = PathBuf::from(format!(
+        "target/test-v2-retained-conflict-{}-{id}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&suite);
+    fs::create_dir_all(&suite).unwrap();
+    let baseline = suite.join("baseline");
+    let conflicted = suite.join("conflicted");
+    create_baseline(&baseline);
+    copy_directory_durable(&baseline, &conflicted);
+    install_provider_conflict_evidence(&conflicted);
+
+    verify_conflict_evidence(&conflicted);
+    assert!(!verify_crash_visible_generation(&conflicted, &baseline));
+    assert_eq!(
+        fs::read(conflicted.join(CONFLICT_SIBLING_NAME)).unwrap(),
+        CONFLICT_SIBLING_BYTES
+    );
+    fs::remove_dir_all(suite).unwrap();
+}
+
+#[test]
+fn descriptor_rooted_crash_copy_is_byte_exact_and_rejects_symlinks() {
+    use std::os::unix::fs::symlink;
+
+    const PAYLOAD: &[u8] = b"descriptor-rooted byte-exact fixture";
+    let id = TEST_ID.fetch_add(1, Ordering::Relaxed);
+    let suite = PathBuf::from(format!(
+        "target/test-v2-descriptor-copy-{}-{id}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&suite);
+    fs::create_dir_all(suite.join("clean-source/nested")).unwrap();
+    fs::write(suite.join("clean-source/nested/payload.bin"), PAYLOAD).unwrap();
+    fs::create_dir_all(suite.join("bad-source")).unwrap();
+    fs::write(suite.join("outside-secret.bin"), b"must never be followed").unwrap();
+    symlink(
+        suite.join("outside-secret.bin").canonicalize().unwrap(),
+        suite.join("bad-source/provider-link"),
+    )
+    .unwrap();
+
+    let root = open_directory_nofollow(&suite).unwrap();
+    copy_directory_durable_at(&root, OsStr::new("clean-source"), OsStr::new("clean-copy")).unwrap();
+    assert_eq!(
+        fs::read(suite.join("clean-copy/nested/payload.bin")).unwrap(),
+        PAYLOAD
+    );
+    let deadline = Instant::now() + COPY_TIMEOUT;
+    let source = openat_nofollow(
+        &root,
+        OsStr::new("clean-source"),
+        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NONBLOCK,
+        0,
+    )
+    .unwrap();
+    let destination = openat_nofollow(
+        &root,
+        OsStr::new("clean-copy"),
+        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NONBLOCK,
+        0,
+    )
+    .unwrap();
+    let copied_snapshot = snapshot_crash_directory(&destination, deadline).unwrap();
+    fs::write(
+        suite.join("clean-source/nested/payload.bin"),
+        vec![b'x'; PAYLOAD.len()],
+    )
+    .unwrap();
+    let changed_source = snapshot_crash_directory(&source, deadline).unwrap();
+    assert!(verify_crash_copy_snapshots(&changed_source, &copied_snapshot).is_err());
+
+    let error = copy_directory_durable_at(&root, OsStr::new("bad-source"), OsStr::new("bad-copy"))
+        .unwrap_err();
+    assert!(
+        matches!(error.raw_os_error(), Some(libc::ELOOP) | Some(libc::EMLINK)),
+        "unexpected symlink rejection error: {error}"
+    );
+    assert!(!suite.join("bad-copy/provider-link").exists());
+    assert_eq!(
+        fs::read(suite.join("outside-secret.bin")).unwrap(),
+        b"must never be followed"
+    );
+    fs::remove_dir_all(suite).unwrap();
 }
 
 fn assert_operation_checkpoint_coverage(label: &str, checkpoints: &[DurabilityCheckpoint]) {
@@ -1588,7 +2274,7 @@ fn decode_mountinfo(value: &str) -> Vec<u8> {
 #[ignore = "requires explicit opt-in and a real APFS test directory"]
 fn subprocess_sigkill_v2_durability_apfs() {
     let suite = configured_suite_root("apfs");
-    run_process_crash_matrix(&suite);
+    run_process_crash_matrix(&suite, None, CrashMatrixRetention::RemoveLocalFixtures);
     fs::remove_dir_all(&suite).expect("remove successful APFS process crash suite");
 }
 
@@ -1610,12 +2296,54 @@ fn subprocess_sigkill_v1_to_v2_migration_apfs() {
     fs::remove_dir_all(&suite).expect("remove successful APFS migration process crash suite");
 }
 
+/// Runs the complete normal-write and recovery SIGKILL matrix through a real
+/// iCloud Drive File Provider folder. This is still a local process-crash test:
+/// waiting for upload completion afterward does not simulate remote-provider
+/// reordering or prove atomic visibility on another Mac.
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "requires an explicit disposable iCloud folder marked Keep Downloaded"]
+fn subprocess_sigkill_v2_durability_icloud() {
+    let suite = crate::macos_integration_tests::IcloudTestSuite::create_keep_downloaded("sigkill");
+    let filesystem = filesystem_type(suite.path()).unwrap_or_else(|error| {
+        panic!(
+            "identify filesystem for {}: {error}",
+            suite.path().display()
+        )
+    });
+    assert_eq!(
+        filesystem, "apfs",
+        "real iCloud durability gate requires APFS, found {filesystem}"
+    );
+    suite.await_materialized_and_uploaded();
+    suite.verify_owned_child();
+    run_process_crash_matrix(
+        suite.path(),
+        Some(suite.capability()),
+        CrashMatrixRetention::PreserveProviderEvidence,
+    );
+    let before_provider_settle = suite.capture_tree_snapshot();
+    suite.await_materialized_and_uploaded();
+    let after_provider_settle = suite.capture_tree_snapshot();
+    assert_eq!(
+        after_provider_settle, before_provider_settle,
+        "iCloud changed an exact name, type, size, link count, or byte digest while the SIGKILL suite settled"
+    );
+    verify_materialized_process_crash_matrix(suite.path());
+    assert_eq!(
+        suite.capture_tree_snapshot(),
+        before_provider_settle,
+        "iCloud changed the exact SIGKILL suite during post-settle authentication"
+    );
+    suite.finish_and_preserve();
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 #[ignore = "requires explicit opt-in and a real ext4 test directory"]
 fn subprocess_sigkill_v2_durability_ext4() {
     let suite = configured_suite_root("ext4");
-    run_process_crash_matrix(&suite);
+    run_process_crash_matrix(&suite, None, CrashMatrixRetention::RemoveLocalFixtures);
     fs::remove_dir_all(&suite).expect("remove successful ext4 process crash suite");
 }
 

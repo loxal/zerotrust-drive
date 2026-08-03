@@ -2,11 +2,11 @@
 
 //! Capability-rooted backing-store access and macOS coordination primitives.
 //!
-//! This module is deliberately not wired into production commands yet. A
-//! coordinated store is safe only after every backing path has been moved
-//! behind `StoreRoot`; partial coordination would advertise a guarantee the
-//! process does not provide. The direct implementation and native shim are a
-//! tested foundation for that later mechanical extraction. Coordinators for
+//! The direct backend is wired only for pinned v2 immutable-object
+//! publication. macOS coordinated mode remains deliberately disabled until
+//! every backing path has moved behind `StoreRoot`; partial coordination would
+//! advertise a guarantee the process does not provide. The native shim remains
+//! a tested foundation for that later mechanical extraction. Coordinators for
 //! one store share a purpose identifier to avoid lock inversion inside the
 //! process. Each `StoreRoot` serializes its own accessors, but callers must
 //! acquire the existing process-wide one-writer/persistence lock first because
@@ -210,6 +210,14 @@ pub(crate) struct StoreEntry {
     relative_path: RelativeStorePath,
 }
 
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ExactStoreOperation {
+    pub(crate) path: PathBuf,
+    pub(crate) is_directory: bool,
+    pub(crate) intent: AccessIntent,
+}
+
 impl StoreEntry {
     pub(crate) fn parent(&self) -> &DirCap {
         &self.parent
@@ -240,6 +248,8 @@ pub(crate) struct StoreRoot {
     identity: DirectoryIdentity,
     coordination: Coordination,
     operation_guard: Mutex<()>,
+    #[cfg(test)]
+    exact_one_operations: Mutex<Vec<ExactStoreOperation>>,
 }
 
 struct StoreOperationGuard<'a> {
@@ -283,6 +293,8 @@ impl StoreRoot {
             identity,
             coordination,
             operation_guard: Mutex::new(()),
+            #[cfg(test)]
+            exact_one_operations: Mutex::new(Vec::new()),
         };
         store.verify_root()?;
         Ok(store)
@@ -290,6 +302,11 @@ impl StoreRoot {
 
     pub(crate) fn presentation_root(&self) -> &Path {
         &self.presentation_root
+    }
+
+    #[cfg(test)]
+    pub(crate) fn exact_one_operations(&self) -> Vec<ExactStoreOperation> {
+        self.exact_one_operations.lock().unwrap().clone()
     }
 
     pub(crate) fn entry(&self, relative_path: RelativeStorePath) -> io::Result<StoreEntry> {
@@ -351,6 +368,15 @@ impl StoreRoot {
         let _operation_guard = self.lock_operations()?;
         self.ensure_entry_belongs(entry)?;
         let expected = self.presentation_root.join(entry.relative_path.as_path());
+        #[cfg(test)]
+        self.exact_one_operations
+            .lock()
+            .unwrap()
+            .push(ExactStoreOperation {
+                path: expected.clone(),
+                is_directory,
+                intent,
+            });
         self.coordination
             .coordinate_one(&expected, is_directory, intent, |adjusted| {
                 reject_adjusted_url(&expected, adjusted)?;

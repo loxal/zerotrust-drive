@@ -5,8 +5,172 @@
 #include "macos_file_coordination.h"
 
 #include <errno.h>
+#include <dispatch/dispatch.h>
 #include <stdlib.h>
 #include <string.h>
+
+@interface ZTDMovePresenterProbe : NSObject <NSFilePresenter>
+
+- (instancetype)initWithURL:(NSURL *)url;
+- (void)snapshotRelinquishWriterCount:(int32_t *)relinquish_writer_count
+                            moveCount:(int32_t *)move_count
+                  observedDestination:(NSURL **)observed_destination;
+- (BOOL)waitForMoveWithTimeoutMilliseconds:(uint64_t)timeout_millis;
+- (BOOL)waitForQueueDrainWithTimeoutMilliseconds:(uint64_t)timeout_millis;
+- (BOOL)snapshotCallbackFailureName:(NSString **)name reason:(NSString **)reason;
+- (void)recordCallbackException:(NSException *)exception;
+
+@end
+
+@implementation ZTDMovePresenterProbe {
+    NSURL *_presentedItemURL;
+    NSOperationQueue *_presentedItemOperationQueue;
+    NSLock *_stateLock;
+    dispatch_semaphore_t _moveSemaphore;
+    int32_t _relinquishWriterCount;
+    int32_t _moveCount;
+    NSURL *_observedDestination;
+    NSString *_callbackFailureName;
+    NSString *_callbackFailureReason;
+}
+
+- (instancetype)initWithURL:(NSURL *)url {
+    self = [super init];
+    if (self != nil) {
+        _presentedItemURL = [url copy];
+        _presentedItemOperationQueue = [[NSOperationQueue alloc] init];
+        _presentedItemOperationQueue.maxConcurrentOperationCount = 1;
+        _presentedItemOperationQueue.name = @"net.lifub.zerotrust-drive.presenter-probe";
+        _stateLock = [[NSLock alloc] init];
+        _moveSemaphore = dispatch_semaphore_create(0);
+    }
+    return self;
+}
+
+- (NSURL *)presentedItemURL {
+    [_stateLock lock];
+    NSURL *url = nil;
+    @try {
+        url = _presentedItemURL;
+    } @finally {
+        [_stateLock unlock];
+    }
+    return url;
+}
+
+- (NSOperationQueue *)presentedItemOperationQueue {
+    return _presentedItemOperationQueue;
+}
+
+- (void)relinquishPresentedItemToWriter:(void (^)(void (^ _Nullable)(void)))writer {
+    @try {
+        [_stateLock lock];
+        @try {
+            _relinquishWriterCount += 1;
+        } @finally {
+            [_stateLock unlock];
+        }
+        writer(nil);
+    } @catch (NSException *exception) {
+        [self recordCallbackException:exception];
+    }
+}
+
+- (void)presentedItemDidMoveToURL:(NSURL *)newURL {
+    @try {
+        NSURL *presented_url = [newURL copy];
+        NSURL *observed_destination = [newURL copy];
+        [_stateLock lock];
+        @try {
+            _presentedItemURL = presented_url;
+            _observedDestination = observed_destination;
+            _moveCount += 1;
+        } @finally {
+            [_stateLock unlock];
+        }
+        dispatch_semaphore_signal(_moveSemaphore);
+    } @catch (NSException *exception) {
+        [self recordCallbackException:exception];
+    }
+}
+
+- (void)recordCallbackException:(NSException *)exception {
+    @try {
+        NSString *name = [exception.name copy];
+        NSString *reason = [exception.reason copy];
+        [_stateLock lock];
+        @try {
+            _callbackFailureName = name;
+            _callbackFailureReason = reason;
+        } @finally {
+            [_stateLock unlock];
+        }
+    } @catch (NSException *recording_exception) {
+        (void)recording_exception;
+    } @finally {
+        dispatch_semaphore_signal(_moveSemaphore);
+    }
+}
+
+- (BOOL)waitForQueueDrainWithTimeoutMilliseconds:(uint64_t)timeout_millis {
+    if (timeout_millis > (uint64_t)INT64_MAX / NSEC_PER_MSEC) {
+        return NO;
+    }
+    dispatch_semaphore_t drained = dispatch_semaphore_create(0);
+    [_presentedItemOperationQueue addBarrierBlock:^{
+        dispatch_semaphore_signal(drained);
+    }];
+    dispatch_time_t deadline = dispatch_time(
+        DISPATCH_TIME_NOW, (int64_t)timeout_millis * NSEC_PER_MSEC);
+    return dispatch_semaphore_wait(drained, deadline) == 0;
+}
+
+- (BOOL)snapshotCallbackFailureName:(NSString **)name reason:(NSString **)reason {
+    [_stateLock lock];
+    BOOL failed = NO;
+    @try {
+        failed = _callbackFailureName != nil || _callbackFailureReason != nil;
+        if (name != NULL) {
+            *name = [_callbackFailureName copy];
+        }
+        if (reason != NULL) {
+            *reason = [_callbackFailureReason copy];
+        }
+    } @finally {
+        [_stateLock unlock];
+    }
+    return failed;
+}
+
+- (BOOL)waitForMoveWithTimeoutMilliseconds:(uint64_t)timeout_millis {
+    if (timeout_millis > (uint64_t)INT64_MAX / NSEC_PER_MSEC) {
+        return NO;
+    }
+    dispatch_time_t deadline = dispatch_time(
+        DISPATCH_TIME_NOW, (int64_t)timeout_millis * NSEC_PER_MSEC);
+    return dispatch_semaphore_wait(_moveSemaphore, deadline) == 0;
+}
+
+- (void)snapshotRelinquishWriterCount:(int32_t *)relinquish_writer_count
+                            moveCount:(int32_t *)move_count
+                  observedDestination:(NSURL **)observed_destination {
+    [_stateLock lock];
+    @try {
+        if (relinquish_writer_count != NULL) {
+            *relinquish_writer_count = _relinquishWriterCount;
+        }
+        if (move_count != NULL) {
+            *move_count = _moveCount;
+        }
+        if (observed_destination != NULL) {
+            *observed_destination = [_observedDestination copy];
+        }
+    } @finally {
+        [_stateLock unlock];
+    }
+}
+
+@end
 
 static void ztd_clear_error(ztd_mac_error *error) {
     if (error != NULL) {
@@ -580,6 +744,211 @@ static int32_t ztd_mac_start_download_impl(
     }
 }
 
+static int32_t ztd_mac_evict_ubiquitous_item_impl(
+    const uint8_t *path,
+    size_t path_len,
+    int32_t is_directory,
+    ztd_mac_error *error) {
+    ztd_clear_error(error);
+    @try {
+        NSURL *url = ztd_file_url(path, path_len, is_directory, error);
+        if (url == nil) {
+            return -1;
+        }
+        NSError *eviction_error = nil;
+        BOOL evicted = [[NSFileManager defaultManager]
+            evictUbiquitousItemAtURL:url
+                               error:&eviction_error];
+        if (!evicted) {
+            ztd_set_foundation_error(error, eviction_error);
+            return -1;
+        }
+        return 0;
+    } @catch (NSException *exception) {
+        ztd_set_error(
+            error,
+            ZTD_MAC_ERROR_EXCEPTION,
+            0,
+            exception.name,
+            exception.reason);
+        return -1;
+    }
+}
+
+static int32_t ztd_mac_probe_coordinated_move_impl(
+    const uint8_t *purpose,
+    size_t purpose_len,
+    const uint8_t *source_path,
+    size_t source_path_len,
+    int32_t source_is_directory,
+    const uint8_t *destination_path,
+    size_t destination_path_len,
+    int32_t destination_is_directory,
+    uint64_t timeout_millis,
+    ztd_mac_accessor accessor,
+    void *context,
+    ztd_mac_presenter_probe_result *result,
+    ztd_mac_error *error) {
+    ztd_clear_error(error);
+    if (result == NULL || timeout_millis == 0) {
+        ztd_set_error(
+            error,
+            ZTD_MAC_ERROR_INVALID_INPUT,
+            0,
+            @"zerotrust-drive",
+            @"presenter probe requires an output result and a nonzero timeout");
+        return -1;
+    }
+    memset(result, 0, sizeof(*result));
+
+    __block BOOL registered = NO;
+    __block int32_t outcome = -1;
+    ZTDMovePresenterProbe *probe = nil;
+    NSURL *destination = nil;
+    @try {
+        NSURL *source =
+            ztd_file_url(source_path, source_path_len, source_is_directory, error);
+        destination = ztd_file_url(
+            destination_path,
+            destination_path_len,
+            destination_is_directory,
+            error);
+        if (source == nil || destination == nil) {
+            return -1;
+        }
+
+        probe = [[ZTDMovePresenterProbe alloc] initWithURL:source];
+        if (probe == nil) {
+            ztd_set_error(
+                error,
+                ZTD_MAC_ERROR_INVALID_INPUT,
+                ENOMEM,
+                NSPOSIXErrorDomain,
+                @"cannot allocate the NSFilePresenter probe");
+            return -1;
+        }
+        [NSFileCoordinator addFilePresenter:probe];
+        registered = YES;
+
+        if (ztd_mac_coordinate_move_impl(
+                purpose,
+                purpose_len,
+                source_path,
+                source_path_len,
+                source_is_directory,
+                destination_path,
+                destination_path_len,
+                destination_is_directory,
+                accessor,
+                context,
+                error) != 0) {
+            return -1;
+        }
+
+        if (![probe waitForMoveWithTimeoutMilliseconds:timeout_millis]) {
+            ztd_set_error(
+                error,
+                ZTD_MAC_ERROR_TIMEOUT,
+                ETIMEDOUT,
+                NSPOSIXErrorDomain,
+                @"timed out waiting for NSFilePresenter move notification");
+            return -1;
+        }
+
+        outcome = 0;
+    } @catch (NSException *exception) {
+        ztd_set_error(
+            error,
+            ZTD_MAC_ERROR_EXCEPTION,
+            0,
+            exception.name,
+            exception.reason);
+        outcome = -1;
+    } @finally {
+        if (registered) {
+            @try {
+                [NSFileCoordinator removeFilePresenter:probe];
+                // Removal prevents new callbacks. A queued barrier observes
+                // completion without allowing a stuck callback to hang this
+                // test process forever.
+                BOOL drained =
+                    [probe waitForQueueDrainWithTimeoutMilliseconds:timeout_millis];
+                if (!drained && outcome == 0) {
+                    ztd_set_error(
+                        error,
+                        ZTD_MAC_ERROR_TIMEOUT,
+                        ETIMEDOUT,
+                        NSPOSIXErrorDomain,
+                        @"timed out draining the NSFilePresenter callback queue");
+                    outcome = -1;
+                }
+                if (drained) {
+                    NSString *callback_failure_name = nil;
+                    NSString *callback_failure_reason = nil;
+                    if ([probe snapshotCallbackFailureName:&callback_failure_name
+                                                    reason:&callback_failure_reason] &&
+                        outcome == 0) {
+                        ztd_set_error(
+                            error,
+                            ZTD_MAC_ERROR_EXCEPTION,
+                            0,
+                            callback_failure_name,
+                            callback_failure_reason);
+                        outcome = -1;
+                    }
+                }
+            } @catch (NSException *exception) {
+                ztd_set_error(
+                    error,
+                    ZTD_MAC_ERROR_EXCEPTION,
+                    0,
+                    exception.name,
+                    exception.reason);
+                outcome = -1;
+            }
+        }
+    }
+    if (outcome != 0) {
+        return -1;
+    }
+
+    @try {
+        NSURL *observed_destination = nil;
+        [probe snapshotRelinquishWriterCount:&result->relinquish_writer_count
+                                   moveCount:&result->move_count
+                         observedDestination:&observed_destination];
+        NSURL *resolved_observed = observed_destination.URLByResolvingSymlinksInPath;
+        NSURL *resolved_expected = destination.URLByResolvingSymlinksInPath;
+        const char *observed_path = resolved_observed.fileSystemRepresentation;
+        const char *expected_path = resolved_expected.fileSystemRepresentation;
+        result->destination_matches =
+            observed_path != NULL && expected_path != NULL &&
+            strcmp(observed_path, expected_path) == 0;
+        if (result->destination_matches == 0) {
+            NSString *message = [NSString
+                stringWithFormat:@"NSFilePresenter observed move destination %@ instead of %@",
+                                 observed_destination.path,
+                                 destination.path];
+            ztd_set_error(
+                error,
+                ZTD_MAC_ERROR_ACCESSOR,
+                0,
+                @"zerotrust-drive",
+                message);
+            return -1;
+        }
+        return 0;
+    } @catch (NSException *exception) {
+        ztd_set_error(
+            error,
+            ZTD_MAC_ERROR_EXCEPTION,
+            0,
+            exception.name,
+            exception.reason);
+        return -1;
+    }
+}
+
 int32_t ztd_mac_coordinate_one(
     const uint8_t *purpose,
     size_t purpose_len,
@@ -683,5 +1052,48 @@ int32_t ztd_mac_start_download(
     ztd_mac_error *error) {
     @autoreleasepool {
         return ztd_mac_start_download_impl(path, path_len, is_directory, error);
+    }
+}
+
+int32_t ztd_mac_evict_ubiquitous_item(
+    const uint8_t *path,
+    size_t path_len,
+    int32_t is_directory,
+    ztd_mac_error *error) {
+    @autoreleasepool {
+        return ztd_mac_evict_ubiquitous_item_impl(
+            path, path_len, is_directory, error);
+    }
+}
+
+int32_t ztd_mac_probe_coordinated_move(
+    const uint8_t *purpose,
+    size_t purpose_len,
+    const uint8_t *source_path,
+    size_t source_path_len,
+    int32_t source_is_directory,
+    const uint8_t *destination_path,
+    size_t destination_path_len,
+    int32_t destination_is_directory,
+    uint64_t timeout_millis,
+    ztd_mac_accessor accessor,
+    void *context,
+    ztd_mac_presenter_probe_result *result,
+    ztd_mac_error *error) {
+    @autoreleasepool {
+        return ztd_mac_probe_coordinated_move_impl(
+            purpose,
+            purpose_len,
+            source_path,
+            source_path_len,
+            source_is_directory,
+            destination_path,
+            destination_path_len,
+            destination_is_directory,
+            timeout_millis,
+            accessor,
+            context,
+            result,
+            error);
     }
 }
