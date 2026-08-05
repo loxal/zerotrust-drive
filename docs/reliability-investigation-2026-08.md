@@ -143,7 +143,8 @@ the locally rerun real APFS process-kill gate also pass unchanged at 46 normal-w
 recovery checkpoints. Coordinated mode must remain disabled until the rest of
 the inventory above is ported and passes the real iCloud gates.
 
-The implemented Rust/Objective-C boundary now provides:
+The implemented Rust/native boundary (Swift shim over the minimal
+Objective-C exception guard - see the shim-language section below) provides:
 
 - canonical presentation URLs paired with pinned no-follow directory
   descriptors and pre/post device-inode identity checks;
@@ -155,9 +156,9 @@ The implemented Rust/Objective-C boundary now provides:
 - rejection of Foundation-adjusted URLs, cross-kind or same-path moves,
   symlinked parents, ambiguous relative components, and recursive coordinated
   callbacks (which return `WouldBlock` instead of deadlocking);
-- Objective-C exception and Rust panic containment, autorelease pools on every
-  exported native call, and structured native error kind/domain/code/message;
-  and
+- NSException containment through the Objective-C guard, Rust panic
+  containment, autorelease pools on every exported native call, and structured
+  native error kind/domain/code/message; and
 - current iCloud ubiquity/materialization, transfer-error, and conflict queries
   plus an explicit start-download primitive.
 
@@ -301,6 +302,89 @@ backing store, iCloud remains a constrained macOS beta, and Proton remains
 experimental. The beta status cannot change until the fully wired path passes
 real iCloud-backed materialization, conflict, rename/exchange, recovery, and
 subprocess-kill tests.
+
+### Shim implementation language: Swift over a minimal Objective-C guard
+
+The shim logic was ported from Objective-C to Swift on 2026-08-05 at the
+user's direction. `src/macos_file_coordination.swift` now implements all
+seven C ABI entry points as `@_cdecl` exports against the unchanged
+`macos_file_coordination.h` contract, so `storage.rs` and the integration
+tests did not change their extern declarations. `build.rs` compiles it with
+`swiftc -swift-version 6 -parse-as-library -emit-library -static` (plus `-O`
+for release) against the bridging header `macos_swift_bridge.h`, and the
+resulting archive links before the Objective-C guard archive that the `cc`
+crate registers.
+
+The pre-port objections were tested on macOS 26.6 with Apple Swift 6.3.3
+before committing to the port, and the practical ones do not hold:
+
+- Runtime availability: the Swift runtime has been ABI stable and shipped by
+  the OS since macOS 10.14.4; probe binaries resolved
+  `/usr/lib/swift/libswiftCore.dylib` from the dyld shared cache with nothing
+  bundled, and autolink records resolved the runtime without explicit search
+  paths even under a plain `clang` driver link.
+- Swift 6 strict concurrency: the full shim, including the
+  `NSFilePresenter` probe class with `NSLock`-protected cross-queue state,
+  compiles under `-swift-version 6` with no warnings.
+
+One objection is real and is language level: Swift cannot catch
+`NSException`. Foundation's coordination, URL, and presenter APIs signal
+misuse by raising, and an exception that unwinds across the `extern "C"`
+boundary into Rust is undefined behavior. A probe confirmed the asymmetry:
+the same synthetic `[NSException raise:]` beneath a Swift frame terminated
+the process with `SIGABRT` (exit 134), while the identical exception under an
+Objective-C `@try`/`@catch` returned a normal error code. Aborting mid-commit
+is precisely the failure mode the root-last publication protocol exists to
+eliminate.
+
+The port therefore retains one deliberately minimal Objective-C file:
+`macos_exception_guard.m` exports `ztd_mac_exception_guard`, which runs a
+block under `@try`/`@catch` and converts a raised `NSException` into the
+structured `ZTD_MAC_ERROR_EXCEPTION` contract. Every Foundation call in the
+Swift shim runs lexically inside that guard; validation that cannot raise
+runs outside it so exact error contracts are preserved. A second probe proved
+the sandwich this design depends on: an `NSException` raised beneath Swift
+frames unwinds through them into the Objective-C `@catch`, the structured
+error is produced, and the process stays stable across repeated contained
+exceptions. Cleanups in the skipped Swift frames do not run - a bounded leak
+on the exceptional path only, which is exact parity with the previous
+all-Objective-C shim because ARC is not exception-safe without
+`-fobjc-arc-exceptions`. The regression test
+`macos_integration_tests::native_exception_beneath_swift_frames_is_contained_and_reported`
+pins the containment property from Rust through the production sandwich.
+
+Three defensive Objective-C branches were documented as unreachable and not
+ported: a nil return from `+[NSURL fileURLWithFileSystemRepresentation:]`
+and a NULL `-[NSURL fileSystemRepresentation]` (both nonnull API contracts
+whose failure Foundation signals by raising, which the guard converts), and
+the explicit `SIZE_MAX`/malloc-`ENOMEM` path (Swift allocation has no
+recoverable failure; lengths at or above 2^63 fail the same nonempty-path
+validation as invalid input instead).
+
+An adversarial five-lens review of the port (ABI/FFI, per-entry-point
+semantics, exception containment, presenter concurrency, build/link), each
+finding attacked by three independent refuters against the git-preserved
+Objective-C, confirmed exactly one defect: the initial `swiftc` invocation
+passed no `-target`, so the Swift archive silently targeted the build host's
+architecture and OS while the `cc`-built guard followed Cargo's `TARGET`,
+and `cargo build --target x86_64-apple-darwin` (which linked before the
+port) failed with every `ztd_mac_*` symbol undefined. The fix derives
+`-target <arch>-apple-macosx<deployment>` from Cargo's `TARGET` plus
+`MACOSX_DEPLOYMENT_TARGET` (floor 11.0), passes the same
+`-mmacosx-version-min` to the guard so one shim cannot carry two minos
+stamps, and adds the toolchain's `runtimeLibraryPaths` (from
+`swiftc -print-target-info`) to the link search path because deployment
+targets below the newest OS autolink static
+`libswiftCompatibility*.a` archives. Both the native arm64 build and the
+x86_64 cross-build now link, with all shim objects stamped minos 11.0.
+
+Post-port verification on the final code: the full deterministic suite,
+clippy with warnings denied, the byte-exact native coordination matrix, the
+`NSFilePresenter` move-notification probe, the x86_64-apple-darwin
+cross-link, and all three real APFS SIGKILL matrices (v2 durability, GC
+quarantine/restore, v1-to-v2 migration) pass against the Swift shim. The
+Linux builds are unaffected because the shim only compiles for macOS
+targets.
 
 ## Proton Drive provider evaluation
 

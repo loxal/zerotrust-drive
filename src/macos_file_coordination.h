@@ -1,4 +1,12 @@
 // Copyright 2026 Alex O <info@lifub.com>
+//
+// C ABI contract for the macOS file-coordination shim. The implementation
+// lives in macos_file_coordination.swift; every Foundation call there runs
+// under the Objective-C NSException guard in macos_exception_guard.m because
+// Swift cannot catch NSExceptions and one crossing the Rust boundary is
+// undefined behavior. Rust (storage.rs, macos_integration_tests.rs) declares
+// these exact prototypes; changing any signature here requires changing the
+// Swift @_cdecl exports and the Rust extern declarations together.
 
 #ifndef ZEROTRUST_DRIVE_MACOS_FILE_COORDINATION_H
 #define ZEROTRUST_DRIVE_MACOS_FILE_COORDINATION_H

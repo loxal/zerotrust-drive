@@ -113,6 +113,8 @@ unsafe extern "C" {
         is_directory: i32,
         error: *mut NativeError,
     ) -> i32;
+
+    fn ztd_mac_test_exception_containment(error: *mut NativeError) -> i32;
 }
 
 fn zeroed_native_error() -> NativeError {
@@ -271,6 +273,44 @@ fn ns_file_presenter_probe_observes_exact_descriptor_rooted_move() {
 
     state.root.sync_all().unwrap();
     drop(state);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+// The shim logic is Swift; only the exception guard remains Objective-C. This
+// regression proves the property that decision rests on: an NSException raised
+// beneath Swift frames must be contained by the guard and reported as a
+// structured error instead of aborting the process mid-commit.
+#[test]
+fn native_exception_beneath_swift_frames_is_contained_and_reported() {
+    for round in 0..3 {
+        let mut error = zeroed_native_error();
+        let status = unsafe { ztd_mac_test_exception_containment(&mut error) };
+        assert_eq!(status, -1, "round {round}");
+        assert_eq!(
+            error.kind,
+            3,
+            "round {round}: {}",
+            native_error_message(&error)
+        );
+        let text = native_error_message(&error);
+        assert!(text.contains("ZTDSyntheticTestException"), "{text}");
+        assert!(
+            text.contains("synthetic Foundation exception for containment tests"),
+            "{text}"
+        );
+    }
+
+    // The process must remain fully operational after repeated contained
+    // exceptions: a real Foundation call on a plain local file still returns a
+    // structured error (evicting a non-ubiquitous item fails cleanly).
+    let directory = local_test_directory("exception-containment");
+    let plain = directory.join("plain");
+    fs::write(&plain, b"local, never ubiquitous").unwrap();
+    let path = plain.as_os_str().as_bytes();
+    let mut error = zeroed_native_error();
+    let status = unsafe { ztd_mac_evict_ubiquitous_item(path.as_ptr(), path.len(), 0, &mut error) };
+    assert_eq!(status, -1, "{}", native_error_message(&error));
+    assert_eq!(error.kind, 1, "{}", native_error_message(&error));
     fs::remove_dir_all(directory).unwrap();
 }
 

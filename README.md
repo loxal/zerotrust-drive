@@ -61,7 +61,10 @@ iCloud Drive is a macOS-only beta target. Mark the complete encrypted backing fo
 **Keep Downloaded** before use. iCloud's File Provider placeholders and lack of a general
 user-facing pause-sync control make migration and recovery less predictable. A safe exact-URL,
 no-presenter `NSFileCoordinator` shim and capability-rooted storage boundary are implemented and
-tested. Pinned v2 immutable-object publication now uses the direct `StoreRoot` backend while
+tested. The shim is Swift over a minimal Objective-C exception guard; the guard stays
+Objective-C because Swift cannot catch the `NSException`s Foundation raises on misuse, and a
+regression test proves an exception raised beneath Swift frames is contained instead of
+aborting mid-commit. Pinned v2 immutable-object publication now uses the direct `StoreRoot` backend while
 retaining descriptor-rooted `openat` writes and the same write, file-fsync, and directory-fsync
 checkpoints. Coordinated production mode and every remaining backing path family are still
 disabled and unwired; enabling only partial coordination would give a false guarantee and can
