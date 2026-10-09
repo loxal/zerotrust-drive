@@ -1,6 +1,8 @@
+# SPDX-FileCopyrightText: Copyright 2026 Alexander Orlov <info@lifub.com>
+
 [package]
 name = "zerotrust-drive"
-version = "0.14.0"
+version = "0.14.1"
 license = "AGPL-3.0-only"
 edition = "2024"
 
