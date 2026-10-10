@@ -1,3 +1,5 @@
+<!-- SPDX-FileCopyrightText: Copyright 2026 Alexander Orlov <info@lifub.com> -->
+
 # ZeroTrust Drive
 
 FUSE-based encrypted overlay filesystem. You work with decrypted files in the mount directory
@@ -183,6 +185,14 @@ direct-StoreRoot, native-probe, and retained-iCloud-evidence changes in `0.13.0`
 validation only. The beta status is unchanged: live kernel-mounted FUSE coverage, complete File
 Provider coordination, current hosted filesystem gates, passing real iCloud-backed tests,
 remote-provider ordering, and safe evidence retirement remain open.
+
+Retired evidence to recheck before changing the v2 beta status:
+
+- `docs/reliability-investigation-2026-08.md` - ZeroTrust Drive reliability investigation: v2
+  durability findings, NSFileCoordinator and Proton Drive evaluations, the small-file measurement
+  recipe and inline-`FileRoot` format decision, and APFS/ext4 kill-matrix verification records,
+  2026-08-02 to 2026-08-05. Removed on 2026-10-10; read it with
+  `git show 3bf59c0ca463:docs/reliability-investigation-2026-08.md`.
 
 #### Opt-in iCloud integration gates
 
