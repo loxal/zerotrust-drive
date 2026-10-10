@@ -1,4 +1,4 @@
-// Copyright 2026 Alex O <info@lifub.com>
+// SPDX-FileCopyrightText: Copyright 2026 Alexander Orlov <info@lifub.com>
 
 //! Capability-rooted backing-store access and macOS coordination primitives.
 //!
@@ -633,6 +633,9 @@ impl StoreRoot {
 }
 
 impl Coordination {
+    // Only the macOS coordinator and the test fake read the directory flags and
+    // intents; a non-macOS release build has just the direct arm.
+    #[cfg_attr(not(any(target_os = "macos", test)), allow(unused_variables))]
     fn coordinate_one<T>(
         &self,
         path: &Path,
@@ -649,6 +652,9 @@ impl Coordination {
         }
     }
 
+    // Only the macOS coordinator and the test fake read the directory flags and
+    // intents; a non-macOS release build has just the direct arm.
+    #[cfg_attr(not(any(target_os = "macos", test)), allow(unused_variables))]
     #[allow(clippy::too_many_arguments)]
     fn coordinate_two<T>(
         &self,
@@ -685,6 +691,9 @@ impl Coordination {
         }
     }
 
+    // Only the macOS coordinator and the test fake read the directory flags and
+    // intents; a non-macOS release build has just the direct arm.
+    #[cfg_attr(not(any(target_os = "macos", test)), allow(unused_variables))]
     fn coordinate_move<T>(
         &self,
         source_path: &Path,

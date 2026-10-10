@@ -1,4 +1,4 @@
-// Copyright 2026 Alexander Orlov <alexander.orlov@loxal.net>
+// SPDX-FileCopyrightText: Copyright 2026 Alexander Orlov <info@lifub.com>
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsStr;
@@ -3822,8 +3822,12 @@ impl Filesystem for ZeroTrustFs {
             "FUSE: mknod parent={} name={:?} mode={:#o}",
             parent.0, name, mode
         );
-        let file_type = mode & libc::S_IFMT as u32;
-        if file_type != libc::S_IFREG as u32 && file_type != 0 {
+        // mode_t is u16 on macOS and u32 on Linux, so the casts matter on one
+        // platform and are no-ops on the other.
+        #[allow(clippy::unnecessary_cast)]
+        let (format_mask, regular) = (libc::S_IFMT as u32, libc::S_IFREG as u32);
+        let file_type = mode & format_mask;
+        if file_type != regular && file_type != 0 {
             reply.error(fuser::Errno::ENOSYS);
             return;
         }

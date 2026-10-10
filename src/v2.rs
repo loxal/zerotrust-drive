@@ -1,4 +1,4 @@
-// Copyright 2026 Alexander Orlov <alexander.orlov@loxal.net>
+// SPDX-FileCopyrightText: Copyright 2026 Alexander Orlov <info@lifub.com>
 
 //! Version 2 immutable-object storage.
 //!
@@ -907,13 +907,17 @@ fn from_hex<const N: usize>(value: &str) -> Option<[u8; N]> {
         return None;
     }
     let mut result = [0u8; N];
-    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+    // The exact-length check above guarantees an empty remainder.
+    let (pairs, []) = value.as_bytes().as_chunks::<2>() else {
+        return None;
+    };
+    for (index, &[high, low]) in pairs.iter().enumerate() {
         let nibble = |byte: u8| match byte {
             b'0'..=b'9' => Some(byte - b'0'),
             b'a'..=b'f' => Some(byte - b'a' + 10),
             _ => None,
         };
-        result[index] = (nibble(pair[0])? << 4) | nibble(pair[1])?;
+        result[index] = (nibble(high)? << 4) | nibble(low)?;
     }
     Some(result)
 }
@@ -4314,6 +4318,74 @@ mod tests {
 
         assert_eq!(names, vec![non_utf8]);
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The `from_hex` contract, written independently of the slice-chunking
+    /// API: exactly `2 * N` bytes, each pair decoded high-nibble-first from
+    /// lowercase hex digits only.
+    fn reference_from_hex<const N: usize>(value: &str) -> Option<[u8; N]> {
+        if value.len() != N * 2 {
+            return None;
+        }
+        let digit = |byte: u8| {
+            b"0123456789abcdef"
+                .iter()
+                .position(|&candidate| candidate == byte)
+                .map(|position| position as u8)
+        };
+        let bytes = value.as_bytes();
+        let mut result = [0u8; N];
+        for (index, slot) in result.iter_mut().enumerate() {
+            *slot = (digit(bytes[2 * index])? << 4) | digit(bytes[2 * index + 1])?;
+        }
+        Some(result)
+    }
+
+    #[test]
+    fn from_hex_matches_reference_decoder_including_odd_length_input() {
+        // Every two-character ASCII input, valid or not.
+        for high in 0u8..0x80 {
+            for low in 0u8..0x80 {
+                let value = String::from_utf8(vec![high, low]).unwrap();
+                assert_eq!(
+                    from_hex::<1>(&value),
+                    reference_from_hex::<1>(&value),
+                    "input {value:?}"
+                );
+            }
+        }
+
+        // Odd lengths can never satisfy the exact `2 * N` length check, so
+        // no trailing half-pair is ever decoded or silently dropped.
+        let id = [0x5au8; 16];
+        let id_hex = to_hex(&id);
+        for length in 0..=(id_hex.len() + 3) {
+            let value = "a".repeat(length);
+            assert_eq!(from_hex::<16>(&value), reference_from_hex::<16>(&value));
+            if length % 2 == 1 {
+                assert_eq!(from_hex::<16>(&value), None, "odd length {length}");
+            }
+        }
+        for odd in ["a", "abc", "0", "00f"] {
+            assert_eq!(from_hex::<1>(odd), None, "input {odd:?}");
+            assert_eq!(from_hex::<2>(odd), None, "input {odd:?}");
+        }
+        assert_eq!(from_hex::<16>(&id_hex[..31]), None);
+        assert_eq!(from_hex::<16>(&format!("{id_hex}0")), None);
+
+        // Known values, round trips, and rejected spellings.
+        assert_eq!(from_hex::<4>("00ff7a10"), Some([0x00, 0xff, 0x7a, 0x10]));
+        assert_eq!(from_hex::<0>(""), Some([]));
+        assert_eq!(from_hex::<16>(&id_hex), Some(id));
+        let digest: [u8; 32] = std::array::from_fn(|index| index as u8 * 7);
+        assert_eq!(from_hex::<32>(&to_hex(&digest)), Some(digest));
+        for rejected in ["00FF7A10", "00ff7a1g", "+0ff7a10", " 0ff7a10"] {
+            assert_eq!(from_hex::<4>(rejected), None, "input {rejected:?}");
+            assert_eq!(from_hex::<4>(rejected), reference_from_hex::<4>(rejected));
+        }
+        // A two-byte UTF-8 scalar has the right byte length but no hex digits.
+        assert_eq!(from_hex::<1>("\u{e9}"), None);
+        assert_eq!(from_hex::<1>("\u{e9}"), reference_from_hex::<1>("\u{e9}"));
     }
 
     fn kdf_fingerprint() -> RecoveryFingerprint {
