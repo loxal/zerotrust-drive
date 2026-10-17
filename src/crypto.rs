@@ -1,4 +1,4 @@
-// Copyright 2026 Alexander Orlov <alexander.orlov@loxal.net>
+// SPDX-FileCopyrightText: Copyright 2026 Alexander Orlov <info@lifub.com>
 
 //! Key derivation + authenticated encryption for the encrypted store.
 //!
@@ -781,18 +781,26 @@ pub fn decrypt_bytes(key: &[u8; 32], data: &[u8], aad: &[u8]) -> Result<Vec<u8>,
 
 /// Encrypt an owned buffer in place, avoiding a second full-size allocation.
 /// The returned layout is identical to [`encrypt_bytes`].
-fn encrypt_bytes_owned(
+fn encrypt_bytes_owned(key: &[u8; 32], plaintext: Vec<u8>, aad: &[u8]) -> Result<Vec<u8>, String> {
+    let mut nonce_bytes = [0u8; XNONCE_LEN];
+    OsRng.fill_bytes(&mut nonce_bytes);
+    encrypt_bytes_owned_with_nonce(key, plaintext, aad, nonce_bytes)
+}
+
+/// Deterministic core of [`encrypt_bytes_owned`]. Production always passes a
+/// fresh random nonce; known-answer tests pin the exact wire format with a
+/// fixed one.
+fn encrypt_bytes_owned_with_nonce(
     key: &[u8; 32],
     mut plaintext: Vec<u8>,
     aad: &[u8],
+    nonce_bytes: [u8; XNONCE_LEN],
 ) -> Result<Vec<u8>, String> {
     plaintext
         .try_reserve(XNONCE_LEN + TAG_LEN)
         .map_err(|e| format!("cannot allocate ciphertext buffer: {e}"))?;
 
     let cipher = XChaCha20Poly1305::new(key.into());
-    let mut nonce_bytes = [0u8; XNONCE_LEN];
-    OsRng.fill_bytes(&mut nonce_bytes);
     let nonce = XNonce::from_slice(&nonce_bytes);
     cipher
         .encrypt_in_place(nonce, aad, &mut plaintext)
@@ -1173,5 +1181,105 @@ mod tests {
         let key = derive_key("pw", &test_kdf());
         assert!(decrypt_bytes(&key, &[0u8; 10], b"").is_err());
         assert!(decrypt_bytes_legacy(&key, &[0u8; 5]).is_err());
+    }
+
+    // Known-answer tests: the expected bytes were captured from the 0.15.1
+    // dependency set (chacha20poly1305 0.10, argon2 0.5, blake2 0.10) and pin
+    // the on-disk format across dependency upgrades. A failure here means
+    // existing stores would stop decrypting - never "fix" it by updating the
+    // expected values without a versioned format change and a migration.
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    fn unhex(value: &str) -> Vec<u8> {
+        (0..value.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&value[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    fn kat_key() -> [u8; 32] {
+        std::array::from_fn(|i| 0x80 + i as u8)
+    }
+
+    fn kat_nonce() -> [u8; XNONCE_LEN] {
+        std::array::from_fn(|i| 0x40 + i as u8)
+    }
+
+    const KAT_BLOB_WIRE: &str = "404142434445464748494a4b4c4d4e4f50515253545556578b69019b2f8281298f3f13a19fd8f8754476520c692bfebd9dd92e8c6223bc3ffc04d7a684cd1c";
+    const KAT_INDEX_WIRE: &str = "404142434445464748494a4b4c4d4e4f50515253545556578a2e1a9a3f958c78c16605a693d366c01fbc405003a44a85fa022ab9e815";
+    const KAT_LEGACY_V0_BLOB: &str =
+        "101112131415161718191a1b98eb885080d5702d104e0c4a9e358fe4bf21d26faa7956";
+
+    #[test]
+    fn kat_v1_blob_and_index_wire_format_is_stable() {
+        let key = kat_key();
+        let blob = encrypt_bytes_owned_with_nonce(
+            &key,
+            b"zerotrust-drive v1 blob".to_vec(),
+            &blob_aad("000001.age"),
+            kat_nonce(),
+        )
+        .unwrap();
+        assert_eq!(hex(&blob), KAT_BLOB_WIRE);
+        assert_eq!(
+            decrypt_blob_owned(&key, "000001.age", unhex(KAT_BLOB_WIRE)).unwrap(),
+            b"zerotrust-drive v1 blob"
+        );
+
+        let index = encrypt_bytes_owned_with_nonce(
+            &key,
+            b"{\"index\":true}".to_vec(),
+            &index_aad(),
+            kat_nonce(),
+        )
+        .unwrap();
+        assert_eq!(hex(&index), KAT_INDEX_WIRE);
+        assert_eq!(
+            decrypt_index_owned(&key, unhex(KAT_INDEX_WIRE)).unwrap(),
+            b"{\"index\":true}"
+        );
+    }
+
+    #[test]
+    fn kat_legacy_v0_blob_still_decrypts() {
+        let key = derive_key_legacy("old-passphrase");
+        assert_eq!(
+            decrypt_bytes_legacy(&key, &unhex(KAT_LEGACY_V0_BLOB)).unwrap(),
+            b"v0 data"
+        );
+    }
+
+    #[test]
+    fn kat_argon2id_key_derivation_is_stable() {
+        let cheap = test_kdf();
+        assert_eq!(
+            hex(&derive_key("correct horse battery staple", &cheap)),
+            "6d9d4cd2bf048c1f142287a80b105d85f868b75b4e15f51ba23c513f1ffb4cb1"
+        );
+
+        let production = KdfParams {
+            salt: (0u8..SALT_LEN as u8).collect(),
+            ..KdfParams::new_random()
+        };
+        assert_eq!(
+            (production.m_cost, production.t_cost, production.p_cost),
+            (19 * 1024, 2, 1),
+            "new drives must keep the OWASP Argon2id baseline"
+        );
+        assert_eq!(
+            hex(&derive_key("correct horse battery staple", &production)),
+            "818259b6310026a8e0dbac5d2e6927abcfdb07b32258fac4f61b18b80f929085"
+        );
+    }
+
+    #[test]
+    fn kat_blake2s256_matches_rfc_7693() {
+        assert_eq!(
+            hex(&Blake2s256::digest(b"abc")),
+            "508c5e8c327c14e2e1a72ba34eeb452f37458b209ed63a294d999b4c86675982"
+        );
     }
 }
