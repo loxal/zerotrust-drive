@@ -1,34 +1,49 @@
+# SPDX-FileCopyrightText: Copyright 2026 Alexander Orlov <info@lifub.com>
+
+# Secrets never pass through this file: zerotrust-drive reads
+# ZEROTRUST_PASSPHRASE and ZEROTRUST_NEW_PASSPHRASE from the inherited
+# environment, or prompts on the terminal with echo off. Interpolating them
+# here would print them, expose them in the process list and let shell
+# metacharacters in a passphrase run commands.
+
 encrypted_dir := "~/g.drive/.zerotrust.drive.encrypted"
 decrypted_dir := "~/z.drive"
-passphrase := env("ZEROTRUST_PASSPHRASE", "")
+legacy_secret_argument := "recipes no longer take passphrases as arguments; set ZEROTRUST_PASSPHRASE / ZEROTRUST_NEW_PASSPHRASE or let zerotrust-drive prompt for them"
 
 default: build
 
 build:
     cargo build
 
-mount passphrase=passphrase: build
+mount *legacy_passphrase: build
+    {{ if legacy_passphrase != "" { error(legacy_secret_argument) } else { "" } }}
     mkdir -p {{decrypted_dir}}
-    cargo run -- --encrypted-dir {{encrypted_dir}} --decrypted-dir {{decrypted_dir}}{{ if passphrase != "" { " --passphrase " + passphrase } else { "" } }}
+    cargo run -- --encrypted-dir {{encrypted_dir}} --decrypted-dir {{decrypted_dir}}
 
-mount-release passphrase=passphrase:
+mount-release *legacy_passphrase:
+    {{ if legacy_passphrase != "" { error(legacy_secret_argument) } else { "" } }}
     mkdir -p {{decrypted_dir}}
-    zdrive --encrypted-dir {{encrypted_dir}} --decrypted-dir {{decrypted_dir}}{{ if passphrase != "" { " --passphrase " + passphrase } else { "" } }}
+    zdrive --encrypted-dir {{encrypted_dir}} --decrypted-dir {{decrypted_dir}}
 
+# Ctrl+C in the mounting terminal also unmounts and flushes.
 umount:
-    umount {{decrypted_dir}} 2>/dev/null || true
+    umount {{decrypted_dir}} 2>/dev/null || fusermount3 -u {{decrypted_dir}} 2>/dev/null || fusermount -u {{decrypted_dir}} 2>/dev/null || true
 
-run passphrase=passphrase: build
-    cargo run -- --encrypted-dir {{encrypted_dir}} --decrypted-dir {{decrypted_dir}}{{ if passphrase != "" { " --passphrase " + passphrase } else { "" } }}
+run *legacy_passphrase: build
+    {{ if legacy_passphrase != "" { error(legacy_secret_argument) } else { "" } }}
+    cargo run -- --encrypted-dir {{encrypted_dir}} --decrypted-dir {{decrypted_dir}}
 
-rekey new_passphrase passphrase=passphrase: build
-    cargo run -- --encrypted-dir {{encrypted_dir}} --new-passphrase {{new_passphrase}}{{ if passphrase != "" { " --passphrase " + passphrase } else { "" } }}
+rekey *legacy_passphrases: build
+    {{ if legacy_passphrases != "" { error(legacy_secret_argument) } else { "" } }}
+    cargo run -- --encrypted-dir {{encrypted_dir}} --decrypted-dir {{decrypted_dir}} --rekey
 
-rekey-resume new_passphrase passphrase=passphrase: build
-    cargo run -- --encrypted-dir {{encrypted_dir}} --new-passphrase {{new_passphrase}} --continue-rekey{{ if passphrase != "" { " --passphrase " + passphrase } else { "" } }}
+rekey-resume *legacy_passphrases: build
+    {{ if legacy_passphrases != "" { error(legacy_secret_argument) } else { "" } }}
+    cargo run -- --encrypted-dir {{encrypted_dir}} --decrypted-dir {{decrypted_dir}} --rekey --continue-rekey
 
-migrate-v2 passphrase=passphrase: build
-    cargo run -- --encrypted-dir {{encrypted_dir}} --migrate-v2{{ if passphrase != "" { " --passphrase " + passphrase } else { "" } }}
+migrate-v2 *legacy_passphrase: build
+    {{ if legacy_passphrase != "" { error(legacy_secret_argument) } else { "" } }}
+    cargo run -- --encrypted-dir {{encrypted_dir}} --migrate-v2
 
 populate:
     #!/usr/bin/env bash
@@ -77,6 +92,6 @@ release-all: release-macos release-linux
     @echo "all supported platforms built in target/dist/"
     @ls -lh target/dist/zdrive-*
 
+# Build artifacts only: the encrypted store and the mount point hold real data.
 clean:
     cargo clean
-    rm -rf {{encrypted_dir}} {{decrypted_dir}}
