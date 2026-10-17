@@ -8,7 +8,7 @@ edition = "2024"
 rust-version = "1.88"
 
 [dependencies]
-fuser = "0.17"
+fuser = "0.18"
 # AEAD: XChaCha20-Poly1305 (24-byte nonce) as of the v1 on-disk format.
 # ChaCha20-Poly1305 (12-byte nonce) is retained from the same crate for
 # reading pre-0.7 (v0) blobs during format migration only.

@@ -1510,7 +1510,7 @@ fn ensure_new_kdf_publication_safe(base_path: &Path) -> Result<(), String> {
 }
 
 impl FsInner {
-    fn persistence_error(&self) -> Option<std::io::Error> {
+    pub(crate) fn persistence_error(&self) -> Option<std::io::Error> {
         match self.persistence_failure.lock() {
             Ok(failure) => failure.as_ref().map(|message| {
                 std::io::Error::other(format!("persistence is disabled until remount: {message}"))
@@ -3540,6 +3540,8 @@ impl Filesystem for ZeroTrustFs {
         };
         if let Err(e) = result {
             eprintln!("zerotrust-drive: ERROR: failed to persist filesystem on destroy: {e}");
+            // Let the process report the unflushed shutdown in its exit status.
+            self.inner.latch_persistence_failure(e);
         }
     }
 

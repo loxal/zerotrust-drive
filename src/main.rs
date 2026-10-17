@@ -1,4 +1,4 @@
-// Copyright 2026 Alexander Orlov <alexander.orlov@loxal.net>
+// SPDX-FileCopyrightText: Copyright 2026 Alexander Orlov <info@lifub.com>
 
 mod crypto;
 mod fault;
@@ -6,7 +6,9 @@ mod fs;
 #[cfg(all(test, target_os = "macos"))]
 mod macos_integration_tests;
 mod migrate;
+mod prompt;
 mod rekey;
+mod shutdown;
 #[allow(dead_code)]
 mod storage;
 mod transaction_lock;
@@ -37,6 +39,7 @@ fn insecure_new_store_passphrase(passphrase: &str) -> bool {
 #[derive(Parser)]
 #[command(
     name = "zerotrust-drive",
+    version,
     about = "FUSE-based encrypted overlay filesystem"
 )]
 struct Cli {
@@ -48,15 +51,24 @@ struct Cli {
     #[arg(long, default_value = "~/z.drive")]
     decrypted_dir: PathBuf,
 
-    /// Encryption passphrase (can also be set via ZEROTRUST_PASSPHRASE env var)
+    /// Encryption passphrase. Prefer the ZEROTRUST_PASSPHRASE env var or the
+    /// terminal prompt: arguments are visible to other local users in the
+    /// process list
     #[arg(long)]
     passphrase: Option<String>,
 
-    /// Re-encrypt all files with a new passphrase (mounts read-only during rotation)
+    /// Rotate the passphrase: re-encrypt every file under a new passphrase
+    /// read from ZEROTRUST_NEW_PASSPHRASE or a terminal prompt (mounts
+    /// read-only during rotation; v1 drives only)
+    #[arg(long)]
+    rekey: bool,
+
+    /// New passphrase for --rekey (implies it). Prefer ZEROTRUST_NEW_PASSPHRASE
+    /// or the prompt: arguments are visible in the process list
     #[arg(long)]
     new_passphrase: Option<String>,
 
-    /// Resume an interrupted rekey instead of starting over (requires --new-passphrase)
+    /// Resume an interrupted rekey instead of starting over (implies --rekey)
     #[arg(long)]
     continue_rekey: bool,
 
@@ -559,19 +571,16 @@ fn exit_with_error(message: impl std::fmt::Display) -> ! {
 }
 
 fn main() {
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
+    // Before any other thread exists, so every thread inherits the mask.
+    shutdown::install().unwrap_or_else(|e| exit_with_error(e));
     let gc_mutation_requested =
         cli.gc_v2_quarantine.is_some() || cli.gc_v2_restore.is_some() || cli.gc_v2_purge.is_some();
     let gc_requested = cli.gc_v2 || gc_mutation_requested;
+    let rekey_requested = cli.rekey || cli.new_passphrase.is_some() || cli.continue_rekey;
     if cli.confirm_sync_paused && !gc_mutation_requested {
         exit_with_error("--confirm-sync-paused is accepted only with a mutating v2 GC operation");
     }
-    let passphrase_from_env = std::env::var("ZEROTRUST_PASSPHRASE").ok();
-    let passphrase_from_cli = cli.passphrase;
-    let passphrase = passphrase_from_env
-        .or(passphrase_from_cli)
-        .unwrap_or_else(|| DEMO_PASSPHRASE.to_string());
-    let using_insecure_passphrase = insecure_new_store_passphrase(&passphrase);
     let expanded_base =
         expand_home_from_env(&cli.encrypted_dir).unwrap_or_else(|e| exit_with_error(e));
     let expanded_mountpoint =
@@ -636,21 +645,39 @@ fn main() {
         .unwrap_or_else(|e| exit_with_error(format!("cannot inspect encrypted index: {e}")));
     let root_exists = fs::backing_entry_exists(&root_path)
         .unwrap_or_else(|e| exit_with_error(format!("cannot inspect encrypted v2 root: {e}")));
+    let creating_store =
+        !index_exists && !root_exists && !cli.migrate_format && !cli.migrate_v2 && !gc_requested;
+    let mut terminal = prompt::TerminalReader::open();
+    let (passphrase, _passphrase_source) = prompt::resolve_current(
+        std::env::var("ZEROTRUST_PASSPHRASE").ok(),
+        cli.passphrase.take(),
+        terminal
+            .as_mut()
+            .map(|terminal| terminal as &mut dyn prompt::SecretReader),
+        cli.allow_default_passphrase,
+        creating_store,
+        DEMO_PASSPHRASE,
+    )
+    .unwrap_or_else(|e| exit_with_error(e));
+    if !rekey_requested && std::env::var_os("ZEROTRUST_NEW_PASSPHRASE").is_some() {
+        eprintln!(
+            "zerotrust-drive: note: ignoring ZEROTRUST_NEW_PASSPHRASE because --rekey was not given"
+        );
+    }
+    let using_insecure_passphrase = insecure_new_store_passphrase(&passphrase);
     if using_insecure_passphrase && !index_exists && !root_exists && !cli.allow_default_passphrase {
         eprintln!(
             "zerotrust-drive: error: refusing to create a new drive with an empty or built-in demo passphrase"
         );
-        eprintln!("zerotrust-drive: set ZEROTRUST_PASSPHRASE (or --passphrase) to a real secret,");
+        eprintln!(
+            "zerotrust-drive: set ZEROTRUST_PASSPHRASE or run from a terminal to be prompted for a real secret,"
+        );
         eprintln!("zerotrust-drive: or pass --allow-default-passphrase for a throwaway test drive");
         std::process::exit(1);
     }
 
     if gc_requested {
-        if cli.migrate_format
-            || cli.migrate_v2
-            || cli.new_passphrase.is_some()
-            || cli.continue_rekey
-        {
+        if cli.migrate_format || cli.migrate_v2 || rekey_requested {
             exit_with_error(
                 "offline v2 GC cannot be combined with migration, mounting, or passphrase rotation",
             );
@@ -763,9 +790,9 @@ fn main() {
         if cli.migrate_v2 {
             exit_with_error("--migrate-format and --migrate-v2 are mutually exclusive");
         }
-        if cli.new_passphrase.is_some() {
+        if rekey_requested {
             eprintln!(
-                "zerotrust-drive: error: --migrate-format upgrades in place with the current passphrase; do not combine it with --new-passphrase"
+                "zerotrust-drive: error: --migrate-format upgrades in place with the current passphrase; do not combine it with --rekey"
             );
             std::process::exit(1);
         }
@@ -814,7 +841,7 @@ fn main() {
     }
 
     if cli.migrate_v2 {
-        if cli.new_passphrase.is_some() || cli.continue_rekey {
+        if rekey_requested {
             exit_with_error("--migrate-v2 cannot be combined with passphrase-rotation options");
         }
         if !index_exists {
@@ -882,19 +909,9 @@ fn main() {
         std::process::exit(1);
     }
 
-    // Validate --continue-rekey requires --new-passphrase
-    let resume = cli.continue_rekey;
-    if resume && cli.new_passphrase.is_none() {
-        eprintln!("zerotrust-drive: error: --continue-rekey requires --new-passphrase");
-        std::process::exit(1);
-    }
-
-    // Handle --new-passphrase (online rekey: mount read-only, re-encrypt in background)
-    if let Some(new_passphrase) = cli.new_passphrase {
-        if new_passphrase == passphrase {
-            eprintln!("zerotrust-drive: error: new passphrase is the same as the current one");
-            std::process::exit(1);
-        }
+    // Online rekey: mount read-only and re-encrypt in the background.
+    if rekey_requested {
+        let resume = cli.continue_rekey;
         if root_exists {
             exit_with_error(
                 "passphrase rotation for v2 is not implemented yet; preserve the immutable generation and migrate a decrypted export into a new v2 store",
@@ -908,12 +925,30 @@ fn main() {
             );
             std::process::exit(1);
         }
+        let new_passphrase = prompt::resolve_new(
+            std::env::var("ZEROTRUST_NEW_PASSPHRASE").ok(),
+            cli.new_passphrase.take(),
+            terminal
+                .as_mut()
+                .map(|terminal| terminal as &mut dyn prompt::SecretReader),
+        )
+        .unwrap_or_else(|e| exit_with_error(e));
+        if new_passphrase == passphrase {
+            eprintln!("zerotrust-drive: error: new passphrase is the same as the current one");
+            std::process::exit(1);
+        }
+        if insecure_new_store_passphrase(&new_passphrase) && !cli.allow_default_passphrase {
+            exit_with_error(
+                "refusing to rotate to an empty or built-in demo passphrase; pass --allow-default-passphrase for a throwaway test drive",
+            );
+        }
 
         drive_operation_lock
             .revalidate()
             .unwrap_or_else(|e| exit_with_error(e));
         let mut ztfs = fs::ZeroTrustFs::new(&passphrase, base_path.clone());
         let inner = ztfs.inner.clone();
+        let rekey_inner = ztfs.inner.clone();
         // Make the filesystem read-only before it can be exposed at the
         // mountpoint. rekey_online repeats this store defensively.
         inner.read_only.store(true, Ordering::SeqCst);
@@ -946,12 +981,12 @@ fn main() {
             .revalidate()
             .unwrap_or_else(|e| exit_with_error(e));
 
-        let mut config = Config::default();
-        config.mount_options = vec![
-            MountOption::RW,
-            MountOption::FSName("zerotrust-drive".to_string()),
-        ];
-        let mount_result = fuser::mount2(ztfs, &mountpoint, &config);
+        let mount_result = serve(ztfs, &mountpoint);
+        if !rekey_worker.is_finished() {
+            eprintln!(
+                "zerotrust-drive: unmounted; waiting for the passphrase rotation to finish (Ctrl+C stops it, --continue-rekey resumes it)"
+            );
+        }
         let worker_result = rekey_worker.join();
         if worker_result.is_err() {
             exit_with_error("rekey worker panicked");
@@ -959,6 +994,7 @@ fn main() {
         if let Err(e) = mount_result {
             exit_with_error(format!("failed to mount filesystem: {e}"));
         }
+        exit_unless_persisted(&rekey_inner);
         return;
     }
 
@@ -1002,15 +1038,36 @@ fn main() {
             );
         }
     }
-    eprintln!("zerotrust-drive: press Ctrl+C to unmount");
+    eprintln!("zerotrust-drive: press Ctrl+C to unmount and flush");
 
+    let inner = ztfs.inner.clone();
+    serve(ztfs, &mountpoint)
+        .unwrap_or_else(|e| exit_with_error(format!("failed to mount filesystem: {e}")));
+    exit_unless_persisted(&inner);
+}
+
+/// Mount and serve until the filesystem is unmounted, by a signal or
+/// externally. `destroy` has flushed pending state when this returns.
+fn serve(filesystem: fs::ZeroTrustFs, mountpoint: &Path) -> std::io::Result<()> {
     let mut config = Config::default();
     config.mount_options = vec![
         MountOption::RW,
         MountOption::FSName("zerotrust-drive".to_string()),
     ];
-    fuser::mount2(ztfs, &mountpoint, &config)
-        .unwrap_or_else(|e| exit_with_error(format!("failed to mount filesystem: {e}")));
+    let session = fuser::Session::new(filesystem, mountpoint, &config)?;
+    shutdown::mounted(mountpoint);
+    let result = session.run();
+    shutdown::session_ended();
+    result
+}
+
+fn exit_unless_persisted(inner: &fs::FsInner) {
+    if let Some(error) = inner.persistence_error() {
+        exit_with_error(format!(
+            "unmounted, but the encrypted state was not fully persisted: {error}"
+        ));
+    }
+    eprintln!("zerotrust-drive: unmounted; encrypted state flushed");
 }
 
 #[cfg(test)]
