@@ -180,11 +180,12 @@ it safe against concurrent inode mutation. The quarantine framework selects only
 unreachable, never committed history or conflict/recovery evidence, but currently reclaims no
 storage. Sustained write-heavy production use is not yet recommended.
 
-The merged PR #1 hosted APFS and x86 loopback-ext4 gates are green. The compact-tail,
-direct-StoreRoot, native-probe, and retained-iCloud-evidence changes in `0.13.0` have local
-validation only. The beta status is unchanged: live kernel-mounted FUSE coverage, complete File
-Provider coordination, current hosted filesystem gates, passing real iCloud-backed tests,
-remote-provider ordering, and safe evidence retirement remain open.
+Every push to `main` runs the hosted APFS and x86 loopback-ext4 SIGKILL matrices; they have
+passed for every release since `0.13.0`. Since `0.16.0` the hosted Linux job also mounts the real
+binary through the kernel (`tests/live_fuse.rs`) and checks that SIGINT, SIGTERM and SIGHUP
+unmount, flush and exit cleanly, and that a busy mount keeps serving. The beta status is
+unchanged: live macOS mount coverage, complete File Provider coordination, passing real
+iCloud-backed tests, remote-provider ordering, and safe evidence retirement remain open.
 
 Retired evidence to recheck before changing the v2 beta status:
 
@@ -292,14 +293,25 @@ Both paths are overridable via justfile variables or CLI flags `--encrypted-dir`
 
 ### Usage
 
-    ZEROTRUST_PASSPHRASE="my-secret" just mount         # mount or create with a real secret
+    just mount                                          # mount or create; prompts for the passphrase
     just populate                                       # create test files on the mounted filesystem
     just umount                                         # unmount (decrypted dir becomes empty)
     just mount                                          # remount - files reappear from encrypted storage
     cargo run -- --migrate-v2                           # explicitly migrate a v1 store, resumably
     just test                                           # run unit tests
     just release                                        # build optimized release binary
-    just clean                                          # remove build artifacts and encrypted storage
+    just clean                                          # remove build artifacts (never the store)
+    zdrive --version                                    # print the installed version
+
+#### Stopping
+
+Press Ctrl+C in the mounting terminal, or send SIGTERM or SIGHUP, to unmount. The drive then
+flushes every acknowledged write to encrypted storage and exits with status 0, or 1 if any write
+could not be persisted. If a program still has a file open, the unmount is refused rather than detached: the
+drive reports it and keeps serving, and the next Ctrl+C or signal tries again once the file is
+closed. `just umount` and an external `umount` / `fusermount3 -u` flush the same way. A signal
+received before the drive is mounted, for example at the passphrase prompt, restores the terminal
+and terminates as usual.
 
 ### Offline v2 orphan quarantine
 
@@ -346,16 +358,25 @@ preview refuses an oversized scan or plan before creating GC state.
 
 ### Passphrase
 
-Set the encryption passphrase via env var or CLI flag. A new store refuses an empty
-passphrase or the built-in `zerotrust-demo-passphrase`. The explicit
-`--allow-default-passphrase` override exists only for throwaway tests. An existing store
-created with either insecure value remains accessible but prints a warning.
+The passphrase comes from the first available source:
 
-    ZEROTRUST_PASSPHRASE="my-secret" just mount         # via env var (recommended)
-    cargo run -- --passphrase "my-secret"                # via CLI flag
+1. the `ZEROTRUST_PASSPHRASE` environment variable;
+2. the `--passphrase` flag, which is visible to other local users in the process list and is
+   kept for compatibility;
+3. a prompt on the controlling terminal with echo off. A new store asks twice so a typo cannot
+   lock the data away; mismatched entries change nothing.
+
+Without any of them and without a terminal, as under a service manager, the built-in demo
+passphrase applies, and a new store refuses it, as it refuses an empty passphrase. The explicit
+`--allow-default-passphrase` override skips the prompt and exists only for throwaway tests. An
+existing store created with either insecure value remains accessible but prints a warning.
+
+    just mount                                          # prompt (recommended interactively)
+    ZEROTRUST_PASSPHRASE="my-secret" zdrive             # environment, e.g. from a secret manager
     cargo run -- --allow-default-passphrase              # throwaway new store only
 
-The env var takes precedence if both are provided.
+The justfile never passes passphrases itself; it leaves the environment and the prompt to the
+binary.
 
 ### Passphrase Rotation (Rekey)
 
@@ -365,15 +386,23 @@ export the decrypted data into a new v2 store created with the new passphrase.
 
 Change the encryption passphrase for all files:
 
-    just rekey "new-secret"                             # re-encrypt with new passphrase
-    ZEROTRUST_PASSPHRASE="new-secret" just mount        # mount with new passphrase
+    just rekey                                          # prompts for the current and new passphrase
+    just mount                                          # then mount with the new passphrase
 
 Or directly:
 
-    cargo run -- --new-passphrase "new-secret"
+    zdrive --rekey
+
+The new passphrase comes from `ZEROTRUST_NEW_PASSPHRASE`, then `--new-passphrase` (kept for
+compatibility, visible in the process list, and implying `--rekey`), then a confirmed terminal
+prompt. Only `--rekey`, `--new-passphrase` or `--continue-rekey` starts a rotation; an exported
+`ZEROTRUST_NEW_PASSPHRASE` alone is ignored with a note. Rotating to an empty or demo passphrase
+is refused.
 
 During rotation the filesystem mounts read-only - existing files are readable but writes
-return EROFS. Once re-encryption finishes the filesystem becomes read-write again.
+return EROFS. Once re-encryption finishes the filesystem becomes read-write again. Ctrl+C
+unmounts as usual; if re-encryption is still running it then finishes in the foreground, and a
+second Ctrl+C stops it so `--continue-rekey` can resume it later.
 
 #### How rekey works
 
@@ -398,7 +427,7 @@ removed.
 
 | Scenario | What happens | Recovery |
 |---|---|---|
-| **Ctrl+C / crash during Phase 1** (staging) | Originals untouched. `.rekey_staging/` contains partial re-encrypted files. | Next `--new-passphrase` wipes the partial staging and starts fresh. Use `--continue-rekey` to resume instead (see below). |
+| **Ctrl+C / crash during Phase 1** (staging) | Originals untouched. `.rekey_staging/` contains partial re-encrypted files. | Next `--rekey` wipes the partial staging and starts fresh. Use `--continue-rekey` to resume instead (see below). |
 | **Ctrl+C / crash during Phase 2** (rename pass) | Some files may already be renamed; immutable fingerprints identify them. | **Automatic** - on next startup `recover_interrupted_rekey()` verifies the manifest and completes the remaining renames. No user action needed. |
 | **Wrong old passphrase** | Decryption of `_index.age` fails immediately. | Lock file removed, clear error shown. No files modified. |
 | **Disk full during staging** | Write fails, no manifest written. | `.rekey_staging/` cleaned up on next run. Originals intact. |
@@ -408,23 +437,24 @@ removed.
 #### Resuming an interrupted rekey
 
 By default, if a `.rekey_staging/` directory exists from a previous cancelled run, a fresh
-`--new-passphrase` invocation **wipes it and starts over**. This prevents mixed-key
+`--rekey` invocation **wipes it and starts over**. This prevents mixed-key
 corruption if you changed your mind about the new passphrase.
 
-To resume where you left off (skipping already-staged files), use `--continue-rekey`:
+To resume where you left off (skipping already-staged files), use `--continue-rekey` and supply
+the same new passphrase again:
 
-    just rekey-resume "same-passphrase"                 # resume interrupted staging
+    just rekey-resume                                   # resume interrupted staging
 
 Or directly:
 
-    cargo run -- --new-passphrase "same-passphrase" --continue-rekey
+    zdrive --continue-rekey
 
 Before resuming, the passphrase is cryptographically probed against the staged index or one staged
 blob. Each staged item is then reused only if it decrypts to the current plaintext; otherwise that
 item is regenerated. ZeroTrust Drive does not persist the passphrase in the encrypted backing
-store. Supplying it as a command-line argument can still leave it in shell history and expose it
-temporarily through process inspection. Use a protected `ZEROTRUST_PASSPHRASE` injection method
-and clear the variable after use; the client does not currently provide an interactive prompt.
+store. The terminal prompts keep both passphrases out of shell history and the process list;
+`--passphrase` and `--new-passphrase` arguments do not. When injecting `ZEROTRUST_PASSPHRASE` or
+`ZEROTRUST_NEW_PASSPHRASE` instead, use a protected method and clear the variables after use.
 
 ### Limits
 

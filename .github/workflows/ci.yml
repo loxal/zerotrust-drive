@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright 2026 Alexander Orlov <info@lifub.com>
+
 name: CI
 
 on:
@@ -11,18 +13,34 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - name: Install FUSE
         run: sudo apt-get update && sudo apt-get install -y libfuse3-dev fuse3
       - name: Run tests
         run: cargo test --locked
+      - name: Verify exact live FUSE test inventory
+        run: |
+          test_inventory="$(cargo test --locked --test live_fuse -- --list)"
+          for test_name in \
+            'sigint_unmounts_flushes_and_exits_cleanly' \
+            'sigterm_unmounts_flushes_and_exits_cleanly' \
+            'sighup_unmounts_flushes_and_exits_cleanly' \
+            'busy_mount_keeps_serving_until_files_are_closed'
+          do
+            printf '%s\n' "$test_inventory" | awk -v expected="$test_name: test" '$0 == expected { found += 1 } END { exit(found == 1 ? 0 : 1) }'
+          done
+      - name: Run live FUSE signal and busy-unmount tests
+        timeout-minutes: 15
+        env:
+          ZDRIVE_RUN_LIVE_FUSE_TESTS: "1"
+        run: cargo test --locked --test live_fuse -- --ignored --test-threads=1 --nocapture
 
   durability-ext4:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - name: Install FUSE and ext4 tools
         run: sudo apt-get update && sudo apt-get install -y libfuse3-dev fuse3 e2fsprogs
@@ -77,7 +95,7 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - name: Install macFUSE
         run: brew install macfuse
@@ -122,9 +140,11 @@ jobs:
   release-linux:
     needs: [test, durability-ext4, durability-apfs]
     if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
+    # Pinned: the build host's glibc is the oldest the artifact runs on, and
+    # ubuntu-latest moving to a newer release would raise it silently.
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - name: Install FUSE
         run: sudo apt-get update && sudo apt-get install -y libfuse3-dev fuse3
@@ -132,7 +152,7 @@ jobs:
         run: cargo build --release --locked
       - name: Prepare artifact
         run: cp target/release/zerotrust-drive zdrive-linux-x86_64
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: zdrive-linux-x86_64
           path: zdrive-linux-x86_64
@@ -142,7 +162,7 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - name: Install macFUSE
         run: brew install macfuse
@@ -150,7 +170,7 @@ jobs:
         run: cargo build --release --locked
       - name: Prepare artifact
         run: cp target/release/zerotrust-drive zdrive-macos-aarch64
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: zdrive-macos-aarch64
           path: zdrive-macos-aarch64
@@ -162,14 +182,14 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: zdrive-linux-x86_64
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: zdrive-macos-aarch64
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           generate_release_notes: true
           prerelease: true

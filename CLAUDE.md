@@ -1,3 +1,5 @@
+<!-- SPDX-FileCopyrightText: Copyright 2026 Alexander Orlov <info@lifub.com> -->
+
 # CLAUDE.md — zerotrust-drive
 
 ## Overview
@@ -12,9 +14,16 @@ Google Drive sync folder for transparent cloud backup of encrypted content.
 just build                  # cargo build
 just mount                  # Build + mount (prompts for passphrase)
 just mount-release          # Mount using installed binary
-just umount                 # Unmount
+just umount                 # Unmount (Ctrl+C in the mounting terminal also unmounts and flushes)
+just rekey                  # Rotate a v1 passphrase (prompts, or ZEROTRUST_NEW_PASSPHRASE)
+just clean                  # cargo clean only; never touches the store or mount point
 cargo test                  # Run tests
+# Live kernel-mounted signal/busy-unmount tests (Linux, needs fuse3):
+ZDRIVE_RUN_LIVE_FUSE_TESTS=1 cargo test --locked --test live_fuse -- --ignored --test-threads=1
 ```
+
+The justfile must never interpolate a passphrase: the binary reads the inherited
+environment or prompts on `/dev/tty`.
 
 ## Architecture
 
@@ -29,7 +38,9 @@ cargo test                  # Run tests
 
 | File | Purpose |
 |------|---------|
-| `src/main.rs` | CLI entry point (clap); `--migrate-format` v0→v1 upgrade |
+| `src/main.rs` | CLI entry point (clap); `--migrate-format` v0→v1 upgrade; mounts through `fuser::Session` |
+| `src/shutdown.rs` | SIGINT/SIGTERM/SIGHUP via a `sigwait` thread: non-lazy unmount while mounted so `destroy` flushes; default action otherwise |
+| `src/prompt.rs` | No-echo `/dev/tty` passphrase prompt and source precedence (env, flag, prompt, demo fallback) |
 | `src/fs.rs` | FUSE filesystem + encrypted directory index (InodeEntry tree) |
 | `src/crypto.rs` | Argon2id KDF + XChaCha20-Poly1305 encrypt/decrypt (+ retained v0 legacy readers for migration) |
 | `src/v2.rs` | Immutable chunk/tree objects, copy-on-write generations, authenticated root-last commit and recovery |
@@ -38,10 +49,13 @@ cargo test                  # Run tests
 | `src/fault.rs` | Deterministic returned-error and test-only real-process kill injection at durability boundaries |
 | `src/migrate.rs` | Crash-safe v0→v1 on-disk format migration |
 | `src/rekey.rs` | Passphrase re-keying (keeps the drive salt; new passphrase → new key) |
+| `tests/live_fuse.rs` | Opt-in Linux live-mount tests: signals unmount, flush and exit 0; a busy mount keeps serving |
+| `tests/fixtures/format/` | Committed v1/v2 stores pinning the on-disk format (with KATs in `crypto.rs`) |
 
 ## Conventions
 
 - Rust edition 2024
 - License: AGPL-3.0-only
 - CI: GitHub Actions
-- Passphrase via `ZEROTRUST_PASSPHRASE` env var or interactive prompt
+- Passphrase precedence: `ZEROTRUST_PASSPHRASE`, `--passphrase`, then a no-echo terminal prompt (confirmed for a new store); without a terminal the demo fallback applies and a new store refuses it
+- Rotation needs `--rekey` (or `--new-passphrase` / `--continue-rekey`); the new passphrase comes from `ZEROTRUST_NEW_PASSPHRASE`, `--new-passphrase`, or a confirmed prompt
