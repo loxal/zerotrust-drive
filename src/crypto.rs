@@ -34,7 +34,7 @@ use blake2::{Blake2s256, Digest};
 use chacha20poly1305::aead::Payload;
 use chacha20poly1305::{
     ChaCha20Poly1305, Nonce, XChaCha20Poly1305, XNonce,
-    aead::{Aead, AeadInPlace, KeyInit, OsRng, rand_core::RngCore},
+    aead::{Aead, AeadInOut, KeyInit},
 };
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Seek, SeekFrom};
@@ -94,12 +94,21 @@ pub struct KdfParams {
     pub p_cost: u32,
 }
 
+/// Fill `bytes` from the operating-system CSPRNG. Without a working system
+/// RNG no salt, nonce or identifier can be generated safely, so this fails
+/// loudly instead of degrading, exactly as `OsRng` did before.
+pub(crate) fn fill_random(bytes: &mut [u8]) {
+    if let Err(error) = getrandom::fill(bytes) {
+        panic!("operating-system CSPRNG unavailable: {error}");
+    }
+}
+
 impl KdfParams {
     /// Fresh params with a CSPRNG-generated salt and the current
     /// Argon2id cost defaults (OWASP baseline: 19 MiB, t=2, p=1).
     pub fn new_random() -> Self {
         let mut salt = vec![0u8; SALT_LEN];
-        OsRng.fill_bytes(&mut salt);
+        fill_random(&mut salt);
         Self {
             format_version: FORMAT_VERSION,
             algorithm: "argon2id".to_string(),
@@ -767,10 +776,10 @@ pub fn decrypt_bytes(key: &[u8; 32], data: &[u8], aad: &[u8]) -> Result<Vec<u8>,
         return Err("ciphertext too short".to_string());
     }
     let cipher = XChaCha20Poly1305::new(key.into());
-    let nonce = XNonce::from_slice(&data[..XNONCE_LEN]);
+    let nonce = XNonce::try_from(&data[..XNONCE_LEN]).map_err(|e| e.to_string())?;
     cipher
         .decrypt(
-            nonce,
+            &nonce,
             Payload {
                 msg: &data[XNONCE_LEN..],
                 aad,
@@ -783,7 +792,7 @@ pub fn decrypt_bytes(key: &[u8; 32], data: &[u8], aad: &[u8]) -> Result<Vec<u8>,
 /// The returned layout is identical to [`encrypt_bytes`].
 fn encrypt_bytes_owned(key: &[u8; 32], plaintext: Vec<u8>, aad: &[u8]) -> Result<Vec<u8>, String> {
     let mut nonce_bytes = [0u8; XNONCE_LEN];
-    OsRng.fill_bytes(&mut nonce_bytes);
+    fill_random(&mut nonce_bytes);
     encrypt_bytes_owned_with_nonce(key, plaintext, aad, nonce_bytes)
 }
 
@@ -801,9 +810,9 @@ fn encrypt_bytes_owned_with_nonce(
         .map_err(|e| format!("cannot allocate ciphertext buffer: {e}"))?;
 
     let cipher = XChaCha20Poly1305::new(key.into());
-    let nonce = XNonce::from_slice(&nonce_bytes);
+    let nonce = XNonce::from(nonce_bytes);
     cipher
-        .encrypt_in_place(nonce, aad, &mut plaintext)
+        .encrypt_in_place(&nonce, aad, &mut plaintext)
         .map_err(|e| e.to_string())?;
 
     let ciphertext_len = plaintext.len();
@@ -831,7 +840,7 @@ pub(crate) fn decrypt_bytes_owned(
 
     let cipher = XChaCha20Poly1305::new(key.into());
     cipher
-        .decrypt_in_place(XNonce::from_slice(&nonce_bytes), aad, &mut data)
+        .decrypt_in_place(&XNonce::from(nonce_bytes), aad, &mut data)
         .map_err(|e| e.to_string())?;
     Ok(data)
 }
@@ -901,9 +910,9 @@ pub fn decrypt_bytes_legacy(key: &[u8; 32], data: &[u8]) -> Result<Vec<u8>, Stri
         return Err("ciphertext too short".to_string());
     }
     let cipher = ChaCha20Poly1305::new(key.into());
-    let nonce = Nonce::from_slice(&data[..LEGACY_NONCE_LEN]);
+    let nonce = Nonce::try_from(&data[..LEGACY_NONCE_LEN]).map_err(|e| e.to_string())?;
     cipher
-        .decrypt(nonce, &data[LEGACY_NONCE_LEN..])
+        .decrypt(&nonce, &data[LEGACY_NONCE_LEN..])
         .map_err(|e| e.to_string())
 }
 
@@ -1056,9 +1065,9 @@ mod tests {
         let key = derive_key_legacy("old-passphrase");
         let cipher = ChaCha20Poly1305::new((&key).into());
         let mut nonce_bytes = [0u8; LEGACY_NONCE_LEN];
-        OsRng.fill_bytes(&mut nonce_bytes);
-        let nonce = Nonce::from_slice(&nonce_bytes);
-        let ct_inner = cipher.encrypt(nonce, b"v0 data".as_ref()).unwrap();
+        fill_random(&mut nonce_bytes);
+        let nonce = Nonce::from(nonce_bytes);
+        let ct_inner = cipher.encrypt(&nonce, b"v0 data".as_ref()).unwrap();
         let mut blob = nonce_bytes.to_vec();
         blob.extend_from_slice(&ct_inner);
 

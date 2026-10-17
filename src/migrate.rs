@@ -1,4 +1,4 @@
-// Copyright 2026 Alexander Orlov <alexander.orlov@loxal.net>
+// SPDX-FileCopyrightText: Copyright 2026 Alexander Orlov <info@lifub.com>
 
 //! One-time on-disk format migration: v0 (pre-0.7) → v1 (0.7+).
 //!
@@ -782,7 +782,7 @@ mod tests {
     ) {
         use chacha20poly1305::{
             ChaCha20Poly1305, Nonce,
-            aead::{Aead, KeyInit, OsRng, rand_core::RngCore},
+            aead::{Aead, KeyInit},
         };
         let _ = std::fs::remove_dir_all(dir);
         std::fs::create_dir_all(dir).unwrap();
@@ -794,8 +794,8 @@ mod tests {
         let v0_encrypt = |pt: &[u8]| -> Vec<u8> {
             let cipher = ChaCha20Poly1305::new((&key).into());
             let mut nb = [0u8; 12];
-            OsRng.fill_bytes(&mut nb);
-            let ct = cipher.encrypt(Nonce::from_slice(&nb), pt).unwrap();
+            crate::crypto::fill_random(&mut nb);
+            let ct = cipher.encrypt(&Nonce::from(nb), pt).unwrap();
             let mut out = nb.to_vec();
             out.extend_from_slice(&ct);
             out

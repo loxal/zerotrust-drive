@@ -1,4 +1,4 @@
-// Copyright 2026 Alexander Orlov <alexander.orlov@loxal.net>
+// SPDX-FileCopyrightText: Copyright 2026 Alexander Orlov <info@lifub.com>
 
 //! Explicit, resumable v1-to-v2 migration.
 //!
@@ -11,7 +11,6 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 
-use chacha20poly1305::aead::rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 
 use crate::crypto::{
@@ -628,7 +627,7 @@ fn publish_plan(
     namespace_pin: Option<&v2::V2NamespacePin>,
 ) -> Result<(MigrationPlan, Vec<u8>), String> {
     let mut transaction_id = [0u8; 16];
-    OsRng.fill_bytes(&mut transaction_id);
+    crate::crypto::fill_random(&mut transaction_id);
     let plan = MigrationPlan {
         plan_version: PLAN_VERSION,
         transaction_id,

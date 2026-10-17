@@ -23,7 +23,6 @@ use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
 use blake2::{Blake2s256, Digest};
-use chacha20poly1305::aead::rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 
 use crate::crypto::{
@@ -86,7 +85,7 @@ fn probe_atomic_exchange_internal(
     }
     let evidence = selected_object_directory(base_path)?.join(EVIDENCE_DIRECTORY);
     let mut id = [0u8; 16];
-    OsRng.fill_bytes(&mut id);
+    crate::crypto::fill_random(&mut id);
     let prefix = format!("exchange-probe-{}", to_hex(&id));
     let first = evidence.join(format!("{prefix}-a"));
     let second = evidence.join(format!("{prefix}-b"));
@@ -1099,7 +1098,7 @@ fn write_object_with_pin(
     }
     loop {
         let mut id = [0u8; 16];
-        OsRng.fill_bytes(&mut id);
+        crate::crypto::fill_random(&mut id);
         let ciphertext =
             encrypt_bytes(key, plaintext, &object_aad(kind, &id)).map_err(std::io::Error::other)?;
         let reference = ObjectRef {
@@ -1943,7 +1942,7 @@ fn write_generation(
     }
     let lineage_id = previous.map(|state| state.lineage_id).unwrap_or_else(|| {
         let mut lineage = [0u8; 16];
-        OsRng.fill_bytes(&mut lineage);
+        crate::crypto::fill_random(&mut lineage);
         lineage
     });
     let lineage_id = initial_lineage.unwrap_or(lineage_id);
@@ -3550,7 +3549,7 @@ fn commit_with_phase_and_lineage(
         let (root_ciphertext, new_root) = prepare_root(key, generation)?;
 
         let mut transaction_id = [0u8; 16];
-        OsRng.fill_bytes(&mut transaction_id);
+        crate::crypto::fill_random(&mut transaction_id);
         let transaction_hex = to_hex(&transaction_id);
         let root_ready_name = format!("{ROOT_READY_PREFIX}{transaction_hex}.ready");
         let manifest_ready_name = format!("{MANIFEST_READY_PREFIX}{transaction_hex}.ready");

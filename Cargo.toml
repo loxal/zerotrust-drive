@@ -12,11 +12,15 @@ fuser = "0.17"
 # AEAD: XChaCha20-Poly1305 (24-byte nonce) as of the v1 on-disk format.
 # ChaCha20-Poly1305 (12-byte nonce) is retained from the same crate for
 # reading pre-0.7 (v0) blobs during format migration only.
-chacha20poly1305 = "0.10"
+chacha20poly1305 = "0.11"
 # Memory-hard passphrase KDF (Argon2id) — replaces the homemade v0 KDF.
-argon2 = "0.5"
+# Only raw key derivation is used, so the PHC password-hash API stays off.
+argon2 = { version = "0.6", default-features = false, features = ["alloc"] }
 # Streaming full-ciphertext fingerprints for crash-recovery manifests.
-blake2 = "0.10"
+blake2 = "0.11"
+# Operating-system CSPRNG for salts, nonces and object identifiers; the
+# RustCrypto AEAD crates no longer re-export `OsRng`.
+getrandom = "0.4"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

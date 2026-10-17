@@ -1,4 +1,4 @@
-// Copyright 2026 Alexander Orlov <alexander.orlov@loxal.net>
+// SPDX-FileCopyrightText: Copyright 2026 Alexander Orlov <info@lifub.com>
 
 //! Evidence-aware, offline garbage collection for immutable v2 objects.
 //!
@@ -2354,7 +2354,7 @@ fn create_staged_control(
     }
     let (name, mut file) = loop {
         let mut nonce = [0u8; 16];
-        OsRng.fill_bytes(&mut nonce);
+        crate::crypto::fill_random(&mut nonce);
         let name = control_stage_name(kind, &nonce);
         match openat_new_file(operation_directory, &name) {
             Ok(file) => break (name, file),
