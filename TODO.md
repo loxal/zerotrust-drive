@@ -22,5 +22,17 @@
 * macOS volume icon for the mount: macFUSE's `volicon` is a high-level libfuse module that fuser's
   low-level mount never runs. Serving a virtual `/.VolumeIcon.icns` plus the root FinderInfo xattr
   from `ZeroTrustFs` would need xattr support and a live macOS kernel-mount check.
+* macFUSE FSKit backend on macOS 26+: macFUSE 5 can mount through a user-space FSKit extension
+  (`-o backend=fskit`, https://github.com/macfuse/macfuse/wiki/FUSE-Backends) instead of the kernel
+  extension, which on Apple silicon first needs kernel extensions enabled in recoveryOS. `zdrive
+  doctor` already recognizes the registered module, but the mount never selects the backend. The
+  wiki restricts its mount points to `/Volumes` and lists missing features and lower performance:
+  measure W2/W3 against the kext, then decide whether a macOS service should prefer it.
+* `zdrive remote remove NAME`: nothing forgets a remote today. Cleanup means deleting
+  `remotes/NAME.{json,token}` and `$XDG_STATE_HOME/zerotrust-drive/remotes/NAME` by hand, and the
+  refresh token stays valid until revoked at `https://oauth2.googleapis.com/revoke` (an encrypted
+  remote seals it under the store passphrase). Observed on 2026-10-18: revoking one bundled-client
+  token also invalidated the other bundled client's tokens for that account on another machine, so
+  a revoke signs out every zdrive install of the account; warn and confirm before revoking.
 * Remote garbage collection: remote packs and root records are append-only, so Drive usage grows
   with every generation's new objects, like the local store before GC.
