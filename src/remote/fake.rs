@@ -9,7 +9,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
@@ -59,6 +59,19 @@ pub(crate) enum Fault {
     ExpireSession,
 }
 
+/// A request the server receives but never answers, so a test can kill
+/// its client at exactly that point. Consumed by its first match.
+#[derive(Clone, Debug)]
+pub(crate) struct Hold {
+    pub(crate) op: Op,
+    /// Only requests for a file whose name ends with this.
+    pub(crate) suffix: &'static str,
+    /// Matching requests to answer normally first.
+    pub(crate) skip: usize,
+    /// Apply the request before withholding the answer.
+    pub(crate) commit: bool,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct FakeFile {
     pub(crate) id: String,
@@ -82,6 +95,8 @@ struct State {
     creation_order: Vec<String>,
     sessions: HashMap<String, Session>,
     faults: VecDeque<(Op, Fault)>,
+    hold: Option<Hold>,
+    held: usize,
     tokens: HashSet<String>,
     counts: HashMap<Op, usize>,
     next_id: u64,
@@ -104,6 +119,19 @@ impl State {
         let token = self.new_id("access-");
         self.tokens.insert(token.clone());
         token
+    }
+
+    fn take_hold(&mut self, op: Op, target: Option<&str>, request: &Request) -> Option<Hold> {
+        let suffix = self.hold.as_ref().filter(|hold| hold.op == op)?.suffix;
+        if !request_name(self, op, target, request).is_some_and(|name| name.ends_with(suffix)) {
+            return None;
+        }
+        let hold = self.hold.as_mut()?;
+        if hold.skip > 0 {
+            hold.skip -= 1;
+            return None;
+        }
+        self.hold.take()
     }
 
     fn take_fault(&mut self, op: Op) -> Option<Fault> {
@@ -324,6 +352,15 @@ impl FakeDrive {
 
     pub(crate) fn fault(&self, op: Op, fault: Fault) {
         self.lock().faults.push_back((op, fault));
+    }
+
+    pub(crate) fn hold(&self, hold: Hold) {
+        self.lock().hold = Some(hold);
+    }
+
+    /// Requests the server has stopped answering.
+    pub(crate) fn held(&self) -> usize {
+        self.lock().held
     }
 
     pub(crate) fn pending_faults(&self) -> usize {
@@ -638,6 +675,15 @@ fn serve(mut stream: TcpStream, state: &Mutex<State>, base: &str) {
         );
         return;
     }
+    if let Some(hold) = guard.take_hold(op, target.as_deref(), &request) {
+        if hold.commit {
+            handle(&mut guard, op, target.as_deref(), &request, base, None);
+        }
+        guard.held += 1;
+        drop(guard);
+        park(&mut stream);
+        return;
+    }
     let fault = guard.take_fault(op);
     match &fault {
         Some(Fault::Status(status, why)) => {
@@ -699,6 +745,39 @@ fn serve(mut stream: TcpStream, state: &Mutex<State>, base: &str) {
         }
         _ => write_reply(&mut stream, &reply, None),
     }
+}
+
+/// Keeps the connection open without answering until the client goes away.
+fn park(stream: &mut TcpStream) {
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(100)));
+    let deadline = Instant::now() + Duration::from_secs(180);
+    let mut sink = [0u8; 8192];
+    while Instant::now() < deadline {
+        match stream.read(&mut sink) {
+            Ok(0) => return,
+            Ok(_) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(_) => return,
+        }
+    }
+}
+
+/// The name of the file a request creates, uploads or reads.
+fn request_name(state: &State, op: Op, target: Option<&str>, request: &Request) -> Option<String> {
+    let metadata = match op {
+        Op::Multipart => multipart(request)?.0,
+        Op::StartSession => serde_json::from_slice(&request.body).ok()?,
+        Op::Chunk | Op::QuerySession => state.sessions.get(target?)?.metadata.clone(),
+        Op::Get | Op::Media | Op::Patch => {
+            return state.files.get(target?).map(|file| file.name.clone());
+        }
+        _ => return None,
+    };
+    metadata.get("name")?.as_str().map(str::to_string)
 }
 
 fn parse_range(header: &str, len: u64) -> Option<(u64, u64)> {

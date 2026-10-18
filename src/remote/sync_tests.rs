@@ -41,7 +41,7 @@ impl Env {
     }
 
     /// Packs above 256 KiB travel through resumable sessions.
-    fn resumable() -> Self {
+    pub(crate) fn resumable() -> Self {
         let fake = FakeDrive::start();
         let drive = fake.client().with_upload_sizes(256 << 10, 256 << 10);
         Self::with(fake, drive)
@@ -64,7 +64,7 @@ impl Env {
         }
     }
 
-    fn named(&self, suffix: &str) -> Vec<crate::remote::fake::FakeFile> {
+    pub(crate) fn named(&self, suffix: &str) -> Vec<crate::remote::fake::FakeFile> {
         self.fake
             .files()
             .into_iter()

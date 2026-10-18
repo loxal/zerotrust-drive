@@ -11,6 +11,8 @@
 pub(crate) mod cli;
 pub(crate) mod config;
 #[cfg(test)]
+mod crash_tests;
+#[cfg(test)]
 mod fake;
 pub(crate) mod format;
 pub(crate) mod gdrive;
