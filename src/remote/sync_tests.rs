@@ -165,7 +165,11 @@ pub(crate) struct Store {
 
 impl Store {
     fn create(label: &str, kdf: KdfParams, files: &[(&str, Vec<u8>)]) -> Self {
-        let dir = TestDir::new(label);
+        Self::create_in(TestDir::new(label), kdf, files)
+    }
+
+    /// Creates the store in `dir/store`; `dir` must exist.
+    pub(crate) fn create_in(dir: TestDir, kdf: KdfParams, files: &[(&str, Vec<u8>)]) -> Self {
         let base = dir.path().join("store");
         std::fs::create_dir_all(&base).unwrap();
         save_kdf(&base, &kdf).unwrap();

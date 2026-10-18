@@ -30,14 +30,24 @@ const RUN_ENV: &str = "ZDRIVE_RUN_GDRIVE_TESTS";
 pub(crate) struct Live {
     pub(crate) drive: GoogleDrive,
     pub(crate) folder: String,
+    /// The run folder's name below the remote's folder.
+    pub(crate) run: String,
     hint: String,
     keep: bool,
     client: OAuthClient,
     refresh_token: String,
 }
 
-impl Live {
-    pub(crate) fn start(label: &str) -> Self {
+/// The configured live remote and a client for its account.
+pub(crate) struct Account {
+    pub(crate) config: RemoteConfig,
+    client: OAuthClient,
+    refresh_token: String,
+    pub(crate) drive: GoogleDrive,
+}
+
+impl Account {
+    pub(crate) fn open() -> Self {
         assert_eq!(
             std::env::var(RUN_ENV).as_deref(),
             Ok("1"),
@@ -57,6 +67,32 @@ impl Live {
             refresh_token.clone(),
             &Endpoints::google(),
         )));
+        Self {
+            config,
+            client,
+            refresh_token,
+            drive,
+        }
+    }
+
+    /// A second client for the same account, for a thread that owns one.
+    pub(crate) fn client(&self) -> GoogleDrive {
+        GoogleDrive::new(Box::new(RefreshTokenSource::new(
+            self.client.clone(),
+            self.refresh_token.clone(),
+            &Endpoints::google(),
+        )))
+    }
+}
+
+impl Live {
+    pub(crate) fn start(label: &str) -> Self {
+        let Account {
+            config,
+            client,
+            refresh_token,
+            drive,
+        } = Account::open();
         let mut nonce = [0u8; 4];
         crate::crypto::fill_random(&mut nonce);
         let run = format!("live-{label}-{}", crate::remote::hex(&nonce));
@@ -70,6 +106,7 @@ impl Live {
         Self {
             drive,
             folder,
+            run,
             hint,
             keep: std::env::var("ZDRIVE_GDRIVE_KEEP").as_deref() == Ok("1"),
             client,
@@ -160,6 +197,77 @@ pub(crate) fn empty_replica(label: &str) -> (TestDir, PathBuf, PathBuf) {
     std::fs::create_dir_all(&base).unwrap();
     let state = dir.path().join("cli-state");
     (dir, base, state)
+}
+
+/// What [`check_mirror`] found.
+pub(crate) struct Mirrored {
+    pub(crate) identical: usize,
+    pub(crate) absent: usize,
+    pub(crate) bytes: u64,
+}
+
+/// Compares the local copy that Drive for desktop keeps of a Drive folder
+/// with the folder itself: every mirrored file must equal its Drive file
+/// byte for byte and hold no plaintext canary. Files not mirrored yet are
+/// counted, not failed.
+pub(crate) fn check_mirror(drive: &GoogleDrive, folder: &str, mirror: &Path) -> Mirrored {
+    let mut pending = vec![(folder.to_string(), mirror.to_path_buf())];
+    let mut found = Mirrored {
+        identical: 0,
+        absent: 0,
+        bytes: 0,
+    };
+    while let Some((parent, dir)) = pending.pop() {
+        for file in drive.list(&parent, false).unwrap() {
+            let local = dir.join(&file.name);
+            if file.is_folder() {
+                pending.push((file.id.clone(), local));
+                continue;
+            }
+            let Ok(content) = std::fs::read(&local) else {
+                found.absent += 1;
+                continue;
+            };
+            assert_eq!(
+                Some(content.len() as u64),
+                file.size(),
+                "{}",
+                local.display()
+            );
+            assert_eq!(
+                Some(crate::remote::md5_bytes(&content)),
+                file.md5(),
+                "{}",
+                local.display()
+            );
+            assert!(
+                !content.windows(CANARY.len()).any(|window| window == CANARY),
+                "plaintext canary in {}",
+                local.display()
+            );
+            found.identical += 1;
+            found.bytes += content.len() as u64;
+        }
+    }
+    found
+}
+
+/// With `ZDRIVE_GDRIVE_MIRROR` naming the local copy that Drive for desktop
+/// keeps of the remote's folder, everything mirrored equals the remote.
+#[test]
+#[ignore = "requires ZDRIVE_RUN_GDRIVE_TESTS=1, a configured remote and ZDRIVE_GDRIVE_MIRROR"]
+fn live_mirror_holds_exactly_the_remote_ciphertext() {
+    let mirror = PathBuf::from(
+        std::env::var("ZDRIVE_GDRIVE_MIRROR")
+            .expect("set ZDRIVE_GDRIVE_MIRROR to the local mirror of the remote's folder"),
+    );
+    let account = Account::open();
+    let found = check_mirror(&account.drive, &account.config.folder_id, &mirror);
+    eprintln!(
+        "mirror: {} files ({} bytes) identical, {} not mirrored",
+        found.identical, found.bytes, found.absent
+    );
+    assert!(found.identical > 0, "nothing mirrored yet");
 }
 
 #[test]

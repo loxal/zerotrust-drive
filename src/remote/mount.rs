@@ -839,3 +839,7 @@ fn next_event(shared: &Shared, plan: &mut Plan) -> Event {
 #[cfg(test)]
 #[path = "mount_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "bench_tests.rs"]
+mod bench;
