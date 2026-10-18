@@ -50,7 +50,9 @@ use super::{RemoteError, hex, md5_bytes, md5_file, unhex};
 /// Present while a bootstrap pull is filling an empty directory. Mounting
 /// refuses such a directory; `zdrive remote pull` finishes it.
 pub(crate) const PULL_PENDING_FILE: &str = "_zdrive-pull.pending";
-const UPLOAD_PARALLELISM: usize = 3;
+/// Concurrent pack uploads. A 1 GiB push measured 42 s with 3, 35-36 s with
+/// 6 and no further gain with 8; chunk PUTs are not write-paced.
+const UPLOAD_PARALLELISM: usize = 6;
 const DOWNLOAD_PARALLELISM: usize = 4;
 /// Sealed packs waiting for an upload worker; bounds outgoing disk use.
 const PIPELINE_DEPTH: usize = 2;
@@ -2175,7 +2177,6 @@ pub(crate) fn verify(
             for info in &generations {
                 walker.generation(info, &mut check)?;
             }
-            drop(check);
             report.generations = generations.len();
             report.objects = seen.len();
             if missing > 0 {
