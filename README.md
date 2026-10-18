@@ -56,12 +56,50 @@ V2 writes fresh immutable objects and publishes an authenticated copy-on-write g
 the small `_root.age` pointer changes last. Updates atomically exchange it and retain the displaced
 root as transaction evidence; the first generation is published with atomic no-replace.
 
+### Quick start
+
+1. Install zdrive. On Linux, install the `.deb` or the tarball from a
+   [release](https://github.com/loxal/zerotrust-drive/releases), see
+   [Linux installation](#linux-installation). On macOS, install
+   [macFUSE](https://macfuse.github.io/) and the release's `zdrive-macos-aarch64` binary as
+   `zdrive` on your `PATH`.
+2. Run the guided setup with your Google account:
+
+       zdrive setup --account you@gmail.com
+
+   Setup shows its plan and asks before it changes anything. It asks twice for the drive
+   passphrase (a new drive needs at least 12 characters), signs in to Google once in the browser or with a device
+   code (see [Setup](#setup)), creates or joins the "ZeroTrust Drive" folder in My Drive, runs the
+   first transfer and starts the drive automatically at login (macOS) or boot (Linux), see
+   [Auto-start](#auto-start). By default the drive appears at `~/zdrive` and its encrypted store
+   lives in `~/.local/share/zerotrust-drive/drive/store`.
+3. Work in `~/zdrive`. Google only ever receives ciphertext.
+
+Every question has a flag (`--name`, `--dir`, `--store`, `--passphrase-file`, `--no-autostart`,
+`--yes`, ...; see `zdrive setup --help`), so setup also runs unattended. `zdrive doctor` checks an
+installation without printing any secret.
+
+**Unencrypted storage is opt-in.** `zdrive setup --plain` keeps an ordinary folder in sync with a
+Drive folder of plain files that Google, and anyone with access to the account, can read; see
+[Plain mode](#plain-mode). Encrypted storage stays the default.
+
+**Telemetry is on by default and never leaves your computer.** zdrive records local diagnostics
+that help find performance and reliability problems; `zdrive telemetry off` turns them off. See
+[Telemetry](#telemetry) and [PRIVACY.md](PRIVACY.md).
+
 ### Cloud backend guidance
 
 For a new store on Google Drive, prefer [native Google Drive API sync](#native-google-drive-api-sync)
 (beta since 0.17.0): it uploads a generation only after every object it needs, which Drive for
 desktop does not guarantee, and it also runs on Linux. The folder-sync guidance below applies when
 a desktop client replicates the encrypted folder.
+
+API mode is already a mirror: every computer keeps a complete local replica and Drive keeps a
+complete copy, with nothing streamed on demand. A Computers folder of Drive for desktop is no
+better target: it backs up one computer and does not sync down to another, Drive for desktop has
+no Linux client, and the bundled `drive.file` client cannot write into a folder Drive for desktop
+created. In the [benchmark](#benchmark), a store in such a synced folder also took 1.1 to 39 times
+as long to reach Drive and exposed incomplete generations.
 
 For folder sync, the primary recommended beta backing target is a dedicated folder in Google Drive `My Drive`, with Google
 Drive for desktop configured to **Mirror files**. Mirror mode keeps ordinary local files and
@@ -295,30 +333,59 @@ verified, so Drive always holds a complete generation.
 
 #### Setup
 
-1. Create your own OAuth client; `zdrive` deliberately ships none:
-   - In the Google Cloud console, create a project and enable the Google Drive API.
-   - Configure the OAuth consent screen as **External** and **publish it to production**. An app
-     left in "Testing" receives refresh tokens that expire after seven days.
-   - Create an OAuth client of type **Desktop app**, download its JSON, and save it as
-     `~/.config/zerotrust-drive/google-oauth-client.json` with mode `0600`.
+[`zdrive setup`](#quick-start) runs every step below for you. To run them yourself, authorize a
+named remote:
 
-   `zdrive` requests the full `drive` scope, so that a remote can live in a folder created by
-   something else, such as a Computers folder of Drive for desktop. Google therefore shows an
-   "unverified app" warning at consent; for your own client that is expected.
-2. Authorize a named remote and choose its folder:
+    zdrive remote auth --remote gdrive --account you@gmail.com
 
-       zdrive remote auth --remote gdrive --folder-path zerotrust-drive
+- Release builds carry zdrive's own Google OAuth client, listed as "ZeroTrust Drive", with the
+  `drive.file` scope: zdrive sees only the files and folders it created itself, from any computer
+  that uses this client, and never the rest of your Drive. It creates the folder "ZeroTrust Drive"
+  in My Drive (`--folder-name NAME` chooses another name) or joins the one an earlier
+  installation created; when several such folders exist it refuses and lists their ids.
+  `--folder-path A/B` places the remote at a nested path below My Drive instead, joining the
+  folders an earlier installation created on that path. Folders you created yourself stay
+  invisible to this client, so zdrive creates its own folder beside one of the same name.
+- On a desktop the command opens the browser (`open` on macOS, `xdg-open` on Linux) and receives
+  Google's answer on a loopback address, with PKCE and a `state` check. Over SSH, and on Linux
+  without a graphical session, it prints a short code instead: open https://www.google.com/device
+  on any phone or computer, enter the code and sign in. `--device-code` selects this flow
+  anywhere. `--account` is suggested to Google, and a sign-in with another account is refused.
+- The prompt asks for the store passphrase: it seals the refresh token with XChaCha20-Poly1305
+  under an Argon2id key in `~/.config/zerotrust-drive/remotes/gdrive.json` (mode `0600`). Remote
+  commands never accept the built-in demo passphrase or an empty one. After a rekey, run
+  `zdrive remote auth` again. `--passphrase-file FILE` reads it from a file only you can read.
 
-   This opens the browser (`open` on macOS, `xdg-open` on Linux) and receives Google's answer on a
-   loopback address, with PKCE and a `state` check. On a headless host, `--no-browser` prints the
-   address and reads the redirected address back. `--folder-path` is a slash-separated path below
-   My Drive or below `--folder-id ID`; missing folders are created and duplicate names are refused.
-   `--client-file FILE` selects another client JSON.
+A Google app password cannot reach Drive: app passwords serve older apps that sign in with a
+password, such as mail clients, while the Drive API accepts only OAuth. The one-time consent above takes its place;
+after it, zdrive refreshes its access on its own.
 
-   The prompt asks for the store passphrase: it seals the refresh token with XChaCha20-Poly1305
-   under an Argon2id key in `~/.config/zerotrust-drive/remotes/gdrive.json` (mode `0600`). Remote
-   commands never accept the built-in demo passphrase or an empty one. After a rekey, run
-   `zdrive remote auth` again.
+Google has not yet verified the "ZeroTrust Drive" brand, so its consent screen shows no link to the
+privacy policy; the policy is [PRIVACY.md](PRIVACY.md). Sign-in and access work the same.
+
+#### Bring your own OAuth client
+
+A build from source contains no Google client (release builds receive it at build time), and a
+remote in a folder that zdrive did not create, such as a Computers folder of Drive for desktop,
+needs the full `drive` scope. Both use your own client:
+
+1. In the Google Cloud console, create a project and enable the Google Drive API.
+2. Configure the OAuth consent screen as **External** and **publish it to production**. An app
+   left in "Testing" receives refresh tokens that expire after seven days.
+3. Create an OAuth client of type **Desktop app**, download its JSON, and save it as
+   `~/.config/zerotrust-drive/google-oauth-client.json` with mode `0600` (a build without the
+   bundled client uses that file by default), or pass it with `--client-file FILE`.
+
+Then authorize with a folder of your choice:
+
+    zdrive remote auth --remote gdrive --client-file ~/client.json --folder-path zerotrust-drive
+
+Google shows an "unverified app" warning at consent; for your own client that is expected.
+`--folder-path` is a slash-separated path below My Drive or below `--folder-id ID`; missing
+folders are created and duplicate names are refused. On a host without a browser, `--no-browser`
+prints the address and reads the redirected address back. A remote configured with your own
+client keeps it on later `remote auth` runs, and every token refresh uses the client that issued
+the token.
 
 #### Mounting with automatic sync
 
@@ -430,13 +497,219 @@ not counted. The harness is
   smaller id wins and the other is refused.
 - v1 stores are refused; run `--migrate-v2` first.
 
+### Plain mode
+
+Plain mode is the opt-in alternative to encryption: an ordinary local folder kept in two-way sync
+with a Drive folder of plain files. **Google, and anyone with access to the account, can read
+every file**, and the files are readable in the Drive web interface. It needs no FUSE.
+
+    zdrive setup --plain --account you@gmail.com       # folder ~/zdrive, Drive "ZeroTrust Drive (plain)"
+    zdrive sync --remote plain --dir ~/zdrive          # one sync now
+    zdrive sync --remote plain --dir ~/zdrive --watch  # keep syncing, every 15 s (--interval SECS)
+
+Setup signs in, creates or joins the marked Drive folder, runs the first sync and installs
+[auto-start](#auto-start), which runs `zdrive sync --watch`. The first SIGINT or SIGTERM finishes
+the current cycle and runs a final one; a second stops at once.
+
+Each cycle first applies Drive's change feed, then uploads what changed locally:
+
+- A download lands in a temporary file next to its target, is checked against Drive's size and
+  MD5 and flushed to disk, and only then replaces the file, and only if the local file is still
+  the version zdrive last synced. The replaced version goes to the local trash described below.
+- If a file changed on both sides, both versions are kept: the Drive version is renamed to
+  `name (conflict YYYY-MM-DD HHMMSS host).ext` on Drive and locally, and the local version is
+  uploaded as a new Drive file.
+- An edit updates the Drive file in place, so its sharing and version history stay; a local
+  rename or move becomes a move on Drive.
+- A local deletion moves the Drive file to the Drive bin, recoverable for 30 days. A deletion on
+  Drive moves the local file into `~/.local/share/zerotrust-drive/<name>/trash/`, kept for 30 days;
+  zdrive never deletes a synced file outright. If the local file changed meanwhile, it is kept and
+  uploaded again instead.
+- Files modified less than two seconds ago wait for a later cycle, and an upload whose file
+  changes while it is read is retried in the next cycle.
+- Symbolic links, sockets, devices, other file systems and names that are not UTF-8 are skipped
+  and counted; `.DS_Store`, `._*` and zdrive's own `.zdrive-*` names are ignored.
+
+The index lives in `~/.local/state/zerotrust-drive/plain/<name>.json` and binds the remote to one
+local folder: a remote has one plain replica per computer. The folder may not contain, or lie
+inside, zdrive's own configuration, state or data folders.
+
+Limits:
+
+- With the bundled sign-in (`drive.file`), zdrive sees only the files zdrive itself created, on
+  any computer. Files added through the Drive web interface or another app do not sync down;
+  with your own OAuth client (full `drive` scope) they do. Google Docs, Sheets and other
+  Google-native documents never sync, since they have no file content.
+- Concurrent writers resolve through conflict copies, not locks. When both sides rename the same
+  item, the local name wins.
+- Names that differ only in letter case or Unicode normalization collide on macOS and become
+  conflict copies.
+- Hard links upload as separate files.
+- An interrupted large upload starts again from the beginning after a restart.
+- A Drive edit that lands in the moment between zdrive's check and its upload can be overwritten;
+  Drive keeps the overwritten content as an earlier revision of the file, typically for 30 days.
+
+On macOS, if you already run Drive for desktop and only need plain files backed up, adding the
+folder there (Computers) works without zdrive.
+
+### Auto-start
+
+`zdrive setup` installs auto-start unless `--no-autostart` is given; `zdrive service` manages it
+afterwards:
+
+    zdrive service install --name drive --remote drive \
+        --encrypted-dir ~/.local/share/zerotrust-drive/drive/store --mount-dir ~/zdrive
+    zdrive service list                    # every instance with its state
+    zdrive service status drive
+    zdrive service uninstall drive         # keeps the definition; --purge --yes deletes it
+
+An instance is defined once in `~/.config/zerotrust-drive/services/<name>.json` (mode `0600`).
+The service manager only runs `zdrive service run <name>`, which reads that definition, recovers a
+stale FUSE mount left by a crash, and then mounts the drive (or, in plain mode, keeps the folder
+in sync).
+
+- **macOS:** a LaunchAgent `~/Library/LaunchAgents/net.loxal.zerotrust-drive.<name>.plist` starts
+  the drive at login and restarts it after a failure. Its log is
+  `~/Library/Logs/zerotrust-drive/<name>.log`. The mount relies on the macFUSE approval you gave
+  when installing macFUSE.
+- **Linux:** a systemd user unit `zerotrust-drive@<name>.service` (`Type=notify`, restarted on
+  failure) starts the drive at boot. Boot start needs lingering for your user; zdrive enables it
+  when polkit allows, and otherwise prints the exact `sudo loginctl enable-linger <user>` to run.
+  Logs: `journalctl --user -u zerotrust-drive@<name>`.
+
+An unattended encrypted drive needs its passphrase without a terminal. On Linux with systemd 256 or
+newer, zdrive encrypts it with `systemd-creds --user`, bound to the machine's TPM or host key,
+into `services/<name>.cred`; systemd hands it to the drive only while it runs. Elsewhere, including
+macOS and Ubuntu 24.04, it is kept in a file only you can read (`services/<name>.passphrase`, mode
+`0600`, or your own file through `--passphrase-file`). Anyone who can read that file, or a backup
+of it, can decrypt the drive, so keep the home directory protected. `--custody` selects the
+method explicitly; after a passphrase rotation, run `zdrive service install --name <name>
+--replace-passphrase`.
+
+On stop, the drive flushes locally and then waits up to 60 seconds (`--final-push-wait SECS`) for
+its last upload. Data that missed it is durable locally and is uploaded first on the next start.
+If a program still uses the drive, for example a terminal whose current directory is inside it,
+the drive keeps serving and retries the unmount every second. After 90 seconds systemd or launchd
+kills it. It keeps flushing acknowledged writes within 5 to 30 seconds while it waits, so only
+writes from those last seconds can be lost, and the next start clears the stale mount.
+
+At shutdown, systemd stops your user manager, and with it every user unit, within the user
+manager's own stop timeout. Ubuntu's systemd package lowers that to 5 seconds
+(`/usr/lib/systemd/system/user@.service.d/timeout.conf`) so that a hanging desktop service cannot
+delay a shutdown, so on Ubuntu a final upload still running after 5 seconds is cut short. The
+drive unmounts and flushes locally before it uploads, which normally takes well under a second,
+and the next start uploads the rest; only another computer sees those last writes later. `zdrive
+doctor` and `zdrive service install` report a timeout below 90 seconds. To give the final upload
+the full 90 seconds, at the cost of shutdowns waiting that long for any hanging user service:
+
+    sudo mkdir -p /etc/systemd/system/user@.service.d
+    printf '[Service]\nTimeoutStopSec=90\n' | sudo tee /etc/systemd/system/user@.service.d/zz-zerotrust-drive.conf
+    sudo systemctl daemon-reload
+
+### Telemetry
+
+zdrive keeps local diagnostics so that performance, resilience and reliability problems can be
+found and fixed from evidence. **Nothing is ever uploaded.** Records are JSON lines in
+`~/.local/state/zerotrust-drive/telemetry/<instance>/YYYYMMDD.jsonl`, kept for 30 days and capped
+at 64 MiB (256 MiB at `full`).
+
+| Level | Records |
+|---|---|
+| `off` | nothing; existing records stay until `zdrive telemetry purge --yes` |
+| `standard` (default) | start and stop, one snapshot a minute, errors, sync and Google Drive request summaries |
+| `full` | also a snapshot every 10 seconds, every operation slower than 250 ms, every Drive request with its status and retries, sync step events, and crash messages with paths removed |
+
+Snapshots carry FUSE operation counts, latency histograms and error codes, store commit and fsync
+times, upload and download volumes, retries and rate limits, and the process's memory, CPU time and
+number of open files. Records never contain file or folder names, paths inside the drive, file
+contents, passphrases, tokens, OAuth client secrets or your email address. A test drives the store,
+sync and crash paths at `full` with canary names, paths and contents and searches every recorded
+byte for them.
+
+    zdrive telemetry status                # level, where it came from, location and size
+    zdrive telemetry report --since 24h    # latency percentiles, errors, retries, restarts, crashes
+    zdrive telemetry report --json         # the same as one JSON object, for tools and agents
+    zdrive telemetry export --output zdrive-telemetry.tar   # to share manually
+    zdrive telemetry off                   # or: telemetry level standard|full, telemetry on
+    zdrive telemetry purge --yes
+
+The level comes from `--telemetry LEVEL`, then the `ZDRIVE_TELEMETRY` environment variable, then
+`~/.config/zerotrust-drive/telemetry.json` (written by the commands above), then `standard`.
+Recording never blocks the drive: a full disk or an unwritable telemetry directory only loses
+records, which are counted.
+
+#### Overhead
+
+Recording a file operation costs two clock reads and a few atomic counter updates; all file writes
+happen on a separate thread. Before 0.18.0 was released, its cost was measured end to end against
+0.17.0 through a real FUSE mount in an arm64 Linux container on an M3 Max, without Google Drive:
+
+* W2 writes 2,000 small files and reads them back.
+* W3 makes 200 fsync'd 4 KiB edits to a 64 MiB file.
+
+Each workload ran nine times for each of four variants: 0.17.0, and 0.18.0 with telemetry `off`,
+`standard` and `full`. Within each run the variants executed back to back, in a rotating order.
+The ratios below pair each 0.18.0 variant with the 0.17.0 run from the same round; the brackets
+give a 95% bootstrap interval.
+
+| Workload | 0.17.0 median | `off` | `standard` | `full` |
+|---|---|---|---|---|
+| W2 | 17.8 s | 0.96 [0.90, 1.12] | 1.09 [0.89, 1.50] | 1.05 [1.00, 1.08] |
+| W3 | 11.5 s | 1.04 [0.98, 1.07] | 1.04 [0.97, 1.16] | 1.05 [1.01, 1.21] |
+
+**The result is inconclusive.** The declared margins were at most 3% slower at `standard` and at
+most 5% at `full`. No interval fits within its margin, and none lies wholly above it, so neither
+non-regression nor a regression is shown.
+
+The host was shared, with a load average of 11 to 15. Back-to-back runs of the same round differed
+by up to a factor of two, and the run-to-run spread exceeds the margins. Compared with 0.18.0 at
+`off`, which is the same binary, the median cost is between -2% and +8%, with intervals reaching
++35%.
+
+Every 0.18.0 variant's median p99 latency stayed within the range of 0.17.0's runs. All 72 runs
+completed and unmounted cleanly, and no telemetry byte contained a canary file name. Telemetry
+used at most 8 KiB per run.
+
+A quiet-host rerun is listed in `TODO.md`. The artifacts, by SHA-256 prefix:
+
+* zdrive 0.17.0 (07199d8): 779d9efa
+* zdrive 0.18.0 (release tree): 238f3ad1
+* harness: 7d93b14d
+
 ### Prerequisites
 
 A FUSE implementation is required. Install the one for your OS:
 
 - **macOS** - [macFUSE](https://macfuse.github.io/)
-- **Linux** - FUSE 3 (Debian/Ubuntu: `sudo apt install libfuse3-dev fuse3`, Fedora: `sudo dnf install fuse3-devel`)
+- **Linux** - FUSE 3 (the `fuse3` package; the `.deb` below installs it for you)
 - **Windows** - not supported (would require [WinFSP](https://winfsp.dev/) and a different FUSE crate)
+
+[Plain mode](#plain-mode) needs no FUSE. `zdrive doctor` reports whether FUSE is ready. On macOS,
+macFUSE's kernel extension loads at the first mount, which macOS must allow under System Settings >
+Privacy & Security; on Apple silicon, kernel extensions must first be enabled in recoveryOS.
+
+#### Linux installation
+
+Every release has packages for x86_64 (`amd64`) and aarch64 (`arm64`) that run on Debian 12,
+Ubuntu 22.04 and newer, and other distributions with glibc 2.34 or newer. On Debian and Ubuntu,
+download the `.deb` from the [releases page](https://github.com/loxal/zerotrust-drive/releases)
+and install it with apt, which also pulls in `fuse3`:
+
+    sudo apt install ./zerotrust-drive_0.18.0_amd64.deb    # or zerotrust-drive_0.18.0_arm64.deb
+    zdrive --version
+
+On other distributions, install `fuse3` with the package manager (it provides `fusermount3`,
+which mounts the drive for a regular user) and unpack the tarball instead:
+
+    tar -xzf zdrive-0.18.0-linux-x86_64.tar.gz             # or zdrive-0.18.0-linux-aarch64.tar.gz
+    sudo install -m 0755 zdrive-0.18.0-linux-x86_64/zdrive /usr/local/bin/zdrive
+
+Each release also lists `SHA256SUMS`; check the downloads with
+`sha256sum --check --ignore-missing SHA256SUMS`. Building from source (see
+[Building](#building)) needs Rust and a C compiler (`build-essential` on Debian and Ubuntu); the
+FUSE crate mounts through `fusermount3`, so neither `libfuse3-dev` nor `pkg-config` is required.
+
+After installing, run `zdrive setup` for the guided first-time configuration.
 
 #### macOS: permissions troubleshooting
 
@@ -449,11 +722,20 @@ Access** and enable access for the terminal or application using the mount.
 
 ### Directory Layout
 
-    ~/g.drive/.zerotrust.drive.encrypted/    encrypted storage - synced by Google Drive (ciphertext + non-secret KDF salt)
-    ~/z.drive/                              FUSE mount point - local, NOT synced (you work here)
+    ~/.local/share/zerotrust-drive/store/   encrypted store of a bare `zdrive` ($XDG_DATA_HOME; ciphertext + non-secret KDF salt)
+    ~/z.drive/                              FUSE mount point of a bare `zdrive` - local (you work here)
+    ~/.local/share/zerotrust-drive/<name>/  store of a drive set up with `zdrive setup --name <name>`
+    ~/.config/zerotrust-drive/              remotes, service definitions, telemetry level (all 0600)
+    ~/.local/state/zerotrust-drive/         per-replica sync state and telemetry
 
 The encrypted directory is auto-managed by zerotrust-drive. Do not modify its contents directly.
 Both paths are overridable via justfile variables or CLI flags `--encrypted-dir` / `--decrypted-dir`.
+
+**Changed in 0.18:** a bare `zdrive` used to keep its store in
+`~/g.drive/.zerotrust.drive.encrypted`, inside a Drive for desktop folder. If that store exists and
+the new default does not, zdrive refuses to start rather than create an empty drive beside it, and
+names both choices: mount the old store with `--encrypted-dir ~/g.drive/.zerotrust.drive.encrypted`,
+or move it, while it is not mounted, to `~/.local/share/zerotrust-drive/store`.
 
 ### Usage
 
@@ -473,7 +755,8 @@ Press Ctrl+C in the mounting terminal, or send SIGTERM or SIGHUP, to unmount. Th
 flushes every acknowledged write to encrypted storage and exits with status 0, or 1 if any write
 could not be persisted. If a program still has a file open, the unmount is refused rather than detached: the
 drive reports it and keeps serving, and the next Ctrl+C or signal tries again once the file is
-closed. `just umount` and an external `umount` / `fusermount3 -u` flush the same way. A signal
+closed. A drive run as a service (`--service`, which `zdrive service` instances use) gets no second
+signal, so it retries the unmount every second by itself until the file is closed. `just umount` and an external `umount` / `fusermount3 -u` flush the same way. A signal
 received before the drive is mounted, for example at the passphrase prompt, restores the terminal
 and terminates as usual.
 

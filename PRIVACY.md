@@ -90,8 +90,9 @@ by hand.
 **What is recorded.** The zdrive version, operating system, architecture and
 kernel; mode and remote kind; operation counts, latencies and error codes;
 sync durations, byte counts and lag; remote request outcomes, retries and
-rate limits; process memory and CPU time; and the code location of a crash
-(at `full`, also the crash message with paths removed).
+rate limits; process memory, CPU time and the number of open files; and
+the code location of a crash (at `full`, also the crash message with paths
+removed).
 
 **What is never recorded.** File and directory names, paths inside your
 drive, file contents, your passphrase, OAuth tokens, client secrets and your

@@ -19,6 +19,8 @@ just umount                 # Unmount (Ctrl+C in the mounting terminal also unmo
 just rekey                  # Rotate a v1 passphrase (prompts, or ZEROTRUST_NEW_PASSPHRASE)
 just clean                  # cargo clean only; never touches the store or mount point
 just icons                  # rebuild assets/icon/zerotrust-drive.icns from its SVG (rsvg-convert + iconutil)
+just deb                    # Linux .deb + tarballs (amd64, arm64) in dist/ via podman (Ubuntu 22.04 glibc baseline)
+just deb-test arm64         # install that .deb on Ubuntu 22.04/24.04/26.04 and Debian 12, FUSE smoke as root and user
 cargo test                  # Run tests (hermetic: the Drive API tests use an in-process fake server)
 # Live kernel-mounted signal/busy-unmount tests (Linux, needs fuse3):
 ZDRIVE_RUN_LIVE_FUSE_TESTS=1 cargo test --locked --test live_fuse -- --ignored --test-threads=1
@@ -32,7 +34,7 @@ environment or prompts on `/dev/tty`.
 
 ## Architecture
 
-- **Encrypted storage**: `~/g.drive/.zerotrust.drive.encrypted/` (v2 immutable authenticated objects + `_root.age` + plaintext `_kdf.json`; legacy v1 stores retain opaque `.age` blobs + `_index.age`)
+- **Encrypted storage**: `$XDG_DATA_HOME/zerotrust-drive/store/` by default since 0.18 (`~/.local/share/...`; `zdrive setup` uses `.../zerotrust-drive/<name>/store`; a pre-0.18 store in `~/g.drive/.zerotrust.drive.encrypted` is refused, never silently mounted) (v2 immutable authenticated objects + `_root.age` + plaintext `_kdf.json`; legacy v1 stores retain opaque `.age` blobs + `_index.age`)
 - **Decrypted mount**: `~/z.drive/` (FUSE mount; v2 file I/O is chunked, while legacy v1 open files are RAM-backed)
 - **Index**: v2 stores an immutable encrypted metadata snapshot referenced through an authenticated generation and `_root.age`; v1 uses mutable `_index.age`. Both describe the directory tree, permissions, sizes, timestamps, and opaque backing references.
 - **KDF metadata**: `_kdf.json` (plaintext, salts are not secret) holds the per-drive Argon2id salt + cost params. Its presence marks a v1 (0.7+) drive
@@ -45,7 +47,12 @@ environment or prompts on `/dev/tty`.
 |------|---------|
 | `src/main.rs` | CLI entry point (clap); `--migrate-format` v0→v1 upgrade; mounts through `fuser::Session` |
 | `src/shutdown.rs` | SIGINT/SIGTERM/SIGHUP via a `sigwait` thread: non-lazy unmount while mounted so `destroy` flushes; default action otherwise |
-| `src/prompt.rs` | No-echo `/dev/tty` passphrase prompt and source precedence (env, flag, prompt, demo fallback) |
+| `src/prompt.rs` | No-echo `/dev/tty` passphrase prompt and source precedence (env, `$CREDENTIALS_DIRECTORY`, `--passphrase-file`, flag, prompt, demo fallback) |
+| `src/setup.rs` | `zdrive setup`: guided sign-in, Drive folder create/join, first sync, auto-start; every prompt has a flag |
+| `src/doctor.rs` | `zdrive doctor`: FUSE, bundled client presence, systemd/creds, remotes, services, telemetry; prints no secrets |
+| `src/service/` | `zdrive service install\|uninstall\|status\|list\|run`: LaunchAgent plist / systemd user unit, passphrase custody (systemd-creds or 0600 file), sd_notify, stale-mount recovery |
+| `src/plain/` | Opt-in plain two-way sync (`zdrive sync`, no FUSE): `engine` (cycle, watch, backoff), `pull` (changes feed, safe downloads, conflicts), `push` (scan, uploads, moves, Drive bin), `local` (ignore rules, conflict names, local trash), `state` (locked index bound to folder and Drive id), `cli` |
+| `src/telemetry/` | Local-only JSONL telemetry (`off`/`standard`/`full`): FUSE op histograms, snapshots, events, retention and caps, `zdrive telemetry status\|report\|export\|level\|purge` |
 | `src/fs.rs` | FUSE filesystem + encrypted directory index (InodeEntry tree) |
 | `src/crypto.rs` | Argon2id KDF + XChaCha20-Poly1305 encrypt/decrypt (+ retained v0 legacy readers for migration) |
 | `src/v2.rs` | Immutable chunk/tree objects, copy-on-write generations, authenticated root-last commit and recovery |
@@ -56,7 +63,7 @@ environment or prompts on `/dev/tty`.
 | `src/rekey.rs` | Passphrase re-keying (keeps the drive salt; new passphrase → new key) |
 | `src/remote/mod.rs` | Native Drive API replication of v2 stores: typed `RemoteError`, private config/state file helpers |
 | `src/remote/cli.rs` | `zdrive remote auth\|push\|pull\|status\|verify`; never falls back to the demo passphrase |
-| `src/remote/oauth.rs` | Installed-app OAuth: loopback redirect, PKCE S256, `state` check, `--no-browser` paste-back, token refresh |
+| `src/remote/oauth.rs` | Installed-app OAuth: loopback redirect, PKCE S256, `state` check, `--no-browser` paste-back, device flow, bundled `drive.file` clients (build-time `ZDRIVE_GOOGLE_*` env) or BYO full scope, token refresh with the issuing client |
 | `src/remote/config.rs` | `~/.config/zerotrust-drive/remotes/<name>.json`; refresh token sealed under an Argon2id key from the store passphrase |
 | `src/remote/gdrive.rs` | Blocking `ureq` Drive v3 client: GCRA pacer, jittered backoff, pre-generated ids, resumable uploads, md5 checks |
 | `src/remote/format.rs` | Remote layout: marker, `_kdf.json` copy, append-only `packs/*.zpk`, `roots/*.zr`, `leases/` |
@@ -66,14 +73,16 @@ environment or prompts on `/dev/tty`.
 | `src/remote/lease.rs` | Advisory writer leases (random replica id, heartbeat); fork detection stays the guarantee |
 | `src/remote/fake.rs` | In-process fake Drive server with fault injection for the hermetic suite |
 | `src/remote/crash_tests.rs` | Subprocess SIGKILL matrix at every push and pull checkpoint |
-| `tests/live_fuse.rs` | Opt-in Linux live-mount tests: signals unmount, flush and exit 0; a busy mount keeps serving |
+| `tests/live_fuse.rs` | Opt-in Linux live-mount tests: signals unmount, flush and exit 0; a busy mount keeps serving, and under `--service` retries the unmount by itself |
 | `tests/fixtures/format/` | Committed v1/v2 stores pinning the on-disk format (with KATs in `crypto.rs`) |
 | `assets/icon/` | ZeroTrust Drive icon: SVG source and the committed `.icns` built by `just icons` |
+| `packaging/` | `.deb` and tarball assembly (`just deb`, `just deb-test`), bundled-client release check |
+| `PRIVACY.md` | Privacy policy the OAuth consent screen links to; keep it in sync with what telemetry and the remote store |
 
 ## Conventions
 
 - Rust edition 2024
 - License: AGPL-3.0-only
 - CI: GitHub Actions
-- Passphrase precedence: `ZEROTRUST_PASSPHRASE`, `--passphrase`, then a no-echo terminal prompt (confirmed for a new store); without a terminal the demo fallback applies and a new store refuses it
+- Passphrase precedence: `ZEROTRUST_PASSPHRASE`, `$CREDENTIALS_DIRECTORY/zdrive-passphrase`, `--passphrase-file` (owner-only), `--passphrase`, then a no-echo terminal prompt (confirmed for a new store); without a terminal the demo fallback applies and a new store refuses it
 - Rotation needs `--rekey` (or `--new-passphrase` / `--continue-rekey`); the new passphrase comes from `ZEROTRUST_NEW_PASSPHRASE`, `--new-passphrase`, or a confirmed prompt

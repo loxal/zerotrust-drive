@@ -103,6 +103,8 @@ Drive behavior that shapes the design:
 - Drive reports `md5Checksum` and `size` for binary files. A root record is created only after every pack it needs matches both. MD5 is a transfer check only: a pull authenticates every object against its v2 digest before installing it, and `zdrive remote verify --full` downloads every pack to do the same remotely.
 - A mounted replica lists the root records every 60 seconds and latches itself read-only when another replica has published. Drive's changes feed (`changes.list` with a saved page token) could replace that poll; it is not used yet because one listing of the small `roots/` folder already answers the question exactly.
 - An External OAuth app whose publishing status is "Testing" receives refresh tokens that expire after seven days, so the app must be published to production; an unverified personal app shows Google's warning screen once at consent. The full `drive` scope lets `zdrive` use a folder created elsewhere, such as a Computers folder that Drive for desktop syncs; `drive.file` would only see files the app created.
+- Since 0.18.0 release builds bundle zdrive's own client with only the non-sensitive `drive.file` scope, so no security assessment or user cap applies; the full scope stays available with your own client. Files created by one installation are visible to every installation of the same client, which is what lets a second computer join a drive. The device flow for hosts without a browser accepts only `drive.file` and `drive.appdata` among the Drive scopes.
+- Drive for desktop's Computers feature was evaluated as the default for 0.18.0 and rejected: a Computers folder is a per-device backup that does not sync down to another computer, Drive for desktop has no Linux client, a `drive.file` client cannot write into a folder Drive for desktop created, and the 0.17.0 benchmark measured that very setup (a store in a Computers sync folder) as 1.1 to 39 times slower to reach Drive, with incomplete generations visible in eight of nine runs. API mode already keeps a complete replica on every computer and a complete copy on Drive.
 
 Sources:
 
@@ -111,6 +113,8 @@ Sources:
 - [Google Drive resumable uploads](https://developers.google.com/workspace/drive/api/guides/manage-uploads)
 - [Google Drive change tracking](https://developers.google.com/workspace/drive/api/guides/about-changes)
 - [Google OAuth 2.0 refresh token expiration](https://developers.google.com/identity/protocols/oauth2#expiration)
+- [Google OAuth 2.0 for TV and limited-input devices: allowed scopes](https://developers.google.com/identity/protocols/oauth2/limited-input-device#allowedscopes)
+- [Google Drive API scopes](https://developers.google.com/workspace/drive/api/guides/api-specific-auth)
 - [rclone Google Drive limitations](https://rclone.org/drive/#limitations)
 
 ### iCloud Drive with Keep Downloaded

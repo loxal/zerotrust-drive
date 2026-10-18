@@ -1,6 +1,15 @@
 <!-- SPDX-FileCopyrightText: Copyright 2026 Alexander Orlov <info@lifub.com> -->
 
-* daemon mode - run in backgroundd as a long-lived service
+* Google brand verification of the bundled "ZeroTrust Drive" OAuth client: unverified, the consent
+  screen may show a generic name and the privacy link stays hidden. Needs a domain-verified
+  homepage and privacy page (github.com cannot be verified by us).
+* Rerun the telemetry overhead benchmark (README "Telemetry > Overhead") on a quiet host: on a
+  shared host at load 11-15 the 0.18.0 result was inconclusive against the declared 3% (`standard`)
+  and 5% (`full`) margins. Same arms, workloads and pairing; more repeats if the spread stays wide.
+* Services restart forever on permanent configuration failures (a refused or binned Drive folder,
+  a wrong passphrase): `zdrive service run` exits 1, so systemd restarts it every 10 s and launchd
+  every 30 s, each start refreshing a token. Exit with a dedicated code (`EX_CONFIG`, 78), add
+  `RestartPreventExitStatus=78` to the unit, and on macOS stop the agent after repeated refusals.
 * Yandex Disk remote through its REST API (not WebDAV, paid-only since June 2026 and deleting
   permanently): `overwrite=false` uploads fit the immutable packs and root records, but there are
   no resumable sessions and no compare-and-swap of a head, so keep the listing-based fork detection.
