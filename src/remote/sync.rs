@@ -91,14 +91,7 @@ struct LocalHead {
 
 impl LocalStore<'_> {
     fn head(&self) -> Result<LocalHead, RemoteError> {
-        let state = replica::local_head(self.base, self.key, self.pin)?;
-        let root_bytes = replica::read_root_bytes(self.base)?
-            .ok_or_else(|| RemoteError::Local("the store has no v2 root".to_string()))?;
-        if replica::decode_root(self.key, &root_bytes)? != state.generation {
-            return Err(RemoteError::Local(
-                "the v2 root changed while it was read".to_string(),
-            ));
-        }
+        let (state, root_bytes) = replica::local_head(self.base, self.key, self.pin)?;
         Ok(LocalHead { state, root_bytes })
     }
 }
@@ -843,6 +836,23 @@ fn record_synced(
     state.save()
 }
 
+/// The local head's number when the remote last held exactly it, so there
+/// is nothing to upload; answers without the network.
+pub(crate) fn synced_head(
+    local: &LocalStore<'_>,
+    state: &RemoteState,
+) -> Result<Option<u64>, RemoteError> {
+    let head = local.head()?.state;
+    Ok(state
+        .record
+        .synced
+        .as_ref()
+        .filter(|synced| {
+            synced.number == head.number && synced.generation == object_hex(&head.generation)
+        })
+        .map(|synced| synced.number))
+}
+
 /// Outcome of one push.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct PushReport {
@@ -1026,7 +1036,7 @@ pub(crate) fn push(
     }
     if !needed.is_empty() || !resumed.is_empty() {
         remote.note(&format!(
-            "uploading {} objects in {} packs",
+            "uploading {} object(s) in {} pack(s)",
             needed.len() + pending.len(),
             plans.len() + resumed.len()
         ));
@@ -1695,7 +1705,7 @@ impl<'a> Fetcher<'a> {
             return Ok(());
         }
         self.remote
-            .note(&format!("downloading {} packs", packs.len()));
+            .note(&format!("downloading {} pack(s)", packs.len()));
         let results = parallel_map(packs, DOWNLOAD_PARALLELISM, &|&pack| self.download(pack));
         first_fatal(&results)?;
         for (&pack, result) in packs.iter().zip(results) {
@@ -1974,7 +1984,16 @@ pub(crate) fn status(
         return Ok(report);
     };
     report.remote = Some(found.number);
-    report.relation = if found.rivals > 0 {
+    report.relation = relate(local, &head, &found)?;
+    Ok(report)
+}
+
+fn relate(
+    local: &LocalStore<'_>,
+    head: &CommitState,
+    found: &RemoteHead,
+) -> Result<Relation, RemoteError> {
+    Ok(if found.rivals > 0 {
         Relation::Forked
     } else if found.generation == head.generation {
         Relation::Equal
@@ -1996,8 +2015,52 @@ pub(crate) fn status(
         Relation::LocalAhead
     } else {
         Relation::Diverged
+    })
+}
+
+/// What a periodic check during a mount learned.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Watch {
+    pub(crate) relation: Relation,
+    pub(crate) remote: Option<u64>,
+    pub(crate) local: u64,
+}
+
+/// A cheap check for another writer: it lists the folder and `roots/`,
+/// never `packs/`, and reads only root records it has not seen.
+pub(crate) fn watch(
+    remote: &Remote<'_>,
+    local: &LocalStore<'_>,
+    state: &mut RemoteState,
+) -> Result<Watch, RemoteError> {
+    let head = local.head()?.state;
+    let mut watch = Watch {
+        relation: Relation::NoRemoteStore,
+        remote: None,
+        local: head.number,
     };
-    Ok(report)
+    let Some(Snapshot { layout, roots, .. }) = snapshot(remote, state, false)? else {
+        return Ok(watch);
+    };
+    if !layout.holds_kdf(local.kdf_bytes) {
+        watch.relation = Relation::DifferentStore;
+        return Ok(watch);
+    }
+    let Some(found) = remote_head(
+        remote,
+        &layout,
+        roots,
+        local.key,
+        &known_records(state),
+        RemoteError::Integrity,
+    )?
+    else {
+        watch.relation = Relation::RemoteEmpty;
+        return Ok(watch);
+    };
+    watch.remote = Some(found.number);
+    watch.relation = relate(local, &head, &found)?;
+    Ok(watch)
 }
 
 #[derive(Debug, Default)]

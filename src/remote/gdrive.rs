@@ -68,6 +68,16 @@ impl RetryPolicy {
         write_interval: Duration::from_millis(400),
     };
 
+    /// This pacing with a smaller retry budget, for callers that have their
+    /// own fallback: a mount goes offline, the replicator backs off.
+    pub(crate) fn bounded(self, attempts: u32, cap: Duration) -> Self {
+        Self {
+            attempts: self.attempts.min(attempts),
+            cap: self.cap.min(cap),
+            ..self
+        }
+    }
+
     /// Full jitter: uniform in `[0, min(cap, base * 2^attempt)]`.
     fn delay(&self, attempt: u32) -> Duration {
         let ceiling = self
@@ -407,6 +417,15 @@ impl GoogleDrive {
             chunk: UPLOAD_CHUNK,
             trace: std::env::var_os("ZDRIVE_TRACE_HTTP").is_some_and(|value| value == "1"),
         }
+    }
+
+    pub(crate) fn retry_policy(&self) -> RetryPolicy {
+        self.policy
+    }
+
+    /// Applies to every later request.
+    pub(crate) fn set_retry_policy(&mut self, policy: RetryPolicy) {
+        self.policy = policy;
     }
 
     /// Smaller upload thresholds let tests exercise multi-chunk sessions.
@@ -1217,10 +1236,6 @@ impl GoogleDrive {
     }
 
     /// Replaces the given app properties, as lease heartbeats do.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "lease heartbeats arrive with mount-time sync")
-    )]
     pub(crate) fn set_app_properties(
         &self,
         id: &str,
@@ -1682,5 +1697,20 @@ mod tests {
             assert!(policy.delay(attempt) <= policy.cap);
         }
         assert!(policy.delay(0) <= policy.base);
+    }
+
+    #[test]
+    fn a_bounded_policy_keeps_the_pacing_and_never_widens_the_budget() {
+        let policy = RetryPolicy::PRODUCTION.bounded(3, Duration::from_secs(4));
+        assert_eq!(policy.attempts, 3);
+        assert_eq!(policy.cap, Duration::from_secs(4));
+        assert_eq!(policy.base, RetryPolicy::PRODUCTION.base);
+        assert_eq!(
+            policy.write_interval,
+            RetryPolicy::PRODUCTION.write_interval
+        );
+        let tighter = policy.bounded(10, Duration::from_secs(64));
+        assert_eq!(tighter.attempts, 3);
+        assert_eq!(tighter.cap, Duration::from_secs(4));
     }
 }

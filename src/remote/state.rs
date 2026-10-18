@@ -65,6 +65,21 @@ pub(crate) struct PendingLayout {
     pub(crate) marker: String,
 }
 
+/// This replica's advisory writer lease. The id is chosen and saved before
+/// the lease file is created, so a retried create reuses it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct LeaseRecord {
+    /// Random hex id naming this replica in `leases/`.
+    pub(crate) replica: String,
+    pub(crate) file_id: String,
+    /// The leases folder the file belongs to; a new remote layout gets a
+    /// new lease.
+    pub(crate) folder: String,
+    /// Whether Drive confirmed the create.
+    pub(crate) created: bool,
+}
+
 /// The layout a verified marker commits to. A later operation checks it
 /// against one listing of the remote folder instead of reading the marker
 /// and `_kdf.json` again; any mismatch falls back to the full read.
@@ -102,6 +117,8 @@ pub(crate) struct StateRecord {
     pub(crate) pending_root: Option<PendingRoot>,
     #[serde(default)]
     pub(crate) layout: Option<KnownLayout>,
+    #[serde(default)]
+    pub(crate) lease: Option<LeaseRecord>,
 }
 
 impl StateRecord {
@@ -114,6 +131,7 @@ impl StateRecord {
             pending_layout: None,
             pending_root: None,
             layout: None,
+            lease: None,
         }
     }
 
@@ -150,6 +168,11 @@ impl StateRecord {
                     &layout.leases,
                 ]
             }))
+            .chain(
+                self.lease
+                    .iter()
+                    .flat_map(|lease| [&lease.file_id, &lease.folder]),
+            )
             .chain(std::iter::once(&self.folder_id));
         if ids.into_iter().any(|id| !valid_file_id(id)) {
             return Err("names an invalid provider id".to_string());
@@ -165,6 +188,13 @@ impl StateRecord {
             );
         if md5s.into_iter().any(|md5| unhex::<16>(md5).is_none()) {
             return Err("names an invalid md5".to_string());
+        }
+        if self
+            .lease
+            .as_ref()
+            .is_some_and(|lease| unhex::<16>(&lease.replica).is_none())
+        {
+            return Err("names an invalid lease replica".to_string());
         }
         Ok(())
     }
@@ -520,6 +550,37 @@ mod tests {
             );
         }
         value["layout"] = serde_json::Value::Null;
+        let lease = serde_json::json!({
+            "replica": "0f".repeat(16), "file_id": "lease_1", "folder": "l", "created": true,
+        });
+        value["lease"] = lease.clone();
+        write_private_file(&path, &serde_json::to_vec(&value).unwrap()).unwrap();
+        assert!(
+            RemoteState::open(&dir, "folder1")
+                .unwrap()
+                .record
+                .lease
+                .is_some_and(|lease| lease.created)
+        );
+        for (field, bad) in [
+            ("replica", "0f".repeat(15)),
+            ("replica", "zz".repeat(16)),
+            ("file_id", "../x".to_string()),
+            ("folder", "a/b".to_string()),
+        ] {
+            let mut tampered = lease.clone();
+            tampered[field] = serde_json::json!(bad);
+            value["lease"] = tampered;
+            write_private_file(&path, &serde_json::to_vec(&value).unwrap()).unwrap();
+            assert!(
+                matches!(
+                    RemoteState::open(&dir, "folder1"),
+                    Err(RemoteError::Local(_))
+                ),
+                "{field}"
+            );
+        }
+        value["lease"] = serde_json::Value::Null;
         value["synced"] = serde_json::json!({
             "number": 1, "generation": "ab".repeat(48), "record": "r",
             "record_md5": "short", "encrypted_dir": "/x", "unix_seconds": 1,

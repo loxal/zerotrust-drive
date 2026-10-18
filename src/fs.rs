@@ -6,7 +6,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -1223,6 +1223,13 @@ pub(crate) struct FsInner {
     /// writes and persistence stay disabled until remount even if a provider
     /// later hides the conflicting artifact again.
     persistence_failure: Mutex<Option<String>>,
+    /// Set when automatic remote sync finds another writer. New writes fail
+    /// with EROFS until remount, while writes already accepted still persist
+    /// locally; online maintenance never clears it.
+    remote_write_block: Mutex<Option<String>>,
+    /// Called after every v2 root publication, with the persistence lock
+    /// held; automatic remote sync only queues a push from it.
+    v2_commit_observer: OnceLock<Box<dyn Fn() + Send + Sync>>,
     /// Set only when this mount's current v2 commit may have published its own
     /// authenticated manifest before returning an error. Synchronous namespace
     /// handlers use it to decide whether rollback would contradict recovery.
@@ -1532,11 +1539,48 @@ impl FsInner {
     }
 
     /// Online maintenance may temporarily set `read_only`; it must never
-    /// clear a fatal cloud-conflict latch while restoring ordinary writes.
+    /// clear a fatal cloud-conflict latch or a remote write block while
+    /// restoring ordinary writes.
     pub(crate) fn restore_writes_if_healthy(&self) {
-        if self.persistence_error().is_none() {
+        let remote_blocked = self
+            .remote_write_block
+            .lock()
+            .map_or(true, |block| block.is_some());
+        if self.persistence_error().is_none() && !remote_blocked {
             self.read_only.store(false, Ordering::SeqCst);
         }
+    }
+
+    /// Refuses new writes until remount because the remote replica moved on
+    /// without this mount. Unlike a persistence failure, already accepted
+    /// writes still reach the local store. Returns false when writes were
+    /// already blocked for a remote reason.
+    pub(crate) fn block_writes_for_remote(&self, reason: String) -> bool {
+        let first = match self.remote_write_block.lock() {
+            Ok(mut block) => {
+                let first = block.is_none();
+                block.get_or_insert(reason);
+                first
+            }
+            Err(_) => false,
+        };
+        self.read_only.store(true, Ordering::SeqCst);
+        first
+    }
+
+    /// Registers the single v2 commit observer. Returns false if one exists.
+    pub(crate) fn observe_v2_commits(&self, observer: Box<dyn Fn() + Send + Sync>) -> bool {
+        self.v2_commit_observer.set(observer).is_ok()
+    }
+
+    /// The exact `_kdf.json` this mount authenticated at startup.
+    pub(crate) fn kdf_fingerprint(&self) -> &RecoveryFingerprint {
+        &self.kdf_fingerprint
+    }
+
+    /// The immutable namespace a v2 mount holds open.
+    pub(crate) fn v2_namespace_pin(&self) -> Option<&v2::V2NamespacePin> {
+        self.v2_namespace_pin.as_ref()
     }
 
     fn ensure_writable(&self) -> std::io::Result<()> {
@@ -2066,6 +2110,8 @@ impl ZeroTrustFs {
             format_controls,
             read_only: AtomicBool::new(false),
             persistence_failure: Mutex::new(None),
+            remote_write_block: Mutex::new(None),
+            v2_commit_observer: OnceLock::new(),
             prospective_intent_may_be_durable: AtomicBool::new(false),
             dirty_inodes: Mutex::new(HashSet::new()),
             persistence_mutex: Mutex::new(()),
@@ -2204,6 +2250,9 @@ impl ZeroTrustFs {
                 && let Ok(mtime) = metadata.modified()
             {
                 *self.inner.index_mtime.lock().unwrap() = Some(mtime);
+            }
+            if let Some(observer) = self.inner.v2_commit_observer.get() {
+                observer();
             }
             return Ok(());
         }

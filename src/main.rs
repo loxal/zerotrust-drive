@@ -133,6 +133,21 @@ struct Cli {
     /// unencrypted. For tests/demos only.
     #[arg(long)]
     allow_default_passphrase: bool,
+
+    /// Keep the store in sync with this remote while mounted (see `zdrive
+    /// remote auth`): catch up before mounting, upload every change, and
+    /// upload the final state on unmount. Exits with status 75 when the
+    /// remote does not hold the final state; local data is durable either way
+    #[arg(
+        long,
+        value_name = "NAME",
+        conflicts_with_all = [
+            "rekey", "new_passphrase", "continue_rekey", "migrate_format", "migrate_v2",
+            "gc_v2", "gc_v2_quarantine", "gc_v2_restore", "gc_v2_purge",
+            "confirm_sync_paused", "allow_default_passphrase",
+        ]
+    )]
+    remote: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -643,6 +658,22 @@ fn main() {
     // to a different directory. Keep display_base_path only for diagnostics.
     let base_path = PathBuf::from(".");
 
+    // Catch up with the remote before the store is inspected for mounting:
+    // this fills an empty directory, finishes an interrupted first pull and
+    // fast-forwards an existing replica.
+    let mut terminal = prompt::TerminalReader::open();
+    let prepared_remote = cli.remote.take().map(|remote| {
+        remote::mount::prepare(
+            &remote,
+            &display_base_path,
+            &base_path,
+            &drive_operation_lock,
+            cli.passphrase.take(),
+            terminal.as_mut(),
+        )
+        .unwrap_or_else(|e| exit_with_error(e))
+    });
+
     // An interrupted first pull leaves objects without a head. Mounting,
     // migration and GC would all take it for a new or broken store.
     if remote::sync::bootstrap_pending(&base_path).unwrap_or_else(|e| exit_with_error(e)) {
@@ -673,18 +704,23 @@ fn main() {
         .unwrap_or_else(|e| exit_with_error(format!("cannot inspect encrypted v2 root: {e}")));
     let creating_store =
         !index_exists && !root_exists && !cli.migrate_format && !cli.migrate_v2 && !gc_requested;
-    let mut terminal = prompt::TerminalReader::open();
-    let (passphrase, _passphrase_source) = prompt::resolve_current(
-        std::env::var("ZEROTRUST_PASSPHRASE").ok(),
-        cli.passphrase.take(),
-        terminal
-            .as_mut()
-            .map(|terminal| terminal as &mut dyn prompt::SecretReader),
-        cli.allow_default_passphrase,
-        creating_store,
-        DEMO_PASSPHRASE,
-    )
-    .unwrap_or_else(|e| exit_with_error(e));
+    let passphrase = match &prepared_remote {
+        Some(prepared) => prepared.passphrase().to_string(),
+        None => {
+            prompt::resolve_current(
+                std::env::var("ZEROTRUST_PASSPHRASE").ok(),
+                cli.passphrase.take(),
+                terminal
+                    .as_mut()
+                    .map(|terminal| terminal as &mut dyn prompt::SecretReader),
+                cli.allow_default_passphrase,
+                creating_store,
+                DEMO_PASSPHRASE,
+            )
+            .unwrap_or_else(|e| exit_with_error(e))
+            .0
+        }
+    };
     if !rekey_requested && std::env::var_os("ZEROTRUST_NEW_PASSPHRASE").is_some() {
         eprintln!(
             "zerotrust-drive: note: ignoring ZEROTRUST_NEW_PASSPHRASE because --rekey was not given"
@@ -1064,12 +1100,33 @@ fn main() {
             );
         }
     }
+    let inner = ztfs.inner.clone();
+    let mut replicator = prepared_remote.map(|prepared| {
+        prepared
+            .start(inner.clone())
+            .unwrap_or_else(|e| exit_with_error(e))
+    });
     eprintln!("zerotrust-drive: press Ctrl+C to unmount and flush");
 
-    let inner = ztfs.inner.clone();
     serve(ztfs, &mountpoint)
         .unwrap_or_else(|e| exit_with_error(format!("failed to mount filesystem: {e}")));
-    exit_unless_persisted(&inner);
+    let Some(replicator) = replicator.as_mut() else {
+        exit_unless_persisted(&inner);
+        return;
+    };
+    // Upload even after a failed final flush: the remote then holds the
+    // last generation that did reach the local disk, and the exit status
+    // still reports the failed flush.
+    let flushed = inner.persistence_error().is_none();
+    if flushed {
+        exit_unless_persisted(&inner);
+    }
+    let outcome = replicator.finish(remote::mount::FINAL_WAIT);
+    let status = replicator.report(&outcome);
+    if !flushed {
+        exit_unless_persisted(&inner);
+    }
+    std::process::exit(status);
 }
 
 /// Mount and serve until the filesystem is unmounted, by a signal or

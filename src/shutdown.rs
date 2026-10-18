@@ -16,6 +16,9 @@
 //!   error is reported, the drive keeps serving, and the next signal retries.
 //! - **Unmounting**: further signals are reported and ignored until the final
 //!   flush completes.
+//! - **Finishing** (the final upload of automatic remote sync, after the local
+//!   flush): a signal abandons the upload. Local data is already durable and
+//!   the next push or mount resumes the upload.
 //!
 //! A signal the parent process set to be ignored (for example SIGHUP under
 //! `nohup`) stays ignored.
@@ -29,6 +32,7 @@ enum Phase {
     Default,
     Mounted(PathBuf),
     Unmounting,
+    Finishing(Box<dyn Fn() + Send>),
 }
 
 static PHASE: Mutex<Phase> = Mutex::new(Phase::Default);
@@ -84,6 +88,11 @@ pub(crate) fn session_ended() {
     *phase() = Phase::Default;
 }
 
+/// Route later signals to `abandon` while the final upload runs.
+pub(crate) fn finishing(abandon: Box<dyn Fn() + Send>) {
+    *phase() = Phase::Finishing(abandon);
+}
+
 fn receive(set: libc::sigset_t) {
     loop {
         let mut signal: libc::c_int = 0;
@@ -115,6 +124,13 @@ fn handle(signal: libc::c_int) {
             "zerotrust-drive: {} received; already unmounting - waiting for the encrypted state to flush",
             signal_name(signal)
         ),
+        Phase::Finishing(abandon) => {
+            eprintln!(
+                "zerotrust-drive: {} received; leaving the upload unfinished - local data is safe",
+                signal_name(signal)
+            );
+            abandon();
+        }
         Phase::Mounted(mountpoint) => {
             let mountpoint = mountpoint.clone();
             *current = Phase::Unmounting;

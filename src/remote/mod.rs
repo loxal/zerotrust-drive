@@ -14,6 +14,8 @@ pub(crate) mod config;
 mod fake;
 pub(crate) mod format;
 pub(crate) mod gdrive;
+pub(crate) mod lease;
+pub(crate) mod mount;
 pub(crate) mod oauth;
 pub(crate) mod state;
 pub(crate) mod sync;

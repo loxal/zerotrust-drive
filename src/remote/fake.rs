@@ -89,6 +89,8 @@ struct State {
     page_size: Option<usize>,
     omit_checksums: bool,
     foreign_location: bool,
+    /// Every API request fails with 503, as during an outage.
+    offline: bool,
     token_forms: Vec<BTreeMap<String, String>>,
 }
 
@@ -346,6 +348,10 @@ impl FakeDrive {
 
     pub(crate) fn omit_checksums_on_create(&self, omit: bool) {
         self.lock().omit_checksums = omit;
+    }
+
+    pub(crate) fn set_offline(&self, offline: bool) {
+        self.lock().offline = offline;
     }
 
     pub(crate) fn use_foreign_session_location(&self, foreign: bool) {
@@ -622,6 +628,15 @@ fn serve(mut stream: TcpStream, state: &Mutex<State>, base: &str) {
             );
             return;
         }
+    }
+    if guard.offline && op != Op::Token {
+        drop(guard);
+        write_reply(
+            &mut stream,
+            &Reply::error(503, "backendError", "offline"),
+            None,
+        );
+        return;
     }
     let fault = guard.take_fault(op);
     match &fault {

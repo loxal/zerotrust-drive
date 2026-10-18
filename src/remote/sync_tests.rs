@@ -78,7 +78,7 @@ impl Env {
         }
     }
 
-    fn push(&self, store: &Store) -> Result<PushReport, RemoteError> {
+    pub(crate) fn push(&self, store: &Store) -> Result<PushReport, RemoteError> {
         push(
             &self.remote(),
             &store.local(),
@@ -144,7 +144,7 @@ impl Env {
         }
     }
 
-    fn clone_store(&self, label: &str) -> Store {
+    pub(crate) fn clone_store(&self, label: &str) -> Store {
         self.bootstrap_into(TestDir::new(label), PASSPHRASE)
             .map_err(|(_, error)| error)
             .unwrap()
@@ -204,7 +204,7 @@ impl Store {
         let (_, fingerprint) = load_kdf_with_fingerprint(&base).unwrap().unwrap();
         let pin = V2NamespacePin::capture(&base).unwrap();
         v2::recover_with_namespace_pin(&base, &key, &fingerprint, &pin).unwrap();
-        let head = replica::local_head(&base, &key, &pin).unwrap();
+        let (head, _) = replica::local_head(&base, &key, &pin).unwrap();
         let mut store = Self {
             kdf_bytes: std::fs::read(base.join("_kdf.json")).unwrap(),
             dir,
@@ -262,7 +262,7 @@ impl Store {
             .collect()
     }
 
-    fn local(&self) -> LocalStore<'_> {
+    pub(crate) fn local(&self) -> LocalStore<'_> {
         LocalStore {
             base: &self.base,
             key: &self.key,
@@ -273,7 +273,7 @@ impl Store {
         }
     }
 
-    fn state(&self, folder: &str) -> RemoteState {
+    pub(crate) fn state(&self, folder: &str) -> RemoteState {
         RemoteState::open(&self.dir.path().join("state"), folder).unwrap()
     }
 }

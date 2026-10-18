@@ -461,12 +461,18 @@ pub(crate) fn finish_bootstrap(
     Ok(state)
 }
 
-/// Current authenticated head of a local store, after the caller ran
-/// recovery.
+/// Current authenticated head of a local store with the exact `_root.age`
+/// bytes it came from, after the caller ran recovery. The root is read once,
+/// so a commit by a concurrently mounted filesystem cannot pair one
+/// generation with another generation's root bytes.
 pub(crate) fn local_head(
     base_path: &Path,
     key: &[u8; 32],
     pin: &V2NamespacePin,
-) -> std::io::Result<CommitState> {
-    load_with_pin(base_path, key, pin).map(|(_, state)| state)
+) -> std::io::Result<(CommitState, Vec<u8>)> {
+    pin.verify(base_path)?;
+    let root_bytes = read_bounded_backing_file(&base_path.join(ROOT_FILE), MAX_ROOT_CIPHERTEXT)?;
+    let (_, state) = load_root_bytes_with_pin(base_path, key, root_bytes.clone(), Some(pin))?;
+    pin.verify(base_path)?;
+    Ok((state, root_bytes))
 }

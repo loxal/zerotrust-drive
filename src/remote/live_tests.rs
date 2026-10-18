@@ -12,6 +12,11 @@
 //! read -s -x ZEROTRUST_PASSPHRASE
 //! cargo test --locked remote::cli::live -- --ignored --test-threads=1 --nocapture
 //! ```
+//!
+//! `live_scratch_folder` with `ZDRIVE_GDRIVE_KEEP=1` only creates and keeps an
+//! empty run folder. A copy of the remote's configuration pointing at it lets
+//! a kernel mount with `--remote` start a fresh store there without touching
+//! the remote's own folder.
 
 use std::time::Instant;
 
@@ -22,15 +27,17 @@ use crate::remote::sync::tests::{CANARY, PASSPHRASE, Store, content};
 
 const RUN_ENV: &str = "ZDRIVE_RUN_GDRIVE_TESTS";
 
-struct Live {
-    drive: GoogleDrive,
-    folder: String,
+pub(crate) struct Live {
+    pub(crate) drive: GoogleDrive,
+    pub(crate) folder: String,
     hint: String,
     keep: bool,
+    client: OAuthClient,
+    refresh_token: String,
 }
 
 impl Live {
-    fn start(label: &str) -> Self {
+    pub(crate) fn start(label: &str) -> Self {
         assert_eq!(
             std::env::var(RUN_ENV).as_deref(),
             Ok("1"),
@@ -46,8 +53,8 @@ impl Live {
         let client = OAuthClient::load(&config.client_file).unwrap();
         let refresh_token = config.token.unseal(&name, &passphrase).unwrap();
         let drive = GoogleDrive::new(Box::new(RefreshTokenSource::new(
-            client,
-            refresh_token,
+            client.clone(),
+            refresh_token.clone(),
             &Endpoints::google(),
         )));
         let mut nonce = [0u8; 4];
@@ -65,7 +72,18 @@ impl Live {
             folder,
             hint,
             keep: std::env::var("ZDRIVE_GDRIVE_KEEP").as_deref() == Ok("1"),
+            client,
+            refresh_token,
         }
+    }
+
+    /// A second client for the same account, for a component that owns one.
+    pub(crate) fn client(&self) -> GoogleDrive {
+        GoogleDrive::new(Box::new(RefreshTokenSource::new(
+            self.client.clone(),
+            self.refresh_token.clone(),
+            &Endpoints::google(),
+        )))
     }
 
     fn remote(&self) -> Remote<'_> {
@@ -78,7 +96,12 @@ impl Live {
 
     /// One command as `store_command` runs it after its lock and credential
     /// steps, timed.
-    fn run(&self, action: Action, base: &Path, state: &Path) -> Result<Summary, RemoteError> {
+    pub(crate) fn run(
+        &self,
+        action: Action,
+        base: &Path,
+        state: &Path,
+    ) -> Result<Summary, RemoteError> {
         let started = Instant::now();
         let kind = inspect_store(base, "store").map_err(RemoteError::Local)?;
         admit(action, kind, &RemoteName::parse("live").unwrap(), "store")?;
@@ -101,7 +124,7 @@ impl Live {
     }
 
     /// Every file and folder below the run folder.
-    fn files(&self) -> Vec<DriveFile> {
+    pub(crate) fn files(&self) -> Vec<DriveFile> {
         let mut pending = vec![self.folder.clone()];
         let mut files = Vec::new();
         while let Some(parent) = pending.pop() {
@@ -131,7 +154,7 @@ fn progress(line: &str) {
 }
 
 /// An empty directory for a first pull, and the sync state beside it.
-fn empty_replica(label: &str) -> (TestDir, PathBuf, PathBuf) {
+pub(crate) fn empty_replica(label: &str) -> (TestDir, PathBuf, PathBuf) {
     let dir = TestDir::new(label);
     let base = dir.path().join("store");
     std::fs::create_dir_all(&base).unwrap();
@@ -235,4 +258,15 @@ fn live_diverged_writer_is_refused_and_records_survive() {
         .count();
     assert_eq!(roots, 2);
     assert_eq!(replica.contents()["a.txt"], content(7, 10));
+}
+
+#[test]
+#[ignore = "requires ZDRIVE_RUN_GDRIVE_TESTS=1, ZDRIVE_GDRIVE_KEEP=1 and a configured remote"]
+fn live_scratch_folder() {
+    let live = Live::start("scratch");
+    assert!(
+        live.keep,
+        "set ZDRIVE_GDRIVE_KEEP=1, or the folder goes to the Drive bin at once"
+    );
+    assert!(live.files().is_empty());
 }

@@ -159,13 +159,13 @@ pub(crate) fn run(command: RemoteCommand) -> i32 {
     }
 }
 
-fn note(message: &str) {
+pub(crate) fn note(message: &str) {
     eprintln!("zerotrust-drive: {message}");
 }
 
 /// Reads the store passphrase. Remote commands never fall back to the demo
 /// passphrase: a credential sealed under it would be readable by anyone.
-fn read_passphrase(
+pub(crate) fn read_passphrase(
     argument: Option<String>,
     terminal: Option<&mut TerminalReader>,
     confirm: bool,
@@ -362,24 +362,13 @@ fn store_command(args: StoreArgs, action: Action) -> Result<Summary, String> {
     let client = OAuthClient::load(&config.client_file).map_err(|error| error.to_string())?;
     let mut terminal = TerminalReader::open();
     let passphrase = read_passphrase(args.passphrase, terminal.as_mut(), false)?;
-    let refresh_token = config
-        .token
-        .unseal(&name, &passphrase)
-        .map_err(|error| error.to_string())?;
-    let drive = GoogleDrive::new(Box::new(RefreshTokenSource::new(
-        client,
-        refresh_token,
-        &Endpoints::google(),
-    )));
+    let drive = open_drive(client, &config, &name, &passphrase)?;
     let remote = Remote {
         drive: &drive,
         folder_id: &config.folder_id,
         log: &note,
     };
-    ensure_private_dir(&paths.state).map_err(|error| error.to_string())?;
-    ensure_private_dir(&paths.state.join("remotes")).map_err(|error| error.to_string())?;
-    ensure_private_dir(&paths.remote_state(&name)).map_err(|error| error.to_string())?;
-    let state_dir = paths.replica_state(&name, &canonical);
+    let state_dir = replica_state(&paths, &name, &canonical)?;
     lock.revalidate()?;
     let mut summary = execute(
         action,
@@ -396,6 +385,41 @@ fn store_command(args: StoreArgs, action: Action) -> Result<Summary, String> {
         format!("remote {name}: {} -> {display}", config.folder_hint),
     );
     Ok(summary)
+}
+
+/// The Drive client of a configured remote, with its credential unsealed
+/// by the store passphrase.
+pub(crate) fn open_drive(
+    client: OAuthClient,
+    config: &RemoteConfig,
+    name: &RemoteName,
+    passphrase: &str,
+) -> Result<GoogleDrive, String> {
+    let refresh_token = config
+        .token
+        .unseal(name, passphrase)
+        .map_err(|error| error.to_string())?;
+    Ok(GoogleDrive::new(Box::new(RefreshTokenSource::new(
+        client,
+        refresh_token,
+        &Endpoints::google(),
+    ))))
+}
+
+/// The private sync-state directory of one local replica of `name`.
+pub(crate) fn replica_state(
+    paths: &Paths,
+    name: &RemoteName,
+    canonical: &Path,
+) -> Result<PathBuf, String> {
+    for dir in [
+        paths.state.clone(),
+        paths.state.join("remotes"),
+        paths.remote_state(name),
+    ] {
+        ensure_private_dir(&dir).map_err(|error| error.to_string())?;
+    }
+    Ok(paths.replica_state(name, canonical))
 }
 
 /// Refuses every directory a remote command must not touch, before any
@@ -546,7 +570,7 @@ fn size(bytes: u64) -> String {
     }
 }
 
-fn transfer(generations: usize, objects: usize, packs: usize, bytes: u64) -> String {
+pub(crate) fn transfer(generations: usize, objects: usize, packs: usize, bytes: u64) -> String {
     format!(
         "{generations} generation(s), {objects} object(s) in {packs} pack(s), {}",
         size(bytes)
@@ -699,4 +723,4 @@ mod tests;
 
 #[cfg(test)]
 #[path = "live_tests.rs"]
-mod live;
+pub(crate) mod live;
