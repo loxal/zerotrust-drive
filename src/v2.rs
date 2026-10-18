@@ -38,6 +38,8 @@ use crate::storage::{AccessIntent, RelativeStorePath, StoreRoot};
 
 #[path = "v2_gc.rs"]
 mod gc;
+#[path = "v2_replica.rs"]
+pub(crate) mod replica;
 pub(crate) use gc::{gc_preview, gc_purge, gc_quarantine, gc_restore};
 
 pub(crate) const ROOT_FILE: &str = "_root.age";
@@ -291,6 +293,46 @@ impl V2NamespacePin {
             )?;
             self.verify(base_path)?;
             Ok(created)
+        }
+    }
+
+    /// Length of an immutable object file, without following a symlink.
+    pub(crate) fn object_file_len(&self, base_path: &Path, name: &str) -> std::io::Result<u64> {
+        self.verify(base_path)?;
+        #[cfg(not(unix))]
+        {
+            let _ = name;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "pinned immutable-object metadata requires Unix openat semantics",
+            ));
+        }
+        #[cfg(unix)]
+        {
+            let c_name = CString::new(name)
+                .map_err(|_| io_invalid("immutable v2 object name contains NUL"))?;
+            let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+            // SAFETY: the descriptor is owned by this pin, the name is a valid
+            // C string and `stat` is a correctly sized output buffer.
+            let result = unsafe {
+                libc::fstatat(
+                    self.objects.as_raw_fd(),
+                    c_name.as_ptr(),
+                    stat.as_mut_ptr(),
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            };
+            if result != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // SAFETY: fstatat succeeded, so it initialized the buffer.
+            let stat = unsafe { stat.assume_init() };
+            if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
+                return Err(io_invalid(format!(
+                    "pinned immutable v2 object {name:?} is not a regular file"
+                )));
+            }
+            u64::try_from(stat.st_size).map_err(|_| io_invalid("negative object length"))
         }
     }
 
@@ -3543,6 +3585,45 @@ fn commit_with_phase_and_lineage(
             initial_lineage,
             namespace_pin,
         )?;
+        publish_prepared_generation(
+            base_path,
+            key,
+            previous,
+            kdf_fingerprint,
+            generation,
+            number,
+            lineage_id,
+            namespace_pin,
+            &mut recovery_required,
+            &mut own_intent_may_be_durable,
+        )
+    })();
+    result.map_err(|error| CommitFailure {
+        error,
+        recovery_required,
+        own_intent_may_be_durable,
+    })
+}
+
+/// Publishes an already materialized generation through the crash-safe
+/// manifest, root exchange and evidence protocol shared by local commits and
+/// remote fast-forwards. The caller has verified that no manifest is pending
+/// and that the canonical root still equals `previous`.
+#[allow(clippy::too_many_arguments)]
+fn publish_prepared_generation(
+    base_path: &Path,
+    key: &[u8; 32],
+    previous: Option<&CommitState>,
+    kdf_fingerprint: &RecoveryFingerprint,
+    generation: ObjectRef,
+    number: u64,
+    lineage_id: [u8; 16],
+    namespace_pin: Option<&V2NamespacePin>,
+    recovery_required: &mut bool,
+    own_intent_may_be_durable: &mut bool,
+) -> std::io::Result<CommitState> {
+    {
+        let expected_old = previous.map(|state| state.root_fingerprint.clone());
         if let Some(pin) = namespace_pin {
             pin.verify_at(base_path, "after v2 generation preparation")?;
         }
@@ -3587,14 +3668,14 @@ fn commit_with_phase_and_lineage(
         )?;
         let manifest_path = base_path.join(WRITE_MANIFEST);
         if root_fingerprint(base_path)? != expected_old {
-            recovery_required = true;
+            *recovery_required = true;
             return Err(io_invalid(
                 "v2 root changed during generation preparation; refusing to publish write intent",
             ));
         }
         if let Err(error) = ensure_no_index_siblings(base_path) {
             if error.kind() == std::io::ErrorKind::AlreadyExists {
-                recovery_required = true;
+                *recovery_required = true;
             }
             return Err(error);
         }
@@ -3604,7 +3685,7 @@ fn commit_with_phase_and_lineage(
             ))
         })?;
         if &pre_intent_kdf != kdf_fingerprint {
-            recovery_required = true;
+            *recovery_required = true;
             return Err(io_invalid(
                 "KDF metadata changed during generation preparation; refusing to publish write intent",
             ));
@@ -3615,14 +3696,14 @@ fn commit_with_phase_and_lineage(
         // From this point onward, even an error returned immediately after a
         // completed namespace operation may have published authenticated intent.
         // The caller must latch read-only and recover before retrying.
-        recovery_required = true;
+        *recovery_required = true;
         let retained_ready = match publish_noreplace(&manifest_ready, &manifest_path) {
             Ok(retained) => {
-                own_intent_may_be_durable = true;
+                *own_intent_may_be_durable = true;
                 retained
             }
             Err(error) => {
-                own_intent_may_be_durable =
+                *own_intent_may_be_durable =
                     read_bounded_regular(&manifest_path, MAX_MANIFEST_CIPHERTEXT)
                         .is_ok_and(|actual| actual == manifest_ciphertext);
                 return Err(error);
@@ -3764,12 +3845,7 @@ fn commit_with_phase_and_lineage(
             lineage_id: manifest.lineage_id,
             root_fingerprint: new_root,
         })
-    })();
-    result.map_err(|error| CommitFailure {
-        error,
-        recovery_required,
-        own_intent_may_be_durable,
-    })
+    }
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -3823,6 +3899,88 @@ pub(crate) fn commit_with_phase_pinned(
         None,
         Some(namespace_pin),
     )
+}
+
+/// How `fast_forward_pinned` proves a child's changed files are complete.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ChildFiles {
+    /// Authenticate every file of the child that differs from its parent.
+    Validate,
+    /// The caller installed every object of the child against its digest and
+    /// already authenticated the final generation of the chain it publishes
+    /// step by step, against the generation that chain started from. Skips
+    /// re-reading files that intermediate generations change again.
+    ValidatedChain,
+}
+
+/// Advances the canonical root by exactly one already-materialized child
+/// generation, as a remote pull does. The child must extend `previous` on the
+/// same authenticated lineage. Files whose authenticated root and size are
+/// unchanged share `previous`'s objects; every other file must be completely
+/// present and authenticated before the shared manifest protocol publishes it.
+pub(crate) fn fast_forward_pinned(
+    base_path: &Path,
+    key: &[u8; 32],
+    previous: &CommitState,
+    generation: ObjectRef,
+    kdf_fingerprint: &RecoveryFingerprint,
+    namespace_pin: &V2NamespacePin,
+    child_files: ChildFiles,
+) -> Result<CommitState, CommitFailure> {
+    let mut recovery_required = false;
+    let mut own_intent_may_be_durable = false;
+    let result = (|| -> std::io::Result<CommitState> {
+        namespace_pin.verify_at(base_path, "before v2 fast-forward")?;
+        if backing_entry_exists(&base_path.join(WRITE_MANIFEST))? {
+            recovery_required = true;
+            return Err(io_invalid(
+                "an authenticated v2 write manifest is already pending recovery",
+            ));
+        }
+        if root_fingerprint(base_path)?.as_ref() != Some(&previous.root_fingerprint) {
+            recovery_required = true;
+            return Err(io_invalid("v2 root changed before fast-forward"));
+        }
+        let (child, child_index) =
+            load_generation_with_pin(base_path, key, generation, Some(namespace_pin))?;
+        let expected_origin = previous.origin.unwrap_or(previous.generation);
+        if previous.number.checked_add(1) != Some(child.number)
+            || child.lineage_id != previous.lineage_id
+            || child.previous != Some(previous.generation)
+            || child.origin != Some(expected_origin)
+        {
+            return Err(io_invalid(
+                "fast-forward target is not the authenticated child of the current v2 generation",
+            ));
+        }
+        drop(child_index);
+        if child_files == ChildFiles::Validate {
+            replica::validate_generation_delta(
+                base_path,
+                key,
+                namespace_pin,
+                Some(previous.generation),
+                generation,
+            )?;
+        }
+        publish_prepared_generation(
+            base_path,
+            key,
+            Some(previous),
+            kdf_fingerprint,
+            generation,
+            child.number,
+            child.lineage_id,
+            Some(namespace_pin),
+            &mut recovery_required,
+            &mut own_intent_may_be_durable,
+        )
+    })();
+    result.map_err(|error| CommitFailure {
+        error,
+        recovery_required,
+        own_intent_may_be_durable,
+    })
 }
 
 #[allow(dead_code)]

@@ -2,7 +2,7 @@
 
 [package]
 name = "zerotrust-drive"
-version = "0.16.0"
+version = "0.17.0"
 license = "AGPL-3.0-only"
 edition = "2024"
 rust-version = "1.88"
@@ -25,6 +25,15 @@ clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 libc = "0.2"
+# Blocking HTTPS client for the Google Drive REST remote. rustls with ring and
+# bundled webpki roots keeps release builds free of OpenSSL and system trust
+# store differences; gzip stays off because remote payloads are ciphertext.
+ureq = { version = "3.4", default-features = false, features = ["rustls"] }
+# PKCE S256 code challenge for the OAuth installed-app flow.
+sha2 = "0.11"
+# Drive reports md5Checksum for uploaded content; it is compared against the
+# local pack bytes only as a transfer check, never as an integrity boundary.
+md-5 = "0.11"
 
 [target.'cfg(target_os = "macos")'.build-dependencies]
 cc = "1"

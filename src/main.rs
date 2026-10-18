@@ -8,6 +8,7 @@ mod macos_integration_tests;
 mod migrate;
 mod prompt;
 mod rekey;
+mod remote;
 mod shutdown;
 #[allow(dead_code)]
 mod storage;
@@ -27,7 +28,7 @@ use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use fuser::{Config, MountOption};
 
 const DEMO_PASSPHRASE: &str = "zerotrust-demo-passphrase";
@@ -40,9 +41,13 @@ fn insecure_new_store_passphrase(passphrase: &str) -> bool {
 #[command(
     name = "zerotrust-drive",
     version,
-    about = "FUSE-based encrypted overlay filesystem"
+    about = "FUSE-based encrypted overlay filesystem",
+    args_conflicts_with_subcommands = true
 )]
 struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+
     /// Directory for encrypted .age files (storage backend, auto-managed — do not modify directly)
     #[arg(long, default_value = "~/g.drive/.zerotrust.drive.encrypted")]
     encrypted_dir: PathBuf,
@@ -128,6 +133,14 @@ struct Cli {
     /// unencrypted. For tests/demos only.
     #[arg(long)]
     allow_default_passphrase: bool,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Replicate the encrypted store to Google Drive through its API; Google
+    /// only receives ciphertext. Mounting stays the default without a command
+    #[command(subcommand)]
+    Remote(remote::cli::RemoteCommand),
 }
 
 fn expand_home_path(path: &Path, home: Option<&Path>) -> Result<PathBuf, String> {
@@ -574,6 +587,9 @@ fn main() {
     let mut cli = Cli::parse();
     // Before any other thread exists, so every thread inherits the mask.
     shutdown::install().unwrap_or_else(|e| exit_with_error(e));
+    if let Some(Command::Remote(command)) = cli.command.take() {
+        std::process::exit(remote::cli::run(command));
+    }
     let gc_mutation_requested =
         cli.gc_v2_quarantine.is_some() || cli.gc_v2_restore.is_some() || cli.gc_v2_purge.is_some();
     let gc_requested = cli.gc_v2 || gc_mutation_requested;
@@ -626,6 +642,16 @@ fn main() {
     // or replacing the user-facing absolute path cannot redirect a live mount
     // to a different directory. Keep display_base_path only for diagnostics.
     let base_path = PathBuf::from(".");
+
+    // An interrupted first pull leaves objects without a head. Mounting,
+    // migration and GC would all take it for a new or broken store.
+    if remote::sync::bootstrap_pending(&base_path).unwrap_or_else(|e| exit_with_error(e)) {
+        exit_with_error(format!(
+            "an interrupted first pull left {} incomplete; finish it with `zdrive remote pull --remote NAME --encrypted-dir {}`",
+            display_base_path.display(),
+            display_base_path.display()
+        ));
+    }
 
     // Cloud providers can preserve conflicting copies under sibling names
     // such as `_index 2.age`. There is no safe automatic merge for an
