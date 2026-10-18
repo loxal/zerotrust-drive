@@ -23,13 +23,14 @@ use std::time::{Duration, Instant};
 use crate::crypto::RecoveryFingerprint;
 use crate::fs::{FsInner, StoreFormat};
 use crate::prompt::TerminalReader;
+use crate::telemetry::{self, Field, Level};
 
 use super::RemoteError;
 use super::cli::{self, Action, StoreKind};
-use super::config::{Paths, RemoteConfig, RemoteName};
+use super::config::{Paths, RemoteConfig, RemoteMode, RemoteName};
 use super::gdrive::GoogleDrive;
 use super::lease;
-use super::oauth::OAuthClient;
+use super::oauth;
 use super::state::RemoteState;
 use super::sync::{self, LocalStore, PushReport, Relation, Remote, Watch};
 
@@ -111,12 +112,18 @@ pub(crate) fn prepare(
     base: &Path,
     lock: &crate::DriveOperationLock,
     passphrase: Option<String>,
+    passphrase_file: Option<&Path>,
     terminal: Option<&mut TerminalReader>,
 ) -> Result<Prepared, String> {
     let paths = Paths::from_env().map_err(|error| error.to_string())?;
     let name = RemoteName::parse(remote).map_err(|error| error.to_string())?;
     let config = RemoteConfig::load(&paths, &name).map_err(|error| error.to_string())?;
-    let client = OAuthClient::load(&config.client_file).map_err(|error| error.to_string())?;
+    if config.mode != RemoteMode::Encrypted {
+        return Err(format!(
+            "remote {name} stores plain files and cannot back an encrypted mount; sync it with `zdrive sync --remote {name} --dir DIR`"
+        ));
+    }
+    let client = oauth::client_for(&config.issuer()).map_err(|error| error.to_string())?;
     let display = canonical.display().to_string();
     let kind = cli::inspect_store(base, &display)?;
     if kind == StoreKind::V1 {
@@ -125,8 +132,13 @@ pub(crate) fn prepare(
         ));
     }
     // A new store may be created below, so its passphrase is confirmed.
-    let passphrase = cli::read_passphrase(passphrase, terminal, kind == StoreKind::Absent)?;
-    let mut drive = cli::open_drive(client, &config, &name, &passphrase)?;
+    let passphrase = cli::read_passphrase(
+        passphrase,
+        passphrase_file,
+        terminal,
+        kind == StoreKind::Absent,
+    )?;
+    let mut drive = cli::open_drive(client, &paths, &config, &name, Some(&passphrase))?;
     let policy = drive.retry_policy();
     drive.set_retry_policy(policy.bounded(STARTUP_ATTEMPTS, STARTUP_RETRY_CAP));
     let state_dir = cli::replica_state(&paths, &name, canonical)?;
@@ -198,9 +210,56 @@ pub(crate) fn prepare(
 }
 
 fn offline(name: &RemoteName, error: &str) {
+    offline_event("mount");
     note(
         name,
         &format!("{error}; mounting offline - changes upload once Google Drive is reachable"),
+    );
+}
+
+fn offline_event(phase: &'static str) {
+    telemetry::event(
+        Level::Standard,
+        "remote.offline",
+        &[("phase", Field::Tag(phase))],
+    );
+}
+
+/// Records one replicator step: its duration always, an event at `full`.
+fn record_step(duration: &'static str, step: &'static str, started: Instant, ok: bool) {
+    let elapsed = started.elapsed();
+    telemetry::duration(duration, elapsed);
+    telemetry::event(
+        Level::Full,
+        "replicator.step",
+        &[
+            ("step", Field::Tag(step)),
+            ("ok", Field::Bool(ok)),
+            ("elapsed_ms", Field::U64(millis(elapsed))),
+        ],
+    );
+}
+
+fn millis(elapsed: Duration) -> u64 {
+    u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Records how the final push of an unmount ended.
+fn record_final_push(outcome: &Outcome, uploaded: bool, timed_out: bool, elapsed: Duration) {
+    let tag = match outcome {
+        Outcome::Synced(_) if uploaded => "pushed",
+        Outcome::Synced(_) | Outcome::ReadOnly => "nothing",
+        Outcome::Unfinished(_) if timed_out => "timeout",
+        Outcome::Unfinished(_) => "interrupted",
+        Outcome::Blocked(_) | Outcome::Failed(_) => "failed",
+    };
+    telemetry::event(
+        Level::Standard,
+        "remote.final_push",
+        &[
+            ("outcome", Field::Tag(tag)),
+            ("elapsed_ms", Field::U64(millis(elapsed))),
+        ],
     );
 }
 
@@ -261,6 +320,11 @@ impl Prepared {
         } = self;
         if let Some(reason) = read_only {
             note(&name, &format!("WARNING: {reason}"));
+            telemetry::event(
+                Level::Standard,
+                "remote.read_only",
+                &[("cause", Field::Tag("foreign_lease"))],
+            );
             inner.block_writes_for_remote(reason);
             return Ok(Replicator {
                 name,
@@ -314,6 +378,8 @@ struct Signal {
     stop: bool,
     /// Leave the final push unfinished.
     abandoned: bool,
+    /// The final push uploaded a new generation.
+    uploaded: bool,
     outcome: Option<Outcome>,
 }
 
@@ -347,6 +413,7 @@ impl Replicator {
     /// state flushed. Waits at most `limit`; a signal abandons the wait.
     pub(crate) fn finish(&mut self, limit: Duration) -> Outcome {
         let Some(thread) = self.thread.take() else {
+            record_final_push(&Outcome::ReadOnly, false, false, Duration::ZERO);
             return Outcome::ReadOnly;
         };
         self.shared.lock().stop = true;
@@ -356,6 +423,7 @@ impl Replicator {
         let started = Instant::now();
         let deadline = started + limit;
         let mut announced = false;
+        let mut timed_out = false;
         let mut signal = self.shared.lock();
         let outcome = loop {
             if let Some(outcome) = signal.outcome.clone() {
@@ -368,6 +436,7 @@ impl Replicator {
             if now >= deadline {
                 // The worker stops after its current attempt.
                 signal.abandoned = true;
+                timed_out = true;
                 self.shared.wake.notify_all();
                 break Outcome::Unfinished(format!(
                     "the upload did not finish within {} s",
@@ -378,10 +447,16 @@ impl Replicator {
             if !announced {
                 if now >= started + QUIET_WAIT {
                     announced = true;
-                    note(
-                        &self.name,
-                        "uploading the final generation; press Ctrl+C to leave it for the next push",
-                    );
+                    let hint = if crate::shutdown::is_unattended() {
+                        format!(
+                            "uploading the final generation for up to {} s; the next start uploads whatever is left",
+                            limit.as_secs()
+                        )
+                    } else {
+                        "uploading the final generation; press Ctrl+C to leave it for the next push"
+                            .to_string()
+                    };
+                    note(&self.name, &hint);
                 } else {
                     until = until.min(started + QUIET_WAIT);
                 }
@@ -393,11 +468,15 @@ impl Replicator {
                 .unwrap_or_else(PoisonError::into_inner)
                 .0;
         };
+        let uploaded = signal.uploaded;
         drop(signal);
         crate::shutdown::session_ended();
-        if !matches!(outcome, Outcome::Unfinished(_)) && thread.join().is_err() {
-            return Outcome::Failed("the replicator thread panicked".to_string());
-        }
+        let outcome = if !matches!(outcome, Outcome::Unfinished(_)) && thread.join().is_err() {
+            Outcome::Failed("the replicator thread panicked".to_string())
+        } else {
+            outcome
+        };
+        record_final_push(&outcome, uploaded, timed_out, started.elapsed());
         outcome
     }
 
@@ -570,10 +649,14 @@ impl Worker {
                 Event::Stop => return self.finish(shared, &plan),
                 Event::Push => {
                     plan.pending = false;
-                    match self.sync(sync::push) {
+                    let started = Instant::now();
+                    let pushed = self.sync(sync::push);
+                    record_step("replicator.push", "push", started, pushed.is_ok());
+                    match pushed {
                         Ok(report) => {
                             if plan.failing {
                                 note(&self.name, "Google Drive is reachable again");
+                                telemetry::event(Level::Standard, "remote.online", &[]);
                             }
                             self.pushed(&report);
                             plan.synced = Some(report.number);
@@ -586,6 +669,7 @@ impl Worker {
                             Step::Halt(outcome) => return self.halt(outcome),
                             Step::Retry(error) => {
                                 if !plan.failing {
+                                    offline_event("replicate");
                                     note(
                                         &self.name,
                                         &format!(
@@ -603,7 +687,10 @@ impl Worker {
                 }
                 Event::Watch => {
                     plan.next_watch = Instant::now() + self.timing.watch;
-                    match self.sync(sync::watch) {
+                    let started = Instant::now();
+                    let watched = self.sync(sync::watch);
+                    record_step("replicator.watch", "watch", started, watched.is_ok());
+                    match watched {
                         Ok(watch) => match watch.relation {
                             Relation::Equal => {}
                             Relation::LocalAhead
@@ -628,7 +715,9 @@ impl Worker {
                 }
                 Event::Beat => {
                     plan.next_beat = Instant::now() + self.timing.heartbeat;
-                    self.beat();
+                    let started = Instant::now();
+                    let renewed = self.beat();
+                    record_step("replicator.beat", "beat", started, renewed);
                 }
             }
         }
@@ -645,9 +734,13 @@ impl Worker {
         let mut delay = self.timing.first_retry.min(self.timing.max_final_retry);
         let mut reported = false;
         loop {
-            let error = match self.sync(sync::push) {
+            let started = Instant::now();
+            let pushed = self.sync(sync::push);
+            record_step("replicator.final", "final", started, pushed.is_ok());
+            let error = match pushed {
                 Ok(report) => {
                     self.pushed(&report);
+                    shared.lock().uploaded = !report.up_to_date;
                     return Outcome::Synced(report.number);
                 }
                 Err(error) => match self.classify(error) {
@@ -756,6 +849,16 @@ impl Worker {
     }
 
     fn halt(&mut self, outcome: Outcome) -> Outcome {
+        let tag = match &outcome {
+            Outcome::Blocked(_) => "blocked",
+            Outcome::Failed(_) => "failed",
+            _ => "other",
+        };
+        telemetry::event(
+            Level::Standard,
+            "remote.halt",
+            &[("outcome", Field::Tag(tag))],
+        );
         match &outcome {
             Outcome::Blocked(reason) => {
                 self.inner.block_writes_for_remote(reason.clone());
@@ -777,7 +880,8 @@ impl Worker {
 
     /// Creates or renews the lease once the remote layout exists. Failures
     /// wait for the next heartbeat; push and watch report lasting ones.
-    fn beat(&mut self) {
+    /// Returns false only when a renewal failed.
+    fn beat(&mut self) -> bool {
         let Some(folder) = self
             .state
             .record
@@ -785,11 +889,12 @@ impl Worker {
             .as_ref()
             .map(|layout| layout.leases.clone())
         else {
-            return;
+            return true;
         };
-        if lease::acquire(&self.drive, &folder, &mut self.state, lease::unix_now()).is_ok() {
-            self.leased = true;
-        }
+        let renewed =
+            lease::acquire(&self.drive, &folder, &mut self.state, lease::unix_now()).is_ok();
+        self.leased |= renewed;
+        renewed
     }
 
     fn release(&mut self) {

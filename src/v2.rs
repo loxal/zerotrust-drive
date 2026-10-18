@@ -467,7 +467,9 @@ fn write_exclusive_verified_file_at(
     let created_identity = (created_metadata.dev(), created_metadata.ino());
     file.write_all(bytes)?;
     fault::checkpoint(DurabilityEvent::Write, context)?;
+    let synced = std::time::Instant::now();
     file.sync_all()?;
+    crate::telemetry::duration("v2.fsync", synced.elapsed());
     fault::checkpoint(DurabilityEvent::FileSync, context)?;
     drop(file);
     directory.sync_all()?;
@@ -1072,7 +1074,9 @@ pub(crate) fn write_new_file(path: &Path, bytes: &[u8], context: &str) -> std::i
     let mut file = open_new_file(path)?;
     file.write_all(bytes)?;
     fault::checkpoint(DurabilityEvent::Write, context)?;
+    let synced = std::time::Instant::now();
     file.sync_all()?;
+    crate::telemetry::duration("v2.fsync", synced.elapsed());
     fault::checkpoint(DurabilityEvent::FileSync, context)?;
     drop(file);
     File::open(parent)?.sync_all()?;
@@ -1162,7 +1166,11 @@ fn write_object_with_pin(
             }
         };
         match result {
-            Ok(true) => return Ok(reference),
+            Ok(true) => {
+                crate::telemetry::counter("v2.objects_written", 1);
+                crate::telemetry::counter("v2.bytes_written", ciphertext.len() as u64);
+                return Ok(reference);
+            }
             Ok(false) => continue,
             Err(error) => return Err(error),
         }
@@ -3552,6 +3560,7 @@ fn commit_with_phase_and_lineage(
     initial_lineage: Option<[u8; 16]>,
     namespace_pin: Option<&V2NamespacePin>,
 ) -> Result<CommitState, CommitFailure> {
+    let started = std::time::Instant::now();
     let mut recovery_required = false;
     let mut own_intent_may_be_durable = false;
     let result = (|| -> std::io::Result<CommitState> {
@@ -3598,6 +3607,7 @@ fn commit_with_phase_and_lineage(
             &mut own_intent_may_be_durable,
         )
     })();
+    record_commit("v2.commit", "v2.commit_failed", started, result.is_ok());
     result.map_err(|error| CommitFailure {
         error,
         recovery_required,
@@ -3848,6 +3858,18 @@ fn publish_prepared_generation(
     }
 }
 
+fn record_commit(
+    duration: &'static str,
+    failed: &'static str,
+    started: std::time::Instant,
+    ok: bool,
+) {
+    crate::telemetry::duration(duration, started.elapsed());
+    if !ok {
+        crate::telemetry::counter(failed, 1);
+    }
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn commit_with_phase(
     base_path: &Path,
@@ -3927,6 +3949,7 @@ pub(crate) fn fast_forward_pinned(
     namespace_pin: &V2NamespacePin,
     child_files: ChildFiles,
 ) -> Result<CommitState, CommitFailure> {
+    let started = std::time::Instant::now();
     let mut recovery_required = false;
     let mut own_intent_may_be_durable = false;
     let result = (|| -> std::io::Result<CommitState> {
@@ -3976,6 +3999,12 @@ pub(crate) fn fast_forward_pinned(
             &mut own_intent_may_be_durable,
         )
     })();
+    record_commit(
+        "v2.fast_forward",
+        "v2.fast_forward_failed",
+        started,
+        result.is_ok(),
+    );
     result.map_err(|error| CommitFailure {
         error,
         recovery_required,

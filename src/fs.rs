@@ -3540,6 +3540,7 @@ fn io_to_errno(e: &std::io::Error) -> fuser::Errno {
 
 impl Filesystem for ZeroTrustFs {
     fn init(&mut self, _req: &Request, config: &mut fuser::KernelConfig) -> std::io::Result<()> {
+        let _call = crate::telemetry::FuseCall::begin(crate::telemetry::FuseOp::Init);
         if self.inner.format == StoreFormat::V2 {
             config
                 .set_max_write(v2::CHUNK_SIZE as u32)
@@ -3569,6 +3570,7 @@ impl Filesystem for ZeroTrustFs {
     }
 
     fn destroy(&mut self) {
+        let _call = crate::telemetry::FuseCall::begin(crate::telemetry::FuseOp::Destroy);
         // Stop the debounce thread first
         {
             let mut stop = self.inner.debounce_mutex.lock().unwrap();
@@ -3595,11 +3597,12 @@ impl Filesystem for ZeroTrustFs {
     }
 
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
+        let call = crate::telemetry::FuseCall::begin(crate::telemetry::FuseOp::Lookup);
         trace!("FUSE: lookup parent={} name={:?}", parent.0, name);
         let name_str = match name.to_str() {
             Some(s) => s,
             None => {
-                reply.error(fuser::Errno::ENOENT);
+                reply.error(call.fail(fuser::Errno::ENOENT));
                 return;
             }
         };
@@ -3610,10 +3613,11 @@ impl Filesystem for ZeroTrustFs {
             reply.entry(&TTL, &Self::inode_to_attr(ino, entry), Generation(0));
             return;
         }
-        reply.error(fuser::Errno::ENOENT);
+        reply.error(call.fail(fuser::Errno::ENOENT));
     }
 
     fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
+        let call = crate::telemetry::FuseCall::begin(crate::telemetry::FuseOp::Getattr);
         trace!("FUSE: getattr ino={}", ino.0);
         let state = self.inner.state.read().unwrap();
         match state.inodes.get(&ino.0) {
@@ -3630,7 +3634,7 @@ impl Filesystem for ZeroTrustFs {
                 }
                 reply.attr(&TTL, &attr);
             }
-            None => reply.error(fuser::Errno::ENOENT),
+            None => reply.error(call.fail(fuser::Errno::ENOENT)),
         }
     }
 
@@ -3652,20 +3656,21 @@ impl Filesystem for ZeroTrustFs {
         _flags: Option<fuser::BsdFileFlags>,
         reply: ReplyAttr,
     ) {
+        let call = crate::telemetry::FuseCall::begin(crate::telemetry::FuseOp::Setattr);
         if self.inner.read_only.load(Ordering::Relaxed) {
-            reply.error(fuser::Errno::EROFS);
+            reply.error(call.fail(fuser::Errno::EROFS));
             return;
         }
         let persistence = self.inner.persistence_mutex.lock().unwrap();
         if let Err(error) = self.inner.ensure_writable() {
-            reply.error(io_to_errno(&error));
+            reply.error(call.fail(io_to_errno(&error)));
             return;
         }
         if let Some(new_size) = size {
             // Validate and persist/dirty the content before publishing the new
             // size. A missing non-empty backing blob must not become zero data.
             if let Err(e) = self.truncate_inode_locked(ino.0, new_size) {
-                reply.error(io_to_errno(&e));
+                reply.error(call.fail(io_to_errno(&e)));
                 return;
             }
         }
@@ -3674,7 +3679,7 @@ impl Filesystem for ZeroTrustFs {
             let entry = match state.inodes.get_mut(&ino.0) {
                 Some(e) => e,
                 None => {
-                    reply.error(fuser::Errno::ENOENT);
+                    reply.error(call.fail(fuser::Errno::ENOENT));
                     return;
                 }
             };
@@ -3696,6 +3701,7 @@ impl Filesystem for ZeroTrustFs {
     }
 
     fn open(&self, _req: &Request, ino: INodeNo, _flags: fuser::OpenFlags, reply: ReplyOpen) {
+        let call = crate::telemetry::FuseCall::begin(crate::telemetry::FuseOp::Open);
         match self.open_inode(ino.0) {
             Ok(()) => reply.opened(FileHandle(ino.0), FopenFlags::empty()),
             Err(e) => {
@@ -3704,7 +3710,7 @@ impl Filesystem for ZeroTrustFs {
                 if e.kind() == std::io::ErrorKind::InvalidData {
                     eprintln!("zerotrust-drive: ERROR: open inode {}: {e}", ino.0);
                 }
-                reply.error(io_to_errno(&e));
+                reply.error(call.fail(io_to_errno(&e)));
             }
         }
     }
@@ -3720,12 +3726,16 @@ impl Filesystem for ZeroTrustFs {
         _lock_owner: Option<fuser::LockOwner>,
         reply: ReplyData,
     ) {
+        let call = crate::telemetry::FuseCall::begin(crate::telemetry::FuseOp::Read);
         if self.inner.format == StoreFormat::V2 {
             match self.read_v2_inode_range(ino.0, offset, size as usize) {
-                Ok(data) => reply.data(&data),
+                Ok(data) => {
+                    call.bytes(data.len() as u64);
+                    reply.data(&data);
+                }
                 Err(error) => {
                     eprintln!("zerotrust-drive: ERROR: read v2 inode {}: {error}", ino.0);
-                    reply.error(io_to_errno(&error));
+                    reply.error(call.fail(io_to_errno(&error)));
                 }
             }
             return;
@@ -3736,7 +3746,7 @@ impl Filesystem for ZeroTrustFs {
                 let start = match usize::try_from(offset) {
                     Ok(start) => start,
                     Err(_) => {
-                        reply.error(fuser::Errno::EOVERFLOW);
+                        reply.error(call.fail(fuser::Errno::EOVERFLOW));
                         return;
                     }
                 };
@@ -3744,10 +3754,11 @@ impl Filesystem for ZeroTrustFs {
                     reply.data(&[]);
                 } else {
                     let end = start.saturating_add(size as usize).min(content.len());
+                    call.bytes((end - start) as u64);
                     reply.data(&content[start..end]);
                 }
             }
-            None => reply.error(fuser::Errno::ENOENT),
+            None => reply.error(call.fail(fuser::Errno::ENOENT)),
         }
     }
 
@@ -3763,8 +3774,9 @@ impl Filesystem for ZeroTrustFs {
         _lock_owner: Option<fuser::LockOwner>,
         reply: ReplyWrite,
     ) {
+        let call = crate::telemetry::FuseCall::begin(crate::telemetry::FuseOp::Write);
         if self.inner.read_only.load(Ordering::Relaxed) {
-            reply.error(fuser::Errno::EROFS);
+            reply.error(call.fail(fuser::Errno::EROFS));
             return;
         }
         trace!(
@@ -3774,10 +3786,13 @@ impl Filesystem for ZeroTrustFs {
             data.len()
         );
         match self.write_inode_content(ino.0, offset, data) {
-            Ok(written) => reply.written(written),
+            Ok(written) => {
+                call.bytes(u64::from(written));
+                reply.written(written);
+            }
             Err(e) => {
                 eprintln!("zerotrust-drive: ERROR: write inode {}: {e}", ino.0);
-                reply.error(io_to_errno(&e));
+                reply.error(call.fail(io_to_errno(&e)));
             }
         }
     }
@@ -3790,9 +3805,10 @@ impl Filesystem for ZeroTrustFs {
         _lock_owner: fuser::LockOwner,
         reply: ReplyEmpty,
     ) {
+        let call = crate::telemetry::FuseCall::begin(crate::telemetry::FuseOp::Flush);
         if let Some(error) = self.inner.persistence_error() {
             eprintln!("zerotrust-drive: ERROR: flush inode {}: {error}", ino.0);
-            reply.error(io_to_errno(&error));
+            reply.error(call.fail(io_to_errno(&error)));
             return;
         }
         trace!("FUSE: flush ino={}", ino.0);
@@ -3807,7 +3823,7 @@ impl Filesystem for ZeroTrustFs {
             Ok(()) => reply.ok(),
             Err(e) => {
                 eprintln!("zerotrust-drive: ERROR: flush inode {}: {e}", ino.0);
-                reply.error(io_to_errno(&e));
+                reply.error(call.fail(io_to_errno(&e)));
             }
         }
     }
@@ -3822,12 +3838,13 @@ impl Filesystem for ZeroTrustFs {
         _flush: bool,
         reply: ReplyEmpty,
     ) {
+        let call = crate::telemetry::FuseCall::begin(crate::telemetry::FuseOp::Release);
         trace!("FUSE: release ino={}", ino.0);
         match self.release_inode(ino.0) {
             Ok(()) => reply.ok(),
             Err(e) => {
                 eprintln!("zerotrust-drive: ERROR: release inode {}: {e}", ino.0);
-                reply.error(io_to_errno(&e));
+                reply.error(call.fail(io_to_errno(&e)));
             }
         }
     }
@@ -3840,9 +3857,10 @@ impl Filesystem for ZeroTrustFs {
         _datasync: bool,
         reply: ReplyEmpty,
     ) {
+        let call = crate::telemetry::FuseCall::begin(crate::telemetry::FuseOp::Fsync);
         if let Some(error) = self.inner.persistence_error() {
             eprintln!("zerotrust-drive: ERROR: fsync inode {}: {error}", ino.0);
-            reply.error(io_to_errno(&error));
+            reply.error(call.fail(io_to_errno(&error)));
             return;
         }
         trace!("FUSE: fsync ino={}", ino.0);
@@ -3850,7 +3868,7 @@ impl Filesystem for ZeroTrustFs {
             Ok(()) => reply.ok(),
             Err(e) => {
                 eprintln!("zerotrust-drive: ERROR: fsync inode {}: {e}", ino.0);
-                reply.error(io_to_errno(&e));
+                reply.error(call.fail(io_to_errno(&e)));
             }
         }
     }
@@ -3865,8 +3883,9 @@ impl Filesystem for ZeroTrustFs {
         _rdev: u32,
         reply: ReplyEntry,
     ) {
+        let call = crate::telemetry::FuseCall::begin(crate::telemetry::FuseOp::Mknod);
         if self.inner.read_only.load(Ordering::Relaxed) {
-            reply.error(fuser::Errno::EROFS);
+            reply.error(call.fail(fuser::Errno::EROFS));
             return;
         }
         trace!(
@@ -3879,23 +3898,23 @@ impl Filesystem for ZeroTrustFs {
         let (format_mask, regular) = (libc::S_IFMT as u32, libc::S_IFREG as u32);
         let file_type = mode & format_mask;
         if file_type != regular && file_type != 0 {
-            reply.error(fuser::Errno::ENOSYS);
+            reply.error(call.fail(fuser::Errno::ENOSYS));
             return;
         }
         let name_str = match name.to_str() {
             Some(s) => s,
             None => {
-                reply.error(fuser::Errno::EINVAL);
+                reply.error(call.fail(fuser::Errno::EINVAL));
                 return;
             }
         };
         if name_str.len() > NAME_MAX {
-            reply.error(fuser::Errno::ENAMETOOLONG);
+            reply.error(call.fail(fuser::Errno::ENAMETOOLONG));
             return;
         }
         let persistence = self.inner.persistence_mutex.lock().unwrap();
         if let Err(error) = self.inner.ensure_writable() {
-            reply.error(io_to_errno(&error));
+            reply.error(call.fail(io_to_errno(&error)));
             return;
         }
         let (ino, attr) = {
@@ -3903,12 +3922,12 @@ impl Filesystem for ZeroTrustFs {
             match state.inodes.get(&parent.0) {
                 Some(e) if e.kind == InodeKind::Directory => {}
                 _ => {
-                    reply.error(fuser::Errno::ENOTDIR);
+                    reply.error(call.fail(fuser::Errno::ENOTDIR));
                     return;
                 }
             }
             if Self::find_child(&state, parent.0, name_str).is_some() {
-                reply.error(fuser::Errno::EEXIST);
+                reply.error(call.fail(fuser::Errno::EEXIST));
                 return;
             }
             let disk_filename = if self.inner.format == StoreFormat::V2 {
@@ -3916,7 +3935,7 @@ impl Filesystem for ZeroTrustFs {
             } else {
                 if let Err(error) = ensure_next_blob_slot_absent(&self.inner.base_path, &state) {
                     let error = self.inner.latch_persistence_failure(error);
-                    reply.error(io_to_errno(&error));
+                    reply.error(call.fail(io_to_errno(&error)));
                     return;
                 }
                 Self::allocate_disk_filename(&mut state)
@@ -3961,8 +3980,9 @@ impl Filesystem for ZeroTrustFs {
         _flags: i32,
         reply: ReplyCreate,
     ) {
+        let call = crate::telemetry::FuseCall::begin(crate::telemetry::FuseOp::Create);
         if self.inner.read_only.load(Ordering::Relaxed) {
-            reply.error(fuser::Errno::EROFS);
+            reply.error(call.fail(fuser::Errno::EROFS));
             return;
         }
         trace!(
@@ -3972,17 +3992,17 @@ impl Filesystem for ZeroTrustFs {
         let name_str = match name.to_str() {
             Some(s) => s,
             None => {
-                reply.error(fuser::Errno::EINVAL);
+                reply.error(call.fail(fuser::Errno::EINVAL));
                 return;
             }
         };
         if name_str.len() > NAME_MAX {
-            reply.error(fuser::Errno::ENAMETOOLONG);
+            reply.error(call.fail(fuser::Errno::ENAMETOOLONG));
             return;
         }
         let persistence = self.inner.persistence_mutex.lock().unwrap();
         if let Err(error) = self.inner.ensure_writable() {
-            reply.error(io_to_errno(&error));
+            reply.error(call.fail(io_to_errno(&error)));
             return;
         }
 
@@ -3991,12 +4011,12 @@ impl Filesystem for ZeroTrustFs {
             match state.inodes.get(&parent.0) {
                 Some(e) if e.kind == InodeKind::Directory => {}
                 _ => {
-                    reply.error(fuser::Errno::ENOTDIR);
+                    reply.error(call.fail(fuser::Errno::ENOTDIR));
                     return;
                 }
             }
             if Self::find_child(&state, parent.0, name_str).is_some() {
-                reply.error(fuser::Errno::EEXIST);
+                reply.error(call.fail(fuser::Errno::EEXIST));
                 return;
             }
             let disk_filename = if self.inner.format == StoreFormat::V2 {
@@ -4004,7 +4024,7 @@ impl Filesystem for ZeroTrustFs {
             } else {
                 if let Err(error) = ensure_next_blob_slot_absent(&self.inner.base_path, &state) {
                     let error = self.inner.latch_persistence_failure(error);
-                    reply.error(io_to_errno(&error));
+                    reply.error(call.fail(io_to_errno(&error)));
                     return;
                 }
                 Self::allocate_disk_filename(&mut state)
@@ -4070,24 +4090,25 @@ impl Filesystem for ZeroTrustFs {
         _umask: u32,
         reply: ReplyEntry,
     ) {
+        let call = crate::telemetry::FuseCall::begin(crate::telemetry::FuseOp::Mkdir);
         if self.inner.read_only.load(Ordering::Relaxed) {
-            reply.error(fuser::Errno::EROFS);
+            reply.error(call.fail(fuser::Errno::EROFS));
             return;
         }
         let name_str = match name.to_str() {
             Some(s) => s,
             None => {
-                reply.error(fuser::Errno::EINVAL);
+                reply.error(call.fail(fuser::Errno::EINVAL));
                 return;
             }
         };
         if name_str.len() > NAME_MAX {
-            reply.error(fuser::Errno::ENAMETOOLONG);
+            reply.error(call.fail(fuser::Errno::ENAMETOOLONG));
             return;
         }
         let persistence = self.inner.persistence_mutex.lock().unwrap();
         if let Err(error) = self.inner.ensure_writable() {
-            reply.error(io_to_errno(&error));
+            reply.error(call.fail(io_to_errno(&error)));
             return;
         }
 
@@ -4096,12 +4117,12 @@ impl Filesystem for ZeroTrustFs {
             match state.inodes.get(&parent.0) {
                 Some(e) if e.kind == InodeKind::Directory => {}
                 _ => {
-                    reply.error(fuser::Errno::ENOTDIR);
+                    reply.error(call.fail(fuser::Errno::ENOTDIR));
                     return;
                 }
             }
             if Self::find_child(&state, parent.0, name_str).is_some() {
-                reply.error(fuser::Errno::EEXIST);
+                reply.error(call.fail(fuser::Errno::EEXIST));
                 return;
             }
             let ino = Self::allocate_inode(&mut state);
@@ -4138,14 +4159,15 @@ impl Filesystem for ZeroTrustFs {
     }
 
     fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        let call = crate::telemetry::FuseCall::begin(crate::telemetry::FuseOp::Unlink);
         if self.inner.read_only.load(Ordering::Relaxed) {
-            reply.error(fuser::Errno::EROFS);
+            reply.error(call.fail(fuser::Errno::EROFS));
             return;
         }
         let name_str = match name.to_str() {
             Some(s) => s,
             None => {
-                reply.error(fuser::Errno::ENOENT);
+                reply.error(call.fail(fuser::Errno::ENOENT));
                 return;
             }
         };
@@ -4158,27 +4180,28 @@ impl Filesystem for ZeroTrustFs {
                 ) {
                     eprintln!("zerotrust-drive: ERROR: failed to unlink {name_str:?}: {error}");
                 }
-                reply.error(io_to_errno(&error));
+                reply.error(call.fail(io_to_errno(&error)));
             }
         }
     }
 
     fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        let call = crate::telemetry::FuseCall::begin(crate::telemetry::FuseOp::Rmdir);
         if self.inner.read_only.load(Ordering::Relaxed) {
-            reply.error(fuser::Errno::EROFS);
+            reply.error(call.fail(fuser::Errno::EROFS));
             return;
         }
         let name_str = match name.to_str() {
             Some(s) => s,
             None => {
-                reply.error(fuser::Errno::ENOENT);
+                reply.error(call.fail(fuser::Errno::ENOENT));
                 return;
             }
         };
 
         let persistence = self.inner.persistence_mutex.lock().unwrap();
         if let Err(error) = self.inner.ensure_writable() {
-            reply.error(io_to_errno(&error));
+            reply.error(call.fail(io_to_errno(&error)));
             return;
         }
         {
@@ -4186,19 +4209,19 @@ impl Filesystem for ZeroTrustFs {
             let ino = match Self::find_child(&state, parent.0, name_str) {
                 Some(i) => i,
                 None => {
-                    reply.error(fuser::Errno::ENOENT);
+                    reply.error(call.fail(fuser::Errno::ENOENT));
                     return;
                 }
             };
             match state.inodes.get(&ino) {
                 Some(e) if e.kind == InodeKind::Directory => {}
                 _ => {
-                    reply.error(fuser::Errno::ENOTDIR);
+                    reply.error(call.fail(fuser::Errno::ENOTDIR));
                     return;
                 }
             }
             if state.children.get(&ino).is_some_and(|ch| !ch.is_empty()) {
-                reply.error(fuser::Errno::ENOTEMPTY);
+                reply.error(call.fail(fuser::Errno::ENOTEMPTY));
                 return;
             }
             state.inodes.remove(&ino);
@@ -4225,31 +4248,32 @@ impl Filesystem for ZeroTrustFs {
         flags: fuser::RenameFlags,
         reply: ReplyEmpty,
     ) {
+        let call = crate::telemetry::FuseCall::begin(crate::telemetry::FuseOp::Rename);
         if self.inner.read_only.load(Ordering::Relaxed) {
-            reply.error(fuser::Errno::EROFS);
+            reply.error(call.fail(fuser::Errno::EROFS));
             return;
         }
         if !flags.is_empty() {
             // Silently ignoring RENAME_NOREPLACE/EXCHANGE can destroy data.
-            reply.error(fuser::Errno::ENOSYS);
+            reply.error(call.fail(fuser::Errno::ENOSYS));
             return;
         }
         let name_str = match name.to_str() {
             Some(s) => s,
             None => {
-                reply.error(fuser::Errno::EINVAL);
+                reply.error(call.fail(fuser::Errno::EINVAL));
                 return;
             }
         };
         let newname_str = match newname.to_str() {
             Some(s) => s,
             None => {
-                reply.error(fuser::Errno::EINVAL);
+                reply.error(call.fail(fuser::Errno::EINVAL));
                 return;
             }
         };
         if newname_str.len() > NAME_MAX {
-            reply.error(fuser::Errno::ENAMETOOLONG);
+            reply.error(call.fail(fuser::Errno::ENAMETOOLONG));
             return;
         }
         match self.rename_name(parent.0, name_str, newparent.0, newname_str) {
@@ -4270,7 +4294,7 @@ impl Filesystem for ZeroTrustFs {
                         "zerotrust-drive: ERROR: failed to rename {name_str:?} to {newname_str:?}: {error}"
                     );
                 }
-                reply.error(io_to_errno(&error));
+                reply.error(call.fail(io_to_errno(&error)));
             }
         }
     }
@@ -4283,11 +4307,12 @@ impl Filesystem for ZeroTrustFs {
         offset: u64,
         mut reply: ReplyDirectory,
     ) {
+        let call = crate::telemetry::FuseCall::begin(crate::telemetry::FuseOp::Readdir);
         let state = self.inner.state.read().unwrap();
         match state.inodes.get(&ino.0) {
             Some(e) if e.kind == InodeKind::Directory => {}
             _ => {
-                reply.error(fuser::Errno::ENOTDIR);
+                reply.error(call.fail(fuser::Errno::ENOTDIR));
                 return;
             }
         }
@@ -4333,9 +4358,10 @@ impl Filesystem for ZeroTrustFs {
         _datasync: bool,
         reply: ReplyEmpty,
     ) {
+        let call = crate::telemetry::FuseCall::begin(crate::telemetry::FuseOp::Fsyncdir);
         if let Some(error) = self.inner.persistence_error() {
             eprintln!("zerotrust-drive: ERROR: fsyncdir failed: {error}");
-            reply.error(io_to_errno(&error));
+            reply.error(call.fail(io_to_errno(&error)));
             return;
         }
         let result = {
@@ -4349,12 +4375,13 @@ impl Filesystem for ZeroTrustFs {
             Ok(()) => reply.ok(),
             Err(e) => {
                 eprintln!("zerotrust-drive: ERROR: fsyncdir failed: {e}");
-                reply.error(io_to_errno(&e));
+                reply.error(call.fail(io_to_errno(&e)));
             }
         }
     }
 
     fn statfs(&self, _req: &Request, _ino: INodeNo, reply: ReplyStatfs) {
+        let call = crate::telemetry::FuseCall::begin(crate::telemetry::FuseOp::Statfs);
         match backing_statfs(&self.inner.base_path) {
             Ok(stat) => reply.statfs(
                 stat.blocks,
@@ -4366,15 +4393,16 @@ impl Filesystem for ZeroTrustFs {
                 stat.namelen,
                 stat.frsize,
             ),
-            Err(e) => reply.error(io_to_errno(&e)),
+            Err(e) => reply.error(call.fail(io_to_errno(&e))),
         }
     }
 
     fn access(&self, _req: &Request, ino: INodeNo, _mask: fuser::AccessFlags, reply: ReplyEmpty) {
+        let call = crate::telemetry::FuseCall::begin(crate::telemetry::FuseOp::Access);
         if self.inner.state.read().unwrap().inodes.contains_key(&ino.0) {
             reply.ok();
         } else {
-            reply.error(fuser::Errno::ENOENT);
+            reply.error(call.fail(fuser::Errno::ENOENT));
         }
     }
 }

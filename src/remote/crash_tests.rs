@@ -41,6 +41,7 @@ fn crash_child() {
     let endpoints = Endpoints {
         auth: format!("{base_url}/auth"),
         token: format!("{base_url}/token"),
+        device: format!("{base_url}/device/code"),
     };
     let tokens = RefreshTokenSource::new(test_client(), REFRESH_TOKEN.to_string(), &endpoints);
     let mut drive =

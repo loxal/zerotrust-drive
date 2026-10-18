@@ -18,15 +18,15 @@
 //!
 //! ```fish
 //! set -x ZDRIVE_RUN_GDRIVE_TESTS 1
-//! set -x ZDRIVE_GDRIVE_REMOTE gdrive-test
-//! set -x ZDRIVE_GDRIVE_MIRROR ~/g.drive/zerotrust-drive-test/api
+//! set -x ZDRIVE_GDRIVE_REMOTE byo-test
+//! set -x ZDRIVE_GDRIVE_MIRROR "$HOME/My Drive (you@gmail.com)/zdrive-byo-test"
 //! set -x ZDRIVE_BENCH_OUT ~/bench.jsonl
 //! read -s -x ZEROTRUST_PASSPHRASE
 //! cargo test --release --locked remote::mount::bench -- --ignored --test-threads=1 --nocapture
 //! ```
 //!
 //! `ZDRIVE_BENCH_REPEAT` (the repetition number; odd runs push first),
-//! `ZDRIVE_BENCH_LOCAL` (default `~/zerotrust.drive/test`),
+//! `ZDRIVE_BENCH_LOCAL` (default `~/zdrive/.bench`),
 //! `ZDRIVE_BENCH_CALIBRATE_MIB`, `ZDRIVE_BENCH_LARGE_MIB`,
 //! `ZDRIVE_BENCH_SMALL_FILES`, `ZDRIVE_BENCH_EDITS`, `ZDRIVE_BENCH_POLL_MS`
 //! and `ZDRIVE_BENCH_TIMEOUT_MIN` adjust a run.
@@ -273,7 +273,7 @@ impl Bench {
             .expect("the mirror has a parent")
             .join("native");
         let local = std::env::var("ZDRIVE_BENCH_LOCAL")
-            .map_or_else(|_| home().join("zerotrust.drive/test"), PathBuf::from);
+            .map_or_else(|_| home().join("zdrive/.bench"), PathBuf::from);
         std::fs::create_dir_all(&native).unwrap();
         std::fs::create_dir_all(&local).unwrap();
         let drive = &account.drive;

@@ -413,7 +413,25 @@ fn remove_tree(path: &Path) -> Result<(), RemoteError> {
     }
 }
 
+/// How often a contended lock is retried before reporting another holder.
+/// `flock` belongs to the open file description, which a child forked by
+/// any thread of this process shares until its exec closes it; a lock
+/// dropped and retaken in that window looks held for a moment. A real
+/// holder keeps it for a whole sync, far longer than these retries.
+const LOCK_ATTEMPTS: u32 = 20;
+const LOCK_RETRY_PAUSE: std::time::Duration = std::time::Duration::from_millis(5);
+
 fn lock_exclusive(path: &Path) -> Result<File, RemoteError> {
+    lock_exclusive_with(path, LOCK_ATTEMPTS, &mut |_| {
+        std::thread::sleep(LOCK_RETRY_PAUSE)
+    })
+}
+
+fn lock_exclusive_with(
+    path: &Path,
+    attempts: u32,
+    pause: &mut dyn FnMut(u32),
+) -> Result<File, RemoteError> {
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     let file = std::fs::OpenOptions::new()
@@ -432,20 +450,33 @@ fn lock_exclusive(path: &Path) -> Result<File, RemoteError> {
             path.display()
         )));
     }
-    // SAFETY: the descriptor is owned by `file` for the whole call.
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        let error = std::io::Error::last_os_error();
-        if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
-            return Err(RemoteError::Conflict(
-                "another zdrive process is syncing this remote; wait for it to finish".to_string(),
-            ));
+    let mut attempt = 1;
+    loop {
+        // SAFETY: the descriptor is owned by `file` for the whole call.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(file);
         }
-        return Err(RemoteError::Local(format!(
-            "lock {}: {error}",
-            path.display()
-        )));
+        let error = std::io::Error::last_os_error();
+        match error.raw_os_error() {
+            Some(libc::EWOULDBLOCK) if attempt < attempts => {
+                pause(attempt);
+                attempt += 1;
+            }
+            Some(libc::EWOULDBLOCK) => {
+                return Err(RemoteError::Conflict(
+                    "another zdrive process is syncing this remote; wait for it to finish"
+                        .to_string(),
+                ));
+            }
+            Some(libc::EINTR) => {}
+            _ => {
+                return Err(RemoteError::Local(format!(
+                    "lock {}: {error}",
+                    path.display()
+                )));
+            }
+        }
     }
-    Ok(file)
 }
 
 #[cfg(test)]
@@ -469,6 +500,33 @@ mod tests {
         ));
         drop(first);
         RemoteState::open(&dir, "folder1").unwrap();
+    }
+
+    #[test]
+    fn lock_waits_out_a_descriptor_a_fork_briefly_shares() {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        let test = TestDir::new("state-lock-fork");
+        std::fs::create_dir_all(test.path()).unwrap();
+        let path = test.path().join("lock");
+        let held = lock_exclusive_with(&path, 1, &mut |_| unreachable!()).unwrap();
+        // A forked child's copy of the descriptor keeps the lock after the
+        // parent closes its own.
+        // SAFETY: dup returns a fresh descriptor that OwnedFd now owns.
+        let inherited = unsafe { OwnedFd::from_raw_fd(libc::dup(held.as_raw_fd())) };
+        drop(held);
+        assert!(matches!(
+            lock_exclusive_with(&path, 1, &mut |_| unreachable!()),
+            Err(RemoteError::Conflict(_))
+        ));
+        let mut inherited = Some(inherited);
+        let mut pauses = Vec::new();
+        lock_exclusive_with(&path, 3, &mut |attempt| {
+            pauses.push(attempt);
+            // The child execs, closing its copy.
+            inherited.take();
+        })
+        .unwrap();
+        assert_eq!(pauses, [1]);
     }
 
     #[test]

@@ -14,6 +14,7 @@ fn remote_command(arguments: &[&str]) -> RemoteCommand {
     match parse(arguments) {
         Ok(cli) => match cli.command {
             Some(crate::Command::Remote(command)) => command,
+            Some(_) => panic!("{arguments:?} parsed as another command"),
             None => panic!("{arguments:?} parsed without a command"),
         },
         Err(error) => panic!("{arguments:?}: {error}"),
@@ -83,7 +84,7 @@ fn remote_commands_parse_and_leave_the_mount_default_alone() {
     }
     let mount = parse(&["--encrypted-dir", "/e", "--decrypted-dir", "/m"]).unwrap();
     assert!(mount.command.is_none());
-    assert_eq!(mount.encrypted_dir, Path::new("/e"));
+    assert_eq!(mount.encrypted_dir.as_deref(), Some(Path::new("/e")));
 
     // Mount flags never silently combine with a remote command, and a
     // store command never falls back to the default encrypted directory.
@@ -302,4 +303,265 @@ fn summaries_flag_states_that_need_the_operator() {
     assert_eq!(size(512), "512 bytes");
     assert_eq!(folder_hint("My Drive", "/a/b/"), "My Drive/a/b");
     assert_eq!(folder_hint("g.drive", ""), "g.drive");
+}
+
+fn choice<'a>() -> ClientChoice<'a> {
+    ClientChoice {
+        client_file: None,
+        existing: None,
+        device_code: false,
+        no_browser: false,
+        headless: false,
+        bundled: (true, true),
+        default_client_file: None,
+    }
+}
+
+#[test]
+fn client_choice_keeps_own_clients_and_prefers_the_device_flow_without_a_browser() {
+    let desktop = Issuer::bundled(ClientKind::BundledDesktop);
+    let device = Issuer::bundled(ClientKind::BundledDevice);
+    let own = PathBuf::from("/c/client.json");
+
+    assert_eq!(
+        choose_client(choice()).unwrap(),
+        (desktop.clone(), Flow::Browser)
+    );
+    assert_eq!(
+        choose_client(ClientChoice {
+            no_browser: true,
+            ..choice()
+        })
+        .unwrap(),
+        (desktop.clone(), Flow::Paste)
+    );
+    assert_eq!(
+        choose_client(ClientChoice {
+            headless: true,
+            ..choice()
+        })
+        .unwrap(),
+        (device.clone(), Flow::Device)
+    );
+    assert_eq!(
+        choose_client(ClientChoice {
+            device_code: true,
+            ..choice()
+        })
+        .unwrap(),
+        (device, Flow::Device)
+    );
+
+    // An explicit or already configured own client wins over bundled ones.
+    assert_eq!(
+        choose_client(ClientChoice {
+            client_file: Some(own.clone()),
+            headless: true,
+            ..choice()
+        })
+        .unwrap(),
+        (Issuer::byo(&own), Flow::Browser)
+    );
+    let configured = Issuer::byo(&own);
+    assert_eq!(
+        choose_client(ClientChoice {
+            existing: Some(&configured),
+            no_browser: true,
+            ..choice()
+        })
+        .unwrap(),
+        (Issuer::byo(&own), Flow::Paste)
+    );
+    let error = choose_client(ClientChoice {
+        existing: Some(&configured),
+        device_code: true,
+        ..choice()
+    })
+    .unwrap_err();
+    assert!(error.contains("--device-code"), "{error}");
+
+    // A configured bundled remote follows the current host's flow.
+    let bundled_remote = Issuer::bundled(ClientKind::BundledDesktop);
+    assert_eq!(
+        choose_client(ClientChoice {
+            existing: Some(&bundled_remote),
+            headless: true,
+            ..choice()
+        })
+        .unwrap()
+        .1,
+        Flow::Device
+    );
+}
+
+#[test]
+fn client_choice_without_bundled_clients_falls_back_or_names_the_fix() {
+    let desktop_only = ClientChoice {
+        bundled: (true, false),
+        ..choice()
+    };
+    assert_eq!(
+        choose_client(ClientChoice {
+            headless: true,
+            ..desktop_only
+        })
+        .unwrap(),
+        (Issuer::bundled(ClientKind::BundledDesktop), Flow::Paste)
+    );
+    let error = choose_client(ClientChoice {
+        device_code: true,
+        bundled: (true, false),
+        ..choice()
+    })
+    .unwrap_err();
+    assert!(error.contains("--client-file"), "{error}");
+
+    let source_build = ClientChoice {
+        bundled: (false, false),
+        ..choice()
+    };
+    let legacy = PathBuf::from("/c/legacy.json");
+    assert_eq!(
+        choose_client(ClientChoice {
+            default_client_file: Some(legacy.clone()),
+            ..source_build
+        })
+        .unwrap(),
+        (Issuer::byo(&legacy), Flow::Browser)
+    );
+    let error = choose_client(ClientChoice {
+        bundled: (false, false),
+        ..choice()
+    })
+    .unwrap_err();
+    assert!(error.contains("--client-file"), "{error}");
+}
+
+#[test]
+fn plain_remotes_always_end_in_a_marked_folder() {
+    use crate::remote::fake::{FakeDrive, ROOT_ID};
+    use crate::remote::gdrive::{FOLDER_MIME, MARKER_KEY, PLAIN_MARKER};
+
+    let fake = FakeDrive::start();
+    let drive = fake.client();
+    let marker = |id: &str| {
+        fake.file(id)
+            .expect("folder exists")
+            .app_properties
+            .get(MARKER_KEY)
+            .cloned()
+    };
+    let default = || FolderChoice::Marked {
+        marker: PLAIN_MARKER,
+        name: "ZeroTrust Drive (plain)".to_string(),
+    };
+    let path = |parent: &str, path: &str| FolderChoice::Path {
+        parent: parent.to_string(),
+        path: path.to_string(),
+    };
+
+    // The default folder is created marked in My Drive and joined again.
+    let (first, hint) = choose_folder(&drive, RemoteMode::Plain, default(), true).unwrap();
+    assert_eq!(hint, "ZeroTrust Drive (plain)");
+    assert_eq!(marker(&first.id).as_deref(), Some(PLAIN_MARKER));
+    let (again, _) = choose_folder(&drive, RemoteMode::Plain, default(), true).unwrap();
+    assert_eq!(again.id, first.id);
+
+    // An explicit path creates and marks exactly its last component, even
+    // directly in My Drive, and is joined again by the same path.
+    let (nested, _) = choose_folder(
+        &drive,
+        RemoteMode::Plain,
+        path(ROOT_ID, "/Work/Sync/"),
+        false,
+    )
+    .unwrap();
+    assert_eq!(nested.name, "Sync");
+    assert_eq!(marker(&nested.id).as_deref(), Some(PLAIN_MARKER));
+    let work = fake.file(&nested.parents[0]).unwrap();
+    assert_eq!(work.name, "Work");
+    assert!(work.app_properties.is_empty(), "{work:?}");
+    let (rejoined, _) =
+        choose_folder(&drive, RemoteMode::Plain, path(ROOT_ID, "Work/Sync"), false).unwrap();
+    assert_eq!(rejoined.id, nested.id);
+    let (top, _) = choose_folder(&drive, RemoteMode::Plain, path(ROOT_ID, "Top"), false).unwrap();
+    assert_eq!(top.name, "Top");
+    assert_ne!(top.id, first.id);
+    assert_eq!(marker(&top.id).as_deref(), Some(PLAIN_MARKER));
+
+    // A configured remote re-authorizes onto its own marked folder.
+    let (same, _) = choose_folder(&drive, RemoteMode::Plain, path(&first.id, ""), false).unwrap();
+    assert_eq!(same.id, first.id);
+
+    // A folder zdrive did not mark is never adopted, by path or by id, and
+    // stays unmarked.
+    let foreign = fake.insert(ROOT_ID, "Mine", Some(FOLDER_MIME), b"");
+    let error = choose_folder(&drive, RemoteMode::Plain, path(ROOT_ID, "Mine"), false).unwrap_err();
+    assert!(error.contains(&foreign), "{error}");
+    let error = choose_folder(&drive, RemoteMode::Plain, path(&foreign, ""), false).unwrap_err();
+    assert!(error.contains("not marked for plain sync"), "{error}");
+    assert!(error.contains("--folder-path"), "{error}");
+    assert_eq!(marker(&foreign), None);
+
+    // Encrypted path folders stay unmarked, as before.
+    let (vault, _) =
+        choose_folder(&drive, RemoteMode::Encrypted, path(ROOT_ID, "Vault"), false).unwrap();
+    assert_eq!(marker(&vault.id), None);
+}
+
+#[test]
+fn bundled_folder_paths_work_although_drive_file_hides_my_drive() {
+    use crate::remote::fake::{FakeDrive, ROOT_REAL_ID};
+    use crate::remote::gdrive::MY_DRIVE;
+
+    let fake = FakeDrive::start();
+    fake.hide_my_drive_root(true);
+    let drive = fake.client();
+    let path = |parent: &str, path: &str| FolderChoice::Path {
+        parent: parent.to_string(),
+        path: path.to_string(),
+    };
+    let choose =
+        |mode, parent: &str, folder: &str| choose_folder(&drive, mode, path(parent, folder), true);
+
+    let (vault, hint) = choose(RemoteMode::Encrypted, MY_DRIVE, "zdrive-tests/enc").unwrap();
+    assert_eq!(hint, "My Drive/zdrive-tests/enc");
+    let (nested, _) = choose(RemoteMode::Plain, MY_DRIVE, "zdrive-tests/plain").unwrap();
+    let (top, _) = choose(RemoteMode::Plain, MY_DRIVE, "Top").unwrap();
+    assert_eq!(fake.file(&top.id).unwrap().parents, [ROOT_REAL_ID]);
+
+    // A second machine joins every folder instead of creating a duplicate,
+    // although Drive reports My Drive's real id, not the alias, as parent.
+    assert_eq!(
+        choose(RemoteMode::Encrypted, MY_DRIVE, "zdrive-tests/enc")
+            .unwrap()
+            .0
+            .id,
+        vault.id
+    );
+    assert_eq!(
+        choose(RemoteMode::Plain, MY_DRIVE, "zdrive-tests/plain")
+            .unwrap()
+            .0
+            .id,
+        nested.id
+    );
+    assert_eq!(
+        choose(RemoteMode::Plain, MY_DRIVE, "Top").unwrap().0.id,
+        top.id
+    );
+    let mut names: Vec<String> = fake
+        .children(MY_DRIVE)
+        .into_iter()
+        .map(|f| f.name)
+        .collect();
+    names.sort();
+    assert_eq!(names, ["Top", "zdrive-tests"]);
+
+    // A folder id the bundled client cannot see keeps its guidance.
+    let error = choose(RemoteMode::Encrypted, "invisible", "").unwrap_err();
+    assert!(
+        error.contains("bundled sign-in sees only folders zdrive created"),
+        "{error}"
+    );
 }

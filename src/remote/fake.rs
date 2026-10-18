@@ -17,9 +17,21 @@ use super::RemoteError;
 use super::gdrive::{FOLDER_MIME, GoogleDrive, RetryPolicy, TokenSource};
 use super::{hex, md5_bytes};
 
+/// The alias Drive accepts for My Drive's root in file ids, queries,
+/// parents and moves.
 pub(crate) const ROOT_ID: &str = "root";
+/// My Drive's real folder id. As on Drive, `parents` always reports this,
+/// never the alias.
+pub(crate) const ROOT_REAL_ID: &str = "0AFakeMyDriveRootFolder";
+
+/// The real id behind Drive's `root` alias; any other id is itself.
+fn resolve(id: &str) -> &str {
+    if id == ROOT_ID { ROOT_REAL_ID } else { id }
+}
 pub(crate) const REFRESH_TOKEN: &str = "fake-refresh-token";
 pub(crate) const AUTH_CODE: &str = "fake-authorization-code";
+pub(crate) const DEVICE_CODE: &str = "fake-device-code";
+pub(crate) const DEVICE_USER_CODE: &str = "FAKE-USER-CODE";
 
 /// Endpoint classes faults and counters refer to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -36,6 +48,13 @@ pub(crate) enum Op {
     Chunk,
     QuerySession,
     Patch,
+    DeviceCode,
+    /// Multipart content update of an existing file.
+    UpdateMedia,
+    /// Start of a resumable content update of an existing file.
+    UpdateSession,
+    ChangesStart,
+    Changes,
 }
 
 /// One scripted failure, consumed by the next request of its [`Op`].
@@ -80,6 +99,14 @@ pub(crate) struct FakeFile {
     pub(crate) mime: String,
     pub(crate) content: Vec<u8>,
     pub(crate) app_properties: BTreeMap<String, String>,
+    /// Explicitly moved to the bin; descendants of a trashed folder are
+    /// trashed implicitly.
+    pub(crate) trashed: bool,
+    /// Bumped by every change, as Drive's `version`.
+    pub(crate) version: u64,
+    /// Change sequence number of the last change, rendered as
+    /// `modifiedTime`.
+    pub(crate) modified: u64,
 }
 
 struct Session {
@@ -87,6 +114,8 @@ struct Session {
     size: u64,
     received: Vec<u8>,
     created: Option<String>,
+    /// The file whose content this session replaces, for an update.
+    update_of: Option<String>,
 }
 
 #[derive(Default)]
@@ -106,10 +135,95 @@ struct State {
     foreign_location: bool,
     /// Every API request fails with 503, as during an outage.
     offline: bool,
+    /// `files.get` of My Drive's root answers 404, as under `drive.file`.
+    root_hidden: bool,
     token_forms: Vec<BTreeMap<String, String>>,
+    device_forms: Vec<BTreeMap<String, String>>,
+    /// OAuth error codes the next device-code polls answer with.
+    device_polls: VecDeque<String>,
+    device_expires_in: Option<u64>,
+    /// The changes feed: sequence number and file id, in order.
+    changes: Vec<(u64, String)>,
+    /// Sequence number of the next change; tokens are these numbers.
+    next_change: u64,
+    /// Bumped by [`FakeDrive::release_held`]; parked requests then close.
+    release_epoch: u64,
 }
 
 impl State {
+    /// Records a change of `id` and returns its sequence number.
+    fn log_change(&mut self, id: &str) -> u64 {
+        let seq = self.next_change;
+        self.next_change += 1;
+        self.changes.push((seq, id.to_string()));
+        seq
+    }
+
+    /// Records a change of an existing file and bumps its version.
+    fn touch(&mut self, id: &str) {
+        let seq = self.log_change(id);
+        if let Some(file) = self.files.get_mut(id) {
+            file.version += 1;
+            file.modified = seq;
+        }
+    }
+
+    /// Whether the file or any folder above it is in the bin.
+    fn effectively_trashed(&self, file: &FakeFile) -> bool {
+        let mut current = file;
+        for _ in 0..64 {
+            if current.trashed {
+                return true;
+            }
+            let Some(parent) = current
+                .parents
+                .first()
+                .and_then(|parent| self.files.get(parent))
+            else {
+                return false;
+            };
+            current = parent;
+        }
+        false
+    }
+
+    /// Whether `id` is `ancestor` or lies below it.
+    fn is_within(&self, id: &str, ancestor: &str) -> bool {
+        let mut current = id.to_string();
+        for _ in 0..64 {
+            if current == ancestor {
+                return true;
+            }
+            match self
+                .files
+                .get(&current)
+                .and_then(|file| file.parents.first())
+            {
+                Some(parent) => current = parent.clone(),
+                None => return false,
+            }
+        }
+        false
+    }
+
+    fn change_json(&self, id: &str) -> Value {
+        match self.files.get(id) {
+            Some(file) => json!({
+                "kind": "drive#change",
+                "changeType": "file",
+                "fileId": id,
+                "removed": false,
+                "file": self.file_json(file),
+            }),
+            None => json!({
+                "kind": "drive#change",
+                "changeType": "file",
+                "fileId": id,
+                "removed": true,
+            }),
+        }
+    }
+
     fn new_id(&mut self, prefix: &str) -> String {
         self.next_id += 1;
         format!("{prefix}{:012}", self.next_id)
@@ -155,6 +269,9 @@ impl State {
             "name": file.name,
             "mimeType": file.mime,
             "parents": file.parents,
+            "trashed": self.effectively_trashed(file),
+            "version": file.version.to_string(),
+            "modifiedTime": modified_time(file.modified),
         });
         if !file.app_properties.is_empty() {
             value["appProperties"] = json!(file.app_properties);
@@ -164,6 +281,109 @@ impl State {
             value["md5Checksum"] = json!(hex(&md5_bytes(&file.content)));
         }
         value
+    }
+
+    /// Replaces the content of an existing file, as a media update.
+    fn replace_content(&mut self, id: &str, metadata: &Value, content: Vec<u8>) -> Reply {
+        let Some(old) = self.files.get(id).map(|file| file.content.len() as u64) else {
+            return Reply::error(404, "notFound", "File not found.");
+        };
+        if self
+            .files
+            .get(id)
+            .is_some_and(|file| file.mime == FOLDER_MIME)
+        {
+            return Reply::error(400, "badContent", "A folder has no content.");
+        }
+        if let Some(limit) = self.quota_limit
+            && self.usage() - old + content.len() as u64 > limit
+        {
+            return Reply::error(
+                403,
+                "storageQuotaExceeded",
+                "The user's Drive storage quota has been exceeded.",
+            );
+        }
+        let stored = self.files.get_mut(id).expect("exists");
+        if let Some(name) = metadata.get("name").and_then(Value::as_str) {
+            stored.name = name.to_string();
+        }
+        stored.content = content;
+        self.touch(id);
+        let file = self.files.get(id).cloned().expect("exists");
+        Reply::json(200, &self.file_json(&file))
+    }
+
+    /// Applies a metadata update: name, bin state, app properties (a null
+    /// value deletes one) and a move through `addParents`/`removeParents`.
+    fn patch_metadata(
+        &mut self,
+        id: &str,
+        patch: &Value,
+        add: Option<&String>,
+        remove: Option<&String>,
+    ) -> Reply {
+        let Some(file) = self.files.get(id).cloned() else {
+            return Reply::error(404, "notFound", "File not found.");
+        };
+        let mut parents = file.parents.clone();
+        for parent in remove
+            .into_iter()
+            .flat_map(|list| list.split(','))
+            .map(resolve)
+        {
+            if !parents.iter().any(|candidate| candidate == parent) {
+                return Reply::error(400, "badRequest", "removeParents names no parent");
+            }
+            parents.retain(|candidate| candidate != parent);
+        }
+        for parent in add
+            .into_iter()
+            .flat_map(|list| list.split(','))
+            .map(resolve)
+        {
+            if !self
+                .files
+                .get(parent)
+                .is_some_and(|folder| folder.mime == FOLDER_MIME)
+            {
+                return Reply::error(404, "notFound", "File not found.");
+            }
+            if self.is_within(parent, id) {
+                return Reply::error(400, "badRequest", "A folder cannot contain itself.");
+            }
+            if !parents.iter().any(|candidate| candidate == parent) {
+                parents.push(parent.to_string());
+            }
+        }
+        let name = match patch.get("name") {
+            None => None,
+            Some(Value::String(name)) if !name.is_empty() => Some(name.clone()),
+            Some(_) => return Reply::error(400, "badRequest", "Invalid name."),
+        };
+        let stored = self.files.get_mut(id).expect("exists");
+        stored.parents = parents;
+        if let Some(name) = name {
+            stored.name = name;
+        }
+        if let Some(trashed) = patch.get("trashed").and_then(Value::as_bool) {
+            stored.trashed = trashed;
+        }
+        if let Some(props) = patch.get("appProperties").and_then(Value::as_object) {
+            for (key, value) in props {
+                match value.as_str() {
+                    Some(value) => {
+                        stored.app_properties.insert(key.clone(), value.to_string());
+                    }
+                    None => {
+                        stored.app_properties.remove(key);
+                    }
+                }
+            }
+        }
+        self.touch(id);
+        let file = self.files.get(id).cloned().expect("exists");
+        Reply::json(200, &self.file_json(&file))
     }
 
     fn create(&mut self, metadata: &Value, content: Vec<u8>) -> Reply {
@@ -181,9 +401,9 @@ impl State {
         let parents: Vec<String> = match metadata.get("parents").and_then(Value::as_array) {
             Some(parents) => parents
                 .iter()
-                .filter_map(|parent| parent.as_str().map(str::to_string))
+                .filter_map(|parent| parent.as_str().map(|id| resolve(id).to_string()))
                 .collect(),
-            None => vec![ROOT_ID.to_string()],
+            None => vec![ROOT_REAL_ID.to_string()],
         };
         for parent in &parents {
             if !self
@@ -203,6 +423,7 @@ impl State {
                 "The user's Drive storage quota has been exceeded.",
             );
         }
+        let seq = self.log_change(&id);
         let file = FakeFile {
             id: id.clone(),
             name: metadata
@@ -221,6 +442,9 @@ impl State {
                 .get("appProperties")
                 .and_then(|props| serde_json::from_value(props.clone()).ok())
                 .unwrap_or_default(),
+            trashed: false,
+            version: 1,
+            modified: seq,
         };
         let mut body = self.file_json(&file);
         if self.omit_checksums
@@ -290,16 +514,20 @@ impl FakeDrive {
         let base = format!("http://{}", listener.local_addr().expect("local addr"));
         let mut state = State::default();
         state.files.insert(
-            ROOT_ID.to_string(),
+            ROOT_REAL_ID.to_string(),
             FakeFile {
-                id: ROOT_ID.to_string(),
+                id: ROOT_REAL_ID.to_string(),
                 name: "My Drive".to_string(),
                 parents: Vec::new(),
                 mime: FOLDER_MIME.to_string(),
                 content: Vec::new(),
                 app_properties: BTreeMap::new(),
+                trashed: false,
+                version: 1,
+                modified: 0,
             },
         );
+        state.next_change = 1;
         let state = Arc::new(Mutex::new(state));
         let stop = Arc::new(AtomicBool::new(false));
         let (thread_state, thread_stop, thread_base) = (state.clone(), stop.clone(), base.clone());
@@ -363,6 +591,12 @@ impl FakeDrive {
         self.lock().held
     }
 
+    /// Closes every parked request without an answer, as a connection
+    /// lost mid-request; the client sees a transport failure.
+    pub(crate) fn release_held(&self) {
+        self.lock().release_epoch += 1;
+    }
+
     pub(crate) fn pending_faults(&self) -> usize {
         self.lock().faults.len()
     }
@@ -387,6 +621,12 @@ impl FakeDrive {
         self.lock().omit_checksums = omit;
     }
 
+    /// Emulates `drive.file`: My Drive's root stays usable as a parent and
+    /// in queries, but `files.get` of it answers 404.
+    pub(crate) fn hide_my_drive_root(&self, hidden: bool) {
+        self.lock().root_hidden = hidden;
+    }
+
     pub(crate) fn set_offline(&self, offline: bool) {
         self.lock().offline = offline;
     }
@@ -399,20 +639,37 @@ impl FakeDrive {
         self.lock().token_forms.clone()
     }
 
+    pub(crate) fn device_forms(&self) -> Vec<BTreeMap<String, String>> {
+        self.lock().device_forms.clone()
+    }
+
+    /// Answer the next device-code polls with these OAuth error codes, in
+    /// order; later polls are approved.
+    pub(crate) fn script_device_polls(&self, errors: &[&str]) {
+        self.lock()
+            .device_polls
+            .extend(errors.iter().map(|error| (*error).to_string()));
+    }
+
+    pub(crate) fn set_device_expiry(&self, seconds: u64) {
+        self.lock().device_expires_in = Some(seconds);
+    }
+
     pub(crate) fn files(&self) -> Vec<FakeFile> {
         self.lock()
             .files
             .values()
-            .filter(|file| file.id != ROOT_ID)
+            .filter(|file| file.id != ROOT_REAL_ID)
             .cloned()
             .collect()
     }
 
     pub(crate) fn file(&self, id: &str) -> Option<FakeFile> {
-        self.lock().files.get(id).cloned()
+        self.lock().files.get(resolve(id)).cloned()
     }
 
     pub(crate) fn children(&self, parent: &str) -> Vec<FakeFile> {
+        let parent = resolve(parent);
         self.lock()
             .files
             .values()
@@ -449,7 +706,82 @@ impl FakeDrive {
         let mut state = self.lock();
         state.files.remove(id);
         state.creation_order.retain(|candidate| candidate != id);
+        state.log_change(id);
     }
+
+    /// Deletes a file or folder forever, with everything below it, as
+    /// another client emptying the bin would.
+    pub(crate) fn delete_foreign(&self, id: &str) {
+        let mut state = self.lock();
+        let doomed: Vec<String> = state
+            .files
+            .keys()
+            .filter(|candidate| state.is_within(candidate, id))
+            .cloned()
+            .collect();
+        for gone in doomed {
+            state.files.remove(&gone);
+            state.creation_order.retain(|candidate| *candidate != gone);
+            state.log_change(&gone);
+        }
+    }
+
+    /// Replaces the content of a file as another client would: a new
+    /// version and a change in the feed.
+    pub(crate) fn update_foreign(&self, id: &str, content: &[u8]) {
+        let mut state = self.lock();
+        state.files.get_mut(id).expect("file exists").content = content.to_vec();
+        state.touch(id);
+    }
+
+    /// Renames a file as another client would.
+    pub(crate) fn rename_foreign(&self, id: &str, name: &str) {
+        let mut state = self.lock();
+        state.files.get_mut(id).expect("file exists").name = name.to_string();
+        state.touch(id);
+    }
+
+    /// Moves a file into the folder `parent` as another client would.
+    pub(crate) fn move_foreign(&self, id: &str, parent: &str) {
+        let parent = resolve(parent);
+        let mut state = self.lock();
+        assert!(
+            state
+                .files
+                .get(parent)
+                .is_some_and(|folder| folder.mime == FOLDER_MIME),
+            "fake move target is not a folder"
+        );
+        state.files.get_mut(id).expect("file exists").parents = vec![parent.to_string()];
+        state.touch(id);
+    }
+
+    /// Moves a file or folder to the bin, or restores it, as another
+    /// client would. Only the item itself gets a change, as the worst case
+    /// for a client that must infer what happened to its descendants.
+    pub(crate) fn trash_foreign(&self, id: &str, trashed: bool) {
+        let mut state = self.lock();
+        state.files.get_mut(id).expect("file exists").trashed = trashed;
+        state.touch(id);
+    }
+
+    /// The current changes token, as `changes/getStartPageToken` answers.
+    pub(crate) fn change_token(&self) -> u64 {
+        self.lock().next_change
+    }
+}
+
+/// A fixed-epoch RFC 3339 rendering of a change sequence number, so later
+/// changes have later times.
+fn modified_time(seq: u64) -> String {
+    let (days, rest) = (seq / 86_400, seq % 86_400);
+    format!(
+        "2026-01-{:02}T{:02}:{:02}:{:02}.000Z",
+        1 + days.min(27),
+        rest / 3600,
+        rest % 3600 / 60,
+        rest % 60
+    )
 }
 
 impl Drop for FakeDrive {
@@ -600,12 +932,15 @@ fn write_reply(stream: &mut TcpStream, reply: &Reply, body_limit: Option<usize>)
 
 fn classify(request: &Request) -> Option<(Op, Option<String>)> {
     let path = request.path.as_str();
-    let file_id = |prefix: &str| path.strip_prefix(prefix).map(str::to_string);
+    let file_id = |prefix: &str| path.strip_prefix(prefix).map(|id| resolve(id).to_string());
     match request.method.as_str() {
         "POST" if path == "/token" => Some((Op::Token, None)),
+        "POST" if path == "/device/code" => Some((Op::DeviceCode, None)),
         "GET" if path == "/drive/v3/about" => Some((Op::About, None)),
         "GET" if path == "/drive/v3/files/generateIds" => Some((Op::GenerateIds, None)),
         "GET" if path == "/drive/v3/files" => Some((Op::List, None)),
+        "GET" if path == "/drive/v3/changes/startPageToken" => Some((Op::ChangesStart, None)),
+        "GET" if path == "/drive/v3/changes" => Some((Op::Changes, None)),
         "GET" if request.query.get("alt").is_some_and(|alt| alt == "media") => {
             Some((Op::Media, file_id("/drive/v3/files/")))
         }
@@ -630,6 +965,14 @@ fn classify(request: &Request) -> Option<(Op, Option<String>)> {
                 Some((Op::Chunk, session))
             }
         }
+        "PATCH" if path.starts_with("/upload/drive/v3/files/") => {
+            let target = file_id("/upload/drive/v3/files/");
+            match request.query.get("uploadType").map(String::as_str) {
+                Some("multipart") => Some((Op::UpdateMedia, target)),
+                Some("resumable") => Some((Op::UpdateSession, target)),
+                _ => None,
+            }
+        }
         "PATCH" => Some((Op::Patch, file_id("/drive/v3/files/"))),
         _ => None,
     }
@@ -650,7 +993,7 @@ fn serve(mut stream: TcpStream, state: &Mutex<State>, base: &str) {
     };
     let mut guard = state.lock().unwrap_or_else(|poison| poison.into_inner());
     *guard.counts.entry(op).or_default() += 1;
-    if op != Op::Token {
+    if !matches!(op, Op::Token | Op::DeviceCode) {
         let authorized = request
             .headers
             .get("authorization")
@@ -666,7 +1009,7 @@ fn serve(mut stream: TcpStream, state: &Mutex<State>, base: &str) {
             return;
         }
     }
-    if guard.offline && op != Op::Token {
+    if guard.offline && !matches!(op, Op::Token | Op::DeviceCode) {
         drop(guard);
         write_reply(
             &mut stream,
@@ -680,8 +1023,9 @@ fn serve(mut stream: TcpStream, state: &Mutex<State>, base: &str) {
             handle(&mut guard, op, target.as_deref(), &request, base, None);
         }
         guard.held += 1;
+        let epoch = guard.release_epoch;
         drop(guard);
-        park(&mut stream);
+        park(&mut stream, state, epoch);
         return;
     }
     let fault = guard.take_fault(op);
@@ -747,12 +1091,22 @@ fn serve(mut stream: TcpStream, state: &Mutex<State>, base: &str) {
     }
 }
 
-/// Keeps the connection open without answering until the client goes away.
-fn park(stream: &mut TcpStream) {
+/// Keeps the connection open without answering until the client goes away
+/// or the test releases held requests.
+fn park(stream: &mut TcpStream, state: &Mutex<State>, epoch: u64) {
     let _ = stream.set_read_timeout(Some(Duration::from_millis(100)));
     let deadline = Instant::now() + Duration::from_secs(180);
     let mut sink = [0u8; 8192];
     while Instant::now() < deadline {
+        let released = state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .release_epoch
+            != epoch;
+        if released {
+            let _ = stream.shutdown(Shutdown::Both);
+            return;
+        }
         match stream.read(&mut sink) {
             Ok(0) => return,
             Ok(_) => {}
@@ -770,9 +1124,15 @@ fn park(stream: &mut TcpStream) {
 fn request_name(state: &State, op: Op, target: Option<&str>, request: &Request) -> Option<String> {
     let metadata = match op {
         Op::Multipart => multipart(request)?.0,
-        Op::StartSession => serde_json::from_slice(&request.body).ok()?,
-        Op::Chunk | Op::QuerySession => state.sessions.get(target?)?.metadata.clone(),
-        Op::Get | Op::Media | Op::Patch => {
+        Op::StartSession | Op::CreateFolder => serde_json::from_slice(&request.body).ok()?,
+        Op::Chunk | Op::QuerySession => {
+            let session = state.sessions.get(target?)?;
+            if let Some(id) = &session.update_of {
+                return state.files.get(id).map(|file| file.name.clone());
+            }
+            session.metadata.clone()
+        }
+        Op::Get | Op::Media | Op::Patch | Op::UpdateMedia | Op::UpdateSession => {
             return state.files.get(target?).map(|file| file.name.clone());
         }
         _ => return None,
@@ -824,6 +1184,37 @@ fn multipart(request: &Request) -> Option<(Value, Vec<u8>)> {
     Some((metadata, parts.remove(1)))
 }
 
+fn open_session(
+    state: &mut State,
+    base: &str,
+    metadata: Value,
+    size: u64,
+    update_of: Option<String>,
+) -> Reply {
+    let session = state.new_id("session");
+    state.sessions.insert(
+        session.clone(),
+        Session {
+            metadata,
+            size,
+            received: Vec::new(),
+            created: None,
+            update_of,
+        },
+    );
+    let origin = if state.foreign_location {
+        "http://203.0.113.9"
+    } else {
+        base
+    };
+    let mut reply = Reply::empty(200);
+    reply.headers.push((
+        "Location".into(),
+        format!("{origin}/upload/drive/v3/files?uploadType=resumable&upload_id={session}"),
+    ));
+    reply
+}
+
 fn session_reply(state: &mut State, session_id: &str) -> Reply {
     let Some(session) = state.sessions.get(session_id) else {
         return Reply::error(404, "notFound", "Upload session not found.");
@@ -843,6 +1234,15 @@ fn session_reply(state: &mut State, session_id: &str) -> Reply {
         return reply;
     }
     let (metadata, content) = (session.metadata.clone(), session.received.clone());
+    if let Some(id) = session.update_of.clone() {
+        let reply = state.replace_content(&id, &metadata, content);
+        if reply.status == 200
+            && let Some(session) = state.sessions.get_mut(session_id)
+        {
+            session.created = Some(id);
+        }
+        return reply;
+    }
     let reply = state.create(&metadata, content);
     if reply.status == 200
         && let Some(id) = metadata.get("id").and_then(Value::as_str)
@@ -866,6 +1266,7 @@ fn handle(
             let form = parse_pairs(&String::from_utf8_lossy(&request.body));
             state.token_forms.push(form.clone());
             let grant = form.get("grant_type").map(String::as_str);
+            let device = grant == Some("urn:ietf:params:oauth:grant-type:device_code");
             let valid = match grant {
                 Some("refresh_token") => {
                     form.get("refresh_token").map(String::as_str) == Some(REFRESH_TOKEN)
@@ -873,6 +1274,23 @@ fn handle(
                 Some("authorization_code") => {
                     form.get("code").map(String::as_str) == Some(AUTH_CODE)
                         && form.contains_key("code_verifier")
+                }
+                _ if device => {
+                    if form.get("device_code").map(String::as_str) != Some(DEVICE_CODE) {
+                        false
+                    } else if let Some(error) = state.device_polls.pop_front() {
+                        // The statuses Google answers these codes with.
+                        let status = match error.as_str() {
+                            "authorization_pending" => 428,
+                            "slow_down" | "access_denied" => 403,
+                            "invalid_client" => 401,
+                            "backendError" => 503,
+                            _ => 400,
+                        };
+                        return Reply::json(status, &json!({ "error": error }));
+                    } else {
+                        true
+                    }
                 }
                 _ => false,
             };
@@ -886,12 +1304,43 @@ fn handle(
                 "access_token": state.issue_token(),
                 "expires_in": 3599,
                 "token_type": "Bearer",
-                "scope": "https://www.googleapis.com/auth/drive",
+                "scope": if device {
+                    "https://www.googleapis.com/auth/drive.file"
+                } else {
+                    "https://www.googleapis.com/auth/drive"
+                },
             });
-            if grant == Some("authorization_code") {
+            if grant == Some("authorization_code") || device {
                 body["refresh_token"] = json!(REFRESH_TOKEN);
             }
             Reply::json(200, &body)
+        }
+        Op::DeviceCode => {
+            let form = parse_pairs(&String::from_utf8_lossy(&request.body));
+            state.device_forms.push(form.clone());
+            // Device clients may only ask for these Drive scopes.
+            let allowed = form.get("scope").is_some_and(|scope| {
+                scope.split(' ').all(|scope| {
+                    matches!(
+                        scope,
+                        "https://www.googleapis.com/auth/drive.file"
+                            | "https://www.googleapis.com/auth/drive.appdata"
+                    )
+                })
+            });
+            if !allowed {
+                return Reply::json(400, &json!({ "error": "invalid_scope" }));
+            }
+            Reply::json(
+                200,
+                &json!({
+                    "device_code": DEVICE_CODE,
+                    "user_code": DEVICE_USER_CODE,
+                    "verification_url": "https://www.google.com/device",
+                    "expires_in": state.device_expires_in.unwrap_or(1800),
+                    "interval": 5,
+                }),
+            )
         }
         Op::About => Reply::json(
             200,
@@ -917,12 +1366,30 @@ fn handle(
         }
         Op::List => {
             let query = request.query.get("q").cloned().unwrap_or_default();
+            let marked_suffix = format!(" }} and mimeType = '{FOLDER_MIME}' and trashed = false");
+            if let Some(marker) = query
+                .strip_prefix("appProperties has { key='zdrive' and value='")
+                .and_then(|rest| rest.strip_suffix(marked_suffix.as_str()))
+                .and_then(|rest| rest.strip_suffix('\''))
+            {
+                let matches: Vec<Value> = state
+                    .files
+                    .values()
+                    .filter(|file| file.mime == FOLDER_MIME)
+                    .filter(|file| {
+                        file.app_properties.get("zdrive").map(String::as_str) == Some(marker)
+                    })
+                    .map(|file| state.file_json(file))
+                    .collect();
+                return Reply::json(200, &json!({ "files": matches }));
+            }
             let Some((parent, rest)) = query
                 .strip_prefix('\'')
                 .and_then(|rest| rest.split_once("' in parents and trashed = false"))
             else {
                 return Reply::error(400, "invalidQuery", "unsupported query");
             };
+            let parent = resolve(parent);
             let folders_only = match rest {
                 "" => false,
                 filter if filter == format!(" and mimeType = '{FOLDER_MIME}'") => true,
@@ -933,6 +1400,7 @@ fn handle(
                 .values()
                 .filter(|file| file.parents.iter().any(|candidate| candidate == parent))
                 .filter(|file| !folders_only || file.mime == FOLDER_MIME)
+                .filter(|file| !state.effectively_trashed(file))
                 .map(|file| state.file_json(file))
                 .collect();
             let requested: usize = request
@@ -954,6 +1422,9 @@ fn handle(
             Reply::json(200, &body)
         }
         Op::Get | Op::Media | Op::Patch => {
+            if state.root_hidden && target == Some(ROOT_REAL_ID) {
+                return Reply::error(404, "notFound", "File not found: .");
+            }
             let Some(file) = target.and_then(|id| state.files.get(id)).cloned() else {
                 return Reply::error(404, "notFound", "File not found.");
             };
@@ -981,14 +1452,12 @@ fn handle(
                     let Ok(patch) = serde_json::from_slice::<Value>(&request.body) else {
                         return Reply::error(400, "parseError", "bad json");
                     };
-                    let props: BTreeMap<String, String> = patch
-                        .get("appProperties")
-                        .and_then(|props| serde_json::from_value(props.clone()).ok())
-                        .unwrap_or_default();
-                    let stored = state.files.get_mut(&file.id).expect("exists");
-                    stored.app_properties.extend(props);
-                    let stored = stored.clone();
-                    Reply::json(200, &state.file_json(&stored))
+                    state.patch_metadata(
+                        &file.id,
+                        &patch,
+                        request.query.get("addParents"),
+                        request.query.get("removeParents"),
+                    )
                 }
             }
         }
@@ -1022,27 +1491,84 @@ fn handle(
                     "A file already exists with the provided ID.",
                 );
             }
-            let session = state.new_id("session");
-            state.sessions.insert(
-                session.clone(),
-                Session {
-                    metadata,
-                    size,
-                    received: Vec::new(),
-                    created: None,
-                },
-            );
-            let origin = if state.foreign_location {
-                "http://203.0.113.9"
-            } else {
-                base
+            open_session(state, base, metadata, size, None)
+        }
+        Op::UpdateSession => {
+            let Some(id) = target.filter(|id| state.files.contains_key(*id)) else {
+                return Reply::error(404, "notFound", "File not found.");
             };
-            let mut reply = Reply::empty(200);
-            reply.headers.push((
-                "Location".into(),
-                format!("{origin}/upload/drive/v3/files?uploadType=resumable&upload_id={session}"),
-            ));
-            reply
+            let Some(size) = request
+                .headers
+                .get("x-upload-content-length")
+                .and_then(|size| size.parse::<u64>().ok())
+            else {
+                return Reply::error(400, "badRequest", "missing upload length");
+            };
+            let Ok(metadata) = serde_json::from_slice::<Value>(&request.body) else {
+                return Reply::error(400, "parseError", "bad json");
+            };
+            open_session(state, base, metadata, size, Some(id.to_string()))
+        }
+        Op::UpdateMedia => {
+            let Some(id) = target else {
+                return Reply::error(404, "notFound", "File not found.");
+            };
+            match multipart(request) {
+                Some((metadata, content)) => state.replace_content(id, &metadata, content),
+                None => Reply::error(400, "badContent", "malformed multipart body"),
+            }
+        }
+        Op::ChangesStart => Reply::json(
+            200,
+            &json!({
+                "kind": "drive#startPageToken",
+                "startPageToken": state.next_change.to_string(),
+            }),
+        ),
+        Op::Changes => {
+            let Some(start) = request
+                .query
+                .get("pageToken")
+                .and_then(|token| token.parse::<u64>().ok())
+                .filter(|token| (1..=state.next_change).contains(token))
+            else {
+                return Reply::error(400, "invalidPageToken", "Invalid page token.");
+            };
+            let requested: usize = request
+                .query
+                .get("pageSize")
+                .and_then(|size| size.parse().ok())
+                .unwrap_or(100);
+            let page_size = state.page_size.unwrap_or(requested).min(requested).max(1);
+            let pending: Vec<(u64, String)> = state
+                .changes
+                .iter()
+                .filter(|(seq, _)| *seq >= start)
+                .cloned()
+                .collect();
+            // Like Drive, one listing reports only the latest change of a file.
+            let latest: HashMap<&str, u64> = pending
+                .iter()
+                .map(|(seq, id)| (id.as_str(), *seq))
+                .collect();
+            let mut changes = Vec::new();
+            let mut next = None;
+            for (seq, id) in &pending {
+                if latest.get(id.as_str()) != Some(seq) {
+                    continue;
+                }
+                if changes.len() == page_size {
+                    next = Some(*seq);
+                    break;
+                }
+                changes.push(state.change_json(id));
+            }
+            let mut body = json!({ "kind": "drive#changeList", "changes": changes });
+            match next {
+                Some(seq) => body["nextPageToken"] = json!(seq.to_string()),
+                None => body["newStartPageToken"] = json!(state.next_change.to_string()),
+            }
+            Reply::json(200, &body)
         }
         Op::QuerySession => match target {
             Some(session) => session_reply(state, session),

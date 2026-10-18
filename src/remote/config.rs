@@ -4,9 +4,11 @@
 //!
 //! Configuration lives outside every store and every synced folder:
 //! `$XDG_CONFIG_HOME/zerotrust-drive/remotes/<name>.json` (0600, in a 0700
-//! directory). The refresh token inside it is sealed with XChaCha20-Poly1305
-//! under an Argon2id key derived from the store passphrase, so neither the
-//! file nor a backup of it grants Drive access on its own.
+//! directory). The refresh token of an encrypted remote is sealed with
+//! XChaCha20-Poly1305 under an Argon2id key derived from the store
+//! passphrase, so neither the file nor a backup of it grants Drive access on
+//! its own. A plain remote has no passphrase; its token sits unsealed in a
+//! private `remotes/<name>.token` file, as rclone keeps its own.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -22,17 +24,70 @@ use crate::crypto::{KdfParams, decrypt_bytes_owned, encrypt_bytes, try_derive_ke
 const APP_DIR: &str = "zerotrust-drive";
 pub(crate) const CLIENT_FILE_NAME: &str = "google-oauth-client.json";
 pub(crate) const CONFIG_FORMAT: &str = "zerotrust-drive-remote-config";
-pub(crate) const CONFIG_VERSION: u32 = 1;
+/// Version 2 adds the client kind, scope and mode. Version 1 files (0.17)
+/// still load: they are bring-your-own, full-scope, encrypted remotes.
+pub(crate) const CONFIG_VERSION: u32 = 2;
+const CONFIG_VERSION_V1: u32 = 1;
 pub(crate) const PROVIDER_GOOGLE_DRIVE: &str = "google-drive";
+/// Full Drive access, for bring-your-own clients.
+pub(crate) const SCOPE_DRIVE: &str = "https://www.googleapis.com/auth/drive";
+/// Only files this app created: the scope of the bundled clients.
+pub(crate) const SCOPE_DRIVE_FILE: &str = "https://www.googleapis.com/auth/drive.file";
 const MAX_CONFIG_FILE: u64 = 64 << 10;
 const TOKEN_AAD_DOMAIN: &[u8] = b"zerotrust-drive token vault v1\0";
 const MAX_REFRESH_TOKEN: usize = 4096;
 
-/// Where configuration and per-remote sync state live.
+/// Which OAuth client issued a remote's refresh token. A refresh must use
+/// the same client.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum ClientKind {
+    /// A Desktop client JSON the user created (`client_file`).
+    #[default]
+    Byo,
+    /// The zdrive Desktop client compiled into release builds.
+    BundledDesktop,
+    /// The zdrive "TVs and Limited Input devices" client, for the device flow.
+    BundledDevice,
+}
+
+impl ClientKind {
+    pub(crate) fn bundled(self) -> bool {
+        self != ClientKind::Byo
+    }
+}
+
+/// What the remote folder holds.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum RemoteMode {
+    /// The encrypted store replica: Google only receives ciphertext.
+    #[default]
+    Encrypted,
+    /// Unencrypted files, mirrored by `zdrive sync`. Google can read them.
+    Plain,
+}
+
+impl RemoteMode {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            RemoteMode::Encrypted => "encrypted",
+            RemoteMode::Plain => "plain",
+        }
+    }
+}
+
+fn default_scope() -> String {
+    SCOPE_DRIVE.to_string()
+}
+
+/// Where configuration, per-remote sync state and local data live.
 #[derive(Clone, Debug)]
 pub(crate) struct Paths {
     pub(crate) config: PathBuf,
     pub(crate) state: PathBuf,
+    /// `$XDG_DATA_HOME/zerotrust-drive`: default stores and local trash.
+    pub(crate) data: PathBuf,
 }
 
 impl Paths {
@@ -42,7 +97,7 @@ impl Paths {
 
     /// XDG base directories; relative values are invalid by the
     /// specification and ignored.
-    fn resolve(var: impl Fn(&str) -> Option<OsString>) -> Result<Self, RemoteError> {
+    pub(crate) fn resolve(var: impl Fn(&str) -> Option<OsString>) -> Result<Self, RemoteError> {
         let absolute = |name: &str| {
             var(name)
                 .map(PathBuf::from)
@@ -61,10 +116,20 @@ impl Paths {
             Some(path) => path,
             None => home()?.join(".local").join("state"),
         };
+        let data = match absolute("XDG_DATA_HOME") {
+            Some(path) => path,
+            None => home()?.join(".local").join("share"),
+        };
         Ok(Self {
             config: config.join(APP_DIR),
             state: state.join(APP_DIR),
+            data: data.join(APP_DIR),
         })
+    }
+
+    /// The store a bare `zdrive` mounts without `--encrypted-dir`.
+    pub(crate) fn default_store(&self) -> PathBuf {
+        self.data.join("store")
     }
 
     pub(crate) fn default_client_file(&self) -> PathBuf {
@@ -75,6 +140,14 @@ impl Paths {
         self.config
             .join("remotes")
             .join(format!("{}.json", name.as_str()))
+    }
+
+    /// The unsealed refresh token of a plain-mode remote (0600). Plain
+    /// mode has no passphrase to seal it with, like rclone's default.
+    pub(crate) fn remote_token(&self, name: &RemoteName) -> PathBuf {
+        self.config
+            .join("remotes")
+            .join(format!("{}.token", name.as_str()))
     }
 
     pub(crate) fn remote_state(&self, name: &RemoteName) -> PathBuf {
@@ -193,6 +266,41 @@ impl SealedToken {
     }
 }
 
+/// The OAuth client and scope that issued a remote's refresh token.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Issuer {
+    pub(crate) client: ClientKind,
+    /// Absolute path of a bring-your-own client JSON; `None` when bundled.
+    pub(crate) client_file: Option<PathBuf>,
+    pub(crate) scope: String,
+}
+
+impl Issuer {
+    pub(crate) fn byo(client_file: &Path) -> Self {
+        Self {
+            client: ClientKind::Byo,
+            client_file: Some(client_file.to_path_buf()),
+            scope: SCOPE_DRIVE.to_string(),
+        }
+    }
+
+    pub(crate) fn bundled(client: ClientKind) -> Self {
+        Self {
+            client,
+            client_file: None,
+            scope: SCOPE_DRIVE_FILE.to_string(),
+        }
+    }
+}
+
+fn is_default<T: Default + PartialEq>(value: &T) -> bool {
+    *value == T::default()
+}
+
+fn is_full_scope(scope: &str) -> bool {
+    scope == SCOPE_DRIVE
+}
+
 /// One configured remote.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -207,21 +315,72 @@ pub(crate) struct RemoteConfig {
     pub(crate) folder_id: String,
     /// Human-readable location of `folder_id`, for status output only.
     pub(crate) folder_hint: String,
-    /// Absolute path of the OAuth client file used for this remote.
-    pub(crate) client_file: PathBuf,
-    pub(crate) token: SealedToken,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub(crate) client: ClientKind,
+    /// Absolute path of the bring-your-own OAuth client file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) client_file: Option<PathBuf>,
+    #[serde(default = "default_scope", skip_serializing_if = "is_full_scope")]
+    pub(crate) scope: String,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub(crate) mode: RemoteMode,
+    /// The refresh token sealed under the store passphrase (encrypted mode).
+    /// Plain remotes keep theirs in [`Paths::remote_token`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) token: Option<SealedToken>,
 }
 
 impl RemoteConfig {
-    pub(crate) fn new(
+    /// An encrypted remote whose credential is sealed under the store
+    /// passphrase.
+    pub(crate) fn encrypted(
         name: &RemoteName,
         account: &str,
         folder_id: &str,
         folder_hint: &str,
-        client_file: &Path,
+        issuer: &Issuer,
         token: SealedToken,
     ) -> Self {
-        Self {
+        Self::build(
+            name,
+            account,
+            folder_id,
+            folder_hint,
+            issuer,
+            RemoteMode::Encrypted,
+            Some(token),
+        )
+    }
+
+    /// A plain remote; its credential lives in the token file.
+    pub(crate) fn plain(
+        name: &RemoteName,
+        account: &str,
+        folder_id: &str,
+        folder_hint: &str,
+        issuer: &Issuer,
+    ) -> Self {
+        Self::build(
+            name,
+            account,
+            folder_id,
+            folder_hint,
+            issuer,
+            RemoteMode::Plain,
+            None,
+        )
+    }
+
+    fn build(
+        name: &RemoteName,
+        account: &str,
+        folder_id: &str,
+        folder_hint: &str,
+        issuer: &Issuer,
+        mode: RemoteMode,
+        token: Option<SealedToken>,
+    ) -> Self {
+        let mut config = Self {
             format: CONFIG_FORMAT.to_string(),
             version: CONFIG_VERSION,
             name: name.as_str().to_string(),
@@ -229,8 +388,34 @@ impl RemoteConfig {
             account: account.to_string(),
             folder_id: folder_id.to_string(),
             folder_hint: folder_hint.to_string(),
-            client_file: client_file.to_path_buf(),
+            client: issuer.client,
+            client_file: issuer.client_file.clone(),
+            scope: issuer.scope.clone(),
+            mode,
             token,
+        };
+        config.version = config.required_version();
+        config
+    }
+
+    pub(crate) fn issuer(&self) -> Issuer {
+        Issuer {
+            client: self.client,
+            client_file: self.client_file.clone(),
+            scope: self.scope.clone(),
+        }
+    }
+
+    /// Version 1 when 0.17 can read it (bring-your-own, full scope,
+    /// encrypted), so a rollback keeps working; version 2 otherwise.
+    fn required_version(&self) -> u32 {
+        if self.client == ClientKind::Byo
+            && self.scope == SCOPE_DRIVE
+            && self.mode == RemoteMode::Encrypted
+        {
+            CONFIG_VERSION_V1
+        } else {
+            CONFIG_VERSION
         }
     }
 
@@ -238,11 +423,14 @@ impl RemoteConfig {
         if self.format != CONFIG_FORMAT {
             return Err("is not a zerotrust-drive remote configuration".to_string());
         }
-        if self.version != CONFIG_VERSION {
+        if self.version != CONFIG_VERSION_V1 && self.version != CONFIG_VERSION {
             return Err(format!(
-                "has configuration version {} (expected {CONFIG_VERSION}); upgrade zdrive",
+                "has configuration version {} (expected {CONFIG_VERSION_V1} or {CONFIG_VERSION}); upgrade zdrive",
                 self.version
             ));
+        }
+        if self.version == CONFIG_VERSION_V1 && self.required_version() != CONFIG_VERSION_V1 {
+            return Err("is version 1 but uses version 2 settings".to_string());
         }
         if self.name != expected.as_str() {
             return Err(format!("names remote {:?}, not {expected}", self.name));
@@ -253,10 +441,57 @@ impl RemoteConfig {
         if !valid_file_id(&self.folder_id) {
             return Err("names an invalid folder id".to_string());
         }
-        if !self.client_file.is_absolute() {
-            return Err("names a relative OAuth client file".to_string());
+        match (self.client, &self.client_file) {
+            (ClientKind::Byo, None) => {
+                return Err("names no OAuth client file".to_string());
+            }
+            (ClientKind::Byo, Some(file)) if !file.is_absolute() => {
+                return Err("names a relative OAuth client file".to_string());
+            }
+            (ClientKind::Byo, Some(_)) => {}
+            (_, Some(_)) => {
+                return Err("names both a bundled client and a client file".to_string());
+            }
+            (_, None) => {}
+        }
+        match self.scope.as_str() {
+            SCOPE_DRIVE if self.client.bundled() => {
+                return Err("asks for full Drive access with a bundled client".to_string());
+            }
+            SCOPE_DRIVE | SCOPE_DRIVE_FILE => {}
+            other => return Err(format!("uses unsupported scope {other:?}")),
+        }
+        match (self.mode, &self.token) {
+            (RemoteMode::Encrypted, None) => {
+                return Err("holds no sealed credential".to_string());
+            }
+            (RemoteMode::Plain, Some(_)) => {
+                return Err("is plain but holds a sealed credential".to_string());
+            }
+            _ => {}
         }
         Ok(())
+    }
+
+    /// The refresh token: unsealed with the store passphrase for an
+    /// encrypted remote, read from the private token file for a plain one.
+    pub(crate) fn refresh_token(
+        &self,
+        paths: &Paths,
+        name: &RemoteName,
+        passphrase: Option<&str>,
+    ) -> Result<String, RemoteError> {
+        match (&self.token, self.mode) {
+            (Some(token), RemoteMode::Encrypted) => {
+                let passphrase = passphrase.ok_or_else(|| {
+                    RemoteError::Local(format!(
+                        "remote {name} is encrypted: its credential needs the store passphrase"
+                    ))
+                })?;
+                token.unseal(name, passphrase)
+            }
+            _ => load_plain_token(paths, name),
+        }
     }
 
     /// Loads and validates `<config>/remotes/<name>.json`.
@@ -281,19 +516,64 @@ impl RemoteConfig {
         Ok(config)
     }
 
-    /// Atomically writes the configuration with mode 0600.
+    /// Atomically writes the configuration with mode 0600, as version 1
+    /// whenever 0.17 can read it.
     pub(crate) fn save(&self, paths: &Paths) -> Result<(), RemoteError> {
         let name = RemoteName::parse(&self.name)?;
-        self.validate(&name).map_err(RemoteError::Local)?;
+        let mut config = self.clone();
+        config.version = config.required_version();
+        config.validate(&name).map_err(RemoteError::Local)?;
         ensure_private_dir(&paths.config)?;
         let directory = paths.config.join("remotes");
         ensure_private_dir(&directory)?;
-        let mut bytes = serde_json::to_vec_pretty(self).map_err(|error| {
+        let mut bytes = serde_json::to_vec_pretty(&config).map_err(|error| {
             RemoteError::Local(format!("serialize remote configuration: {error}"))
         })?;
         bytes.push(b'\n');
         write_private_file(&paths.remote_config(&name), &bytes)
     }
+}
+
+/// Stores a plain remote's refresh token in its private token file.
+pub(crate) fn save_plain_token(
+    paths: &Paths,
+    name: &RemoteName,
+    refresh_token: &str,
+) -> Result<(), RemoteError> {
+    if refresh_token.is_empty()
+        || refresh_token.len() > MAX_REFRESH_TOKEN
+        || refresh_token.contains(['\n', '\r'])
+    {
+        return Err(RemoteError::Local(
+            "refusing an implausible refresh token".to_string(),
+        ));
+    }
+    ensure_private_dir(&paths.config)?;
+    ensure_private_dir(&paths.config.join("remotes"))?;
+    let mut bytes = refresh_token.as_bytes().to_vec();
+    bytes.push(b'\n');
+    write_private_file(&paths.remote_token(name), &bytes)
+}
+
+/// Reads a plain remote's refresh token; the file must be private.
+pub(crate) fn load_plain_token(paths: &Paths, name: &RemoteName) -> Result<String, RemoteError> {
+    let path = paths.remote_token(name);
+    let bytes = read_private_file(&path, MAX_REFRESH_TOKEN as u64 + 2)?.ok_or_else(|| {
+        RemoteError::NotFound(format!(
+            "remote {name} has no credential at {}; run `zdrive remote auth --remote {name} --plain` again",
+            path.display()
+        ))
+    })?;
+    let text = String::from_utf8(bytes)
+        .map_err(|_| RemoteError::Local(format!("{} is not text", path.display())))?;
+    let token = text.trim_end_matches(['\n', '\r']);
+    if token.is_empty() || token.len() > MAX_REFRESH_TOKEN || token.contains(['\n', '\r']) {
+        return Err(RemoteError::Local(format!(
+            "{} holds an implausible credential",
+            path.display()
+        )));
+    }
+    Ok(token.to_string())
 }
 
 #[cfg(test)]
@@ -318,20 +598,32 @@ mod tests {
         Paths {
             config: root.join("config"),
             state: root.join("state"),
+            data: root.join("data"),
         }
     }
+
+    const CLIENT_FILE: &str = "/home/tester/.config/zerotrust-drive/google-oauth-client.json";
 
     fn sample(name: &RemoteName) -> RemoteConfig {
         let token =
             SealedToken::seal(name, "vault passphrase", "1//refresh-token", test_kdf()).unwrap();
-        RemoteConfig::new(
+        RemoteConfig::encrypted(
             name,
             "tester@example.com",
             "0AbCdEfGhIjKlMnOp",
             "My Drive/zerotrust-drive",
-            Path::new("/home/tester/.config/zerotrust-drive/google-oauth-client.json"),
+            &Issuer::byo(Path::new(CLIENT_FILE)),
             token,
         )
+    }
+
+    fn write_private(path: &Path, bytes: &[u8]) {
+        std::fs::write(path, bytes).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    fn json_of(path: &Path) -> serde_json::Value {
+        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
     }
 
     #[test]
@@ -354,6 +646,10 @@ mod tests {
         assert_eq!(
             paths.state,
             Path::new("/home/tester/.local/state/zerotrust-drive")
+        );
+        assert_eq!(
+            paths.default_store(),
+            Path::new("/home/tester/.local/share/zerotrust-drive/store")
         );
         assert!(Paths::resolve(lookup(&[("HOME", "relative")])).is_err());
         let name = RemoteName::parse("gdrive").unwrap();
@@ -448,9 +744,17 @@ mod tests {
         assert_eq!(loaded.account, "tester@example.com");
         assert_eq!(loaded.folder_id, "0AbCdEfGhIjKlMnOp");
         assert_eq!(
-            loaded.token.unseal(&name, "vault passphrase").unwrap(),
+            loaded
+                .refresh_token(&paths, &name, Some("vault passphrase"))
+                .unwrap(),
             "1//refresh-token"
         );
+        // A bring-your-own encrypted remote stays readable by 0.17.
+        let written = json_of(&paths.remote_config(&name));
+        assert_eq!(written["version"], 1);
+        for absent in ["client", "scope", "mode"] {
+            assert!(written.get(absent).is_none(), "{absent}");
+        }
         // Replacing keeps one file and no temporaries.
         sample(&name).save(&paths).unwrap();
         let entries: Vec<_> = std::fs::read_dir(paths.config.join("remotes"))
@@ -490,14 +794,148 @@ mod tests {
         std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
         assert!(RemoteConfig::load(&paths, &name).is_err());
         value.as_object_mut().unwrap().remove("unexpected");
-        value["version"] = serde_json::json!(2);
+        value["version"] = serde_json::json!(3);
         std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
         let refused = RemoteConfig::load(&paths, &name).unwrap_err().to_string();
         assert!(refused.contains("upgrade zdrive"), "{refused}");
+        // Version 1 cannot carry version 2 settings.
+        value["version"] = serde_json::json!(1);
+        value["mode"] = serde_json::json!("plain");
+        std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        let refused = RemoteConfig::load(&paths, &name).unwrap_err().to_string();
+        assert!(refused.contains("version 2 settings"), "{refused}");
 
         // A group-accessible configuration directory is refused on save.
         std::fs::set_permissions(&paths.config, std::fs::Permissions::from_mode(0o755)).unwrap();
         let refused = sample(&name).save(&paths).unwrap_err().to_string();
         assert!(refused.contains("chmod 700"), "{refused}");
+    }
+
+    #[test]
+    fn a_configuration_written_by_0_17_loads_as_byo_full_scope_encrypted() {
+        let root = TestDir::new("config-0-17");
+        let paths = paths(root.path());
+        let name = RemoteName::parse("gdrive-test").unwrap();
+        let token = SealedToken::seal(&name, "vault passphrase", "1//legacy", test_kdf()).unwrap();
+        // Exactly the key set 0.17.0 writes.
+        let legacy = serde_json::json!({
+            "format": CONFIG_FORMAT,
+            "version": 1,
+            "name": "gdrive-test",
+            "provider": "google-drive",
+            "account": "tester@example.com",
+            "folder_id": "1x04nI2XZuRe1Y_wgIpMBi6mBRe1QOFvm",
+            "folder_hint": "My Drive/zerotrust-drive-test",
+            "client_file": CLIENT_FILE,
+            "token": serde_json::to_value(&token).unwrap(),
+        });
+        ensure_private_dir(&paths.config.join("remotes")).unwrap();
+        std::fs::set_permissions(&paths.config, std::fs::Permissions::from_mode(0o700)).unwrap();
+        write_private(
+            &paths.remote_config(&name),
+            &serde_json::to_vec_pretty(&legacy).unwrap(),
+        );
+        let loaded = RemoteConfig::load(&paths, &name).unwrap();
+        assert_eq!(loaded.issuer(), Issuer::byo(Path::new(CLIENT_FILE)));
+        assert_eq!(loaded.mode, RemoteMode::Encrypted);
+        assert_eq!(
+            loaded
+                .refresh_token(&paths, &name, Some("vault passphrase"))
+                .unwrap(),
+            "1//legacy"
+        );
+        assert!(loaded.refresh_token(&paths, &name, None).is_err());
+        // Saving it again changes nothing 0.17 depends on.
+        loaded.save(&paths).unwrap();
+        assert_eq!(json_of(&paths.remote_config(&name)), legacy);
+    }
+
+    #[test]
+    fn bundled_and_plain_remotes_are_version_2_and_validated() {
+        let root = TestDir::new("config-v2");
+        let paths = paths(root.path());
+        let name = RemoteName::parse("zdrive").unwrap();
+        let token = SealedToken::seal(&name, "vault passphrase", "1//bundled", test_kdf()).unwrap();
+        let bundled = RemoteConfig::encrypted(
+            &name,
+            "tester@example.com",
+            "0AbCdEfGhIjKlMnOp",
+            "My Drive/ZeroTrust Drive",
+            &Issuer::bundled(ClientKind::BundledDevice),
+            token,
+        );
+        bundled.save(&paths).unwrap();
+        let written = json_of(&paths.remote_config(&name));
+        assert_eq!(written["version"], 2);
+        assert_eq!(written["client"], "bundled-device");
+        assert_eq!(written["scope"], SCOPE_DRIVE_FILE);
+        assert!(written.get("client_file").is_none());
+        let loaded = RemoteConfig::load(&paths, &name).unwrap();
+        assert_eq!(loaded.issuer(), Issuer::bundled(ClientKind::BundledDevice));
+
+        let plain = RemoteConfig::plain(
+            &name,
+            "tester@example.com",
+            "0AbCdEfGhIjKlMnOp",
+            "My Drive/ZeroTrust Drive (plain)",
+            &Issuer::bundled(ClientKind::BundledDesktop),
+        );
+        plain.save(&paths).unwrap();
+        let written = json_of(&paths.remote_config(&name));
+        assert_eq!(written["mode"], "plain");
+        assert!(written.get("token").is_none());
+        let loaded = RemoteConfig::load(&paths, &name).unwrap();
+        assert_eq!(loaded.mode, RemoteMode::Plain);
+        assert!(matches!(
+            loaded.refresh_token(&paths, &name, None),
+            Err(RemoteError::NotFound(message)) if message.contains("--plain")
+        ));
+
+        // Each inconsistent combination is refused before it is written.
+        let mut cases: Vec<(RemoteConfig, &str)> = Vec::new();
+        let mut full_bundled = plain.clone();
+        full_bundled.scope = SCOPE_DRIVE.to_string();
+        cases.push((full_bundled, "full Drive access"));
+        let mut both = plain.clone();
+        both.client_file = Some(PathBuf::from(CLIENT_FILE));
+        cases.push((both, "both a bundled client"));
+        let mut byo_without = plain.clone();
+        byo_without.client = ClientKind::Byo;
+        cases.push((byo_without, "no OAuth client file"));
+        let mut odd_scope = plain.clone();
+        odd_scope.scope = "https://www.googleapis.com/auth/drive.readonly".to_string();
+        cases.push((odd_scope, "unsupported scope"));
+        let mut sealed_plain = plain.clone();
+        sealed_plain.token = bundled.token.clone();
+        cases.push((sealed_plain, "plain but holds"));
+        let mut unsealed = bundled.clone();
+        unsealed.token = None;
+        cases.push((unsealed, "no sealed credential"));
+        for (config, expected) in cases {
+            let refused = config.save(&paths).unwrap_err().to_string();
+            assert!(refused.contains(expected), "{expected}: {refused}");
+        }
+    }
+
+    #[test]
+    fn plain_tokens_live_in_a_private_single_line_file() {
+        let root = TestDir::new("config-plain-token");
+        let paths = paths(root.path());
+        let name = RemoteName::parse("plain").unwrap();
+        for invalid in ["", "two\nlines", &"x".repeat(MAX_REFRESH_TOKEN + 1)] {
+            assert!(save_plain_token(&paths, &name, invalid).is_err());
+        }
+        save_plain_token(&paths, &name, "1//plain").unwrap();
+        let path = paths.remote_token(&name);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(load_plain_token(&paths, &name).unwrap(), "1//plain");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let refused = load_plain_token(&paths, &name).unwrap_err().to_string();
+        assert!(refused.contains("chmod 600"), "{refused}");
+        write_private(&path, b"one\ntwo\n");
+        assert!(load_plain_token(&paths, &name).is_err());
     }
 }

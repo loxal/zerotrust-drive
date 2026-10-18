@@ -26,7 +26,7 @@ use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard, mpsc};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use md5::Digest;
 
@@ -46,6 +46,7 @@ use super::format::{
 use super::gdrive::{DriveFile, GoogleDrive, UploadCheckpoint};
 use super::state::{KnownLayout, PendingLayout, PendingRoot, RemoteState, SyncedHead};
 use super::{RemoteError, hex, md5_bytes, md5_file, unhex};
+use crate::telemetry::{self, Field, Level};
 
 /// Present while a bootstrap pull is filling an empty directory. Mounting
 /// refuses such a directory; `zdrive remote pull` finishes it.
@@ -888,10 +889,109 @@ struct Queued {
     size: u64,
 }
 
+/// Telemetry names of one transfer direction; they never carry a name, id or
+/// path.
+struct Transfer {
+    op: &'static str,
+    duration: &'static str,
+    failed: &'static str,
+    bytes: &'static str,
+    objects: &'static str,
+    packs: &'static str,
+}
+
+const PUSH: Transfer = Transfer {
+    op: "push",
+    duration: "remote.push",
+    failed: "remote.push.failed",
+    bytes: "remote.push.bytes",
+    objects: "remote.push.objects",
+    packs: "remote.push.packs",
+};
+
+const PULL: Transfer = Transfer {
+    op: "pull",
+    duration: "remote.pull",
+    failed: "remote.pull.failed",
+    bytes: "remote.pull.bytes",
+    objects: "remote.pull.objects",
+    packs: "remote.pull.packs",
+};
+
+const BOOTSTRAP: Transfer = Transfer {
+    op: "bootstrap",
+    duration: "remote.bootstrap",
+    failed: "remote.bootstrap.failed",
+    bytes: "remote.bootstrap.bytes",
+    objects: "remote.bootstrap.objects",
+    packs: "remote.bootstrap.packs",
+};
+
+fn pulled(result: &Result<PullReport, RemoteError>) -> Result<(u64, usize, usize), &RemoteError> {
+    result
+        .as_ref()
+        .map(|report| (report.bytes, report.objects, report.packs))
+}
+
+/// Records one transfer: its duration, and what it moved or why it failed.
+fn record_transfer(
+    transfer: &Transfer,
+    started: Instant,
+    moved: Result<(u64, usize, usize), &RemoteError>,
+) {
+    telemetry::duration(transfer.duration, started.elapsed());
+    match moved {
+        Ok((bytes, objects, packs)) => {
+            telemetry::counter(transfer.bytes, bytes);
+            telemetry::counter(transfer.objects, objects as u64);
+            telemetry::counter(transfer.packs, packs as u64);
+        }
+        Err(error) => {
+            telemetry::counter(transfer.failed, 1);
+            telemetry::event(
+                Level::Standard,
+                "remote.sync_failed",
+                &[
+                    ("op", Field::Tag(transfer.op)),
+                    ("error", Field::Tag(error_kind(error))),
+                ],
+            );
+        }
+    }
+}
+
+fn error_kind(error: &RemoteError) -> &'static str {
+    match error {
+        RemoteError::Auth(_) => "auth",
+        RemoteError::Quota(_) => "quota",
+        RemoteError::NotFound(_) => "not_found",
+        RemoteError::Conflict(_) => "conflict",
+        RemoteError::Integrity(_) => "integrity",
+        RemoteError::Diverged(_) => "diverged",
+        RemoteError::Network(_) => "network",
+        RemoteError::Protocol(_) => "protocol",
+        RemoteError::Local(_) => "local",
+    }
+}
+
 /// Publishes the local head: uploads every object of its closure the remote
 /// lacks, then creates its root record. The remote head must be an ancestor
 /// of the local head.
 pub(crate) fn push(
+    remote: &Remote<'_>,
+    local: &LocalStore<'_>,
+    state: &mut RemoteState,
+) -> Result<PushReport, RemoteError> {
+    let started = Instant::now();
+    let result = push_unrecorded(remote, local, state);
+    let moved = result
+        .as_ref()
+        .map(|report| (report.bytes, report.objects, report.packs));
+    record_transfer(&PUSH, started, moved);
+    result
+}
+
+fn push_unrecorded(
     remote: &Remote<'_>,
     local: &LocalStore<'_>,
     state: &mut RemoteState,
@@ -1481,6 +1581,17 @@ pub(crate) fn pull(
     local: &LocalStore<'_>,
     state: &mut RemoteState,
 ) -> Result<PullReport, RemoteError> {
+    let started = Instant::now();
+    let result = pull_unrecorded(remote, local, state);
+    record_transfer(&PULL, started, pulled(&result));
+    result
+}
+
+fn pull_unrecorded(
+    remote: &Remote<'_>,
+    local: &LocalStore<'_>,
+    state: &mut RemoteState,
+) -> Result<PullReport, RemoteError> {
     // `packs/` is listed only once the head is known: a listing taken
     // before `roots/` could miss the packs of a root published between them.
     let Snapshot { layout, roots, .. } =
@@ -1809,6 +1920,20 @@ fn head_bytes(remote: &Remote<'_>, head: &RemoteHead) -> Result<Vec<u8>, RemoteE
 /// head. A pending marker makes an interrupted bootstrap resumable and keeps
 /// the half-filled directory from being mounted.
 pub(crate) fn bootstrap(
+    remote: &Remote<'_>,
+    base: &Path,
+    display: &str,
+    key: &[u8; 32],
+    kdf: &RemoteKdf,
+    state: &mut RemoteState,
+) -> Result<PullReport, RemoteError> {
+    let started = Instant::now();
+    let result = bootstrap_unrecorded(remote, base, display, key, kdf, state);
+    record_transfer(&BOOTSTRAP, started, pulled(&result));
+    result
+}
+
+fn bootstrap_unrecorded(
     remote: &Remote<'_>,
     base: &Path,
     display: &str,

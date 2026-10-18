@@ -15,8 +15,10 @@ use crate::crypto::{KdfParams, RecoveryFingerprint, load_kdf_with_fingerprint, t
 use crate::prompt::{self, PassphraseSource, SecretReader, TerminalReader};
 use crate::v2::{self, V2NamespacePin, replica};
 
-use super::config::{Paths, RemoteConfig, RemoteName, SealedToken};
-use super::gdrive::{GoogleDrive, http_agent};
+use super::config::{
+    self, ClientKind, Issuer, Paths, RemoteConfig, RemoteMode, RemoteName, SCOPE_DRIVE, SealedToken,
+};
+use super::gdrive::{self, GoogleDrive, http_agent};
 use super::oauth::{self, Consent, Endpoints, OAuthClient, RefreshTokenSource};
 use super::state::RemoteState;
 use super::sync::{
@@ -24,9 +26,6 @@ use super::sync::{
     VerifyReport,
 };
 use super::{RemoteError, ensure_private_dir};
-
-/// Drive's alias for the root of My Drive.
-const MY_DRIVE: &str = "root";
 
 #[derive(Subcommand, Debug)]
 pub(crate) enum RemoteCommand {
@@ -43,54 +42,85 @@ pub(crate) enum RemoteCommand {
     Verify(VerifyArgs),
 }
 
-#[derive(Args, Debug)]
+#[derive(Args, Debug, Default)]
 pub(crate) struct AuthArgs {
     /// Remote name: 1-63 lowercase letters, digits, '-' or '_'
     #[arg(long)]
-    remote: String,
+    pub(crate) remote: String,
+
+    /// Google account to sign in with; zdrive suggests it to Google and
+    /// refuses a sign-in with another account
+    #[arg(long, value_name = "EMAIL")]
+    pub(crate) account: Option<String>,
+
+    /// Store plain, unencrypted files that Google can read. The default
+    /// stores only ciphertext
+    #[arg(long)]
+    pub(crate) plain: bool,
+
+    /// Name of the Drive folder zdrive creates in My Drive when none of its
+    /// folders exists yet [default: "ZeroTrust Drive", or "ZeroTrust Drive
+    /// (plain)" with --plain]
+    #[arg(long, value_name = "NAME")]
+    pub(crate) folder_name: Option<String>,
 
     /// Drive folder that holds the remote, for example a Computers folder.
-    /// Defaults to My Drive, or to the folder of an already configured remote
+    /// Defaults to the folder zdrive created, or to the folder of an
+    /// already configured remote
     #[arg(long, value_name = "ID")]
-    folder_id: Option<String>,
+    pub(crate) folder_id: Option<String>,
 
     /// Slash-separated folder path below --folder-id (or My Drive); missing
     /// folders are created and duplicate names are refused
     #[arg(long, value_name = "PATH")]
-    folder_path: Option<String>,
+    pub(crate) folder_path: Option<String>,
 
-    /// OAuth Desktop client JSON downloaded from Google Cloud [default:
-    /// ~/.config/zerotrust-drive/google-oauth-client.json]
+    /// Your own OAuth Desktop client JSON from Google Cloud, which grants
+    /// full Drive access instead of only the files zdrive creates
     #[arg(long, value_name = "FILE")]
-    client_file: Option<PathBuf>,
+    pub(crate) client_file: Option<PathBuf>,
+
+    /// Sign in by entering a short code on Google's device page from any
+    /// phone or computer (the default over SSH and without a display)
+    #[arg(long, conflicts_with = "no_browser")]
+    pub(crate) device_code: bool,
 
     /// Print the consent address and read the redirected address back
-    /// instead of opening a local browser (headless hosts)
+    /// instead of opening a local browser
     #[arg(long)]
-    no_browser: bool,
+    pub(crate) no_browser: bool,
 
     /// Store passphrase that seals the Google credential. Prefer the
-    /// ZEROTRUST_PASSPHRASE env var or the prompt: arguments are visible in
-    /// the process list
+    /// ZEROTRUST_PASSPHRASE env var, --passphrase-file or the prompt:
+    /// arguments are visible in the process list
     #[arg(long)]
-    passphrase: Option<String>,
+    pub(crate) passphrase: Option<String>,
+
+    /// Private file (mode 0600) holding the store passphrase
+    #[arg(long, value_name = "FILE")]
+    pub(crate) passphrase_file: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
 pub(crate) struct StoreArgs {
     /// Remote name given to `zdrive remote auth`
     #[arg(long)]
-    remote: String,
+    pub(crate) remote: String,
 
     /// Local encrypted v2 store. Keep it outside folders that a desktop sync
     /// client uploads; the API replication replaces that client
     #[arg(long)]
-    encrypted_dir: PathBuf,
+    pub(crate) encrypted_dir: PathBuf,
 
-    /// Store passphrase. Prefer the ZEROTRUST_PASSPHRASE env var or the
-    /// prompt: arguments are visible in the process list
+    /// Store passphrase. Prefer the ZEROTRUST_PASSPHRASE env var,
+    /// --passphrase-file or the prompt: arguments are visible in the
+    /// process list
     #[arg(long)]
-    passphrase: Option<String>,
+    pub(crate) passphrase: Option<String>,
+
+    /// Private file (mode 0600) holding the store passphrase
+    #[arg(long, value_name = "FILE")]
+    pub(crate) passphrase_file: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -167,11 +197,15 @@ pub(crate) fn note(message: &str) {
 /// passphrase: a credential sealed under it would be readable by anyone.
 pub(crate) fn read_passphrase(
     argument: Option<String>,
+    passphrase_file: Option<&Path>,
     terminal: Option<&mut TerminalReader>,
     confirm: bool,
 ) -> Result<String, String> {
+    let passphrase_file = passphrase_file
+        .map(crate::expand_home_from_env)
+        .transpose()?;
     let (passphrase, source) = prompt::resolve_current(
-        std::env::var("ZEROTRUST_PASSPHRASE").ok(),
+        prompt::stored_passphrase(passphrase_file.as_deref())?,
         argument,
         terminal.map(|terminal| terminal as &mut dyn SecretReader),
         false,
@@ -180,7 +214,7 @@ pub(crate) fn read_passphrase(
     )?;
     if source == PassphraseSource::Default {
         return Err(
-            "remote commands need the store passphrase: set ZEROTRUST_PASSPHRASE or run from a terminal to be prompted"
+            "remote commands need the store passphrase: set ZEROTRUST_PASSPHRASE, pass --passphrase-file, or run from a terminal to be prompted"
                 .to_string(),
         );
     }
@@ -193,7 +227,125 @@ pub(crate) fn read_passphrase(
     Ok(passphrase)
 }
 
+/// How the user approves access.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Flow {
+    /// Loopback redirect to a local browser.
+    Browser,
+    /// The consent address is printed and the redirected one pasted back.
+    Paste,
+    /// A short code entered on Google's device page.
+    Device,
+}
+
+/// What `remote auth` was asked for, before any network access.
+#[derive(Debug, Default)]
+pub(crate) struct ClientChoice<'a> {
+    /// Canonical `--client-file`.
+    pub(crate) client_file: Option<PathBuf>,
+    /// The issuer of an already configured remote.
+    pub(crate) existing: Option<&'a Issuer>,
+    pub(crate) device_code: bool,
+    pub(crate) no_browser: bool,
+    /// No usable local browser (SSH or a Linux host without a display).
+    pub(crate) headless: bool,
+    /// Bundled (desktop, device) clients in this build.
+    pub(crate) bundled: (bool, bool),
+    /// The 0.17 default client file, when it exists.
+    pub(crate) default_client_file: Option<PathBuf>,
+}
+
+/// Picks the OAuth client and the consent flow. A configured remote that
+/// uses its own client keeps it, because its folder may lie outside what
+/// the bundled `drive.file` client can see.
+pub(crate) fn choose_client(choice: ClientChoice<'_>) -> Result<(Issuer, Flow), String> {
+    let browser = if choice.no_browser {
+        Flow::Paste
+    } else {
+        Flow::Browser
+    };
+    let byo_file = choice.client_file.or_else(|| {
+        choice
+            .existing
+            .filter(|issuer| issuer.client == ClientKind::Byo)
+            .and_then(|issuer| issuer.client_file.clone())
+    });
+    if let Some(file) = byo_file {
+        if choice.device_code {
+            return Err(
+                "--device-code signs in with the bundled client; your own OAuth client signs in through a browser (use --no-browser on a host without one)"
+                    .to_string(),
+            );
+        }
+        return Ok((Issuer::byo(&file), browser));
+    }
+    let (desktop, device) = choice.bundled;
+    let wants_device = choice.device_code || (choice.headless && !choice.no_browser);
+    if wants_device && device {
+        return Ok((Issuer::bundled(ClientKind::BundledDevice), Flow::Device));
+    }
+    if choice.device_code {
+        return Err(oauth::missing_bundled_client(ClientKind::BundledDevice).to_string());
+    }
+    // Without a device client, a headless host pastes the redirect back.
+    let flow = if wants_device { Flow::Paste } else { browser };
+    if desktop {
+        return Ok((Issuer::bundled(ClientKind::BundledDesktop), flow));
+    }
+    match choice.default_client_file {
+        Some(file) => Ok((Issuer::byo(&file), flow)),
+        None => Err(oauth::missing_bundled_client(ClientKind::BundledDesktop).to_string()),
+    }
+}
+
+/// Where the remote lives in Drive.
+enum FolderChoice {
+    /// The folder zdrive marked, created on first use.
+    Marked { marker: &'static str, name: String },
+    /// `path` below the folder `parent`.
+    Path { parent: String, path: String },
+}
+
+/// What the Drive folder of a freshly authorized encrypted remote holds.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum RemoteStore {
+    Present,
+    Absent,
+    /// The folder could not be inspected.
+    Unknown(String),
+}
+
+/// One completed authorization.
+#[derive(Debug)]
+pub(crate) struct Authorized {
+    pub(crate) lines: Vec<String>,
+    /// `None` for a plain remote.
+    pub(crate) store: Option<RemoteStore>,
+}
+
+/// One `remote auth` run.
 fn auth(args: AuthArgs) -> Result<Vec<String>, String> {
+    let name = args.remote.clone();
+    let mut authorized = authorize(args)?;
+    match authorized.store {
+        None => authorized.lines.push(format!(
+            "sync a local folder with `zdrive sync --remote {name} --dir DIR`"
+        )),
+        Some(RemoteStore::Present) => authorized.lines.push(format!(
+            "the folder holds a zerotrust-drive store: run `zdrive remote pull --remote {name} --encrypted-dir DIR` with an empty DIR to replicate it"
+        )),
+        Some(RemoteStore::Absent) => authorized.lines.push(format!(
+            "the folder holds no store yet: `zdrive remote push --remote {name} --encrypted-dir DIR` creates it"
+        )),
+        Some(RemoteStore::Unknown(error)) => authorized
+            .lines
+            .push(format!("could not inspect the folder yet: {error}")),
+    }
+    Ok(authorized.lines)
+}
+
+/// Signs in, chooses the Drive folder and saves the remote configuration.
+pub(crate) fn authorize(args: AuthArgs) -> Result<Authorized, String> {
     let paths = Paths::from_env().map_err(|error| error.to_string())?;
     let name = RemoteName::parse(&args.remote).map_err(|error| error.to_string())?;
     let existing = match RemoteConfig::load(&paths, &name) {
@@ -201,59 +353,127 @@ fn auth(args: AuthArgs) -> Result<Vec<String>, String> {
         Err(RemoteError::NotFound(_)) => None,
         Err(error) => return Err(error.to_string()),
     };
-    let client_file = match &args.client_file {
-        Some(path) => crate::expand_home_from_env(path)?,
-        None => existing
-            .as_ref()
-            .map(|config| config.client_file.clone())
-            .unwrap_or_else(|| paths.default_client_file()),
+    let mode = if args.plain {
+        RemoteMode::Plain
+    } else {
+        RemoteMode::Encrypted
     };
-    let client_file = std::fs::canonicalize(&client_file).map_err(|error| {
-        format!(
-            "cannot open the OAuth client file {}: {error}; download the Desktop client JSON from Google Cloud and save it there with mode 0600",
-            client_file.display()
-        )
+    if let Some(config) = &existing
+        && config.mode != mode
+    {
+        return Err(match config.mode {
+            RemoteMode::Plain => {
+                format!("remote {name} is a plain remote; pass --plain to re-authorize it")
+            }
+            RemoteMode::Encrypted => format!(
+                "remote {name} is an encrypted remote; choose another remote name for plain storage"
+            ),
+        });
+    }
+    let client_file = args
+        .client_file
+        .as_deref()
+        .map(canonical_client_file)
+        .transpose()?;
+    let default_client_file = paths.default_client_file();
+    let existing_issuer = existing.as_ref().map(RemoteConfig::issuer);
+    let (issuer, flow) = choose_client(ClientChoice {
+        client_file,
+        existing: existing_issuer.as_ref(),
+        device_code: args.device_code,
+        no_browser: args.no_browser,
+        headless: oauth::prefers_device_flow(|name| std::env::var_os(name)),
+        bundled: oauth::bundled_available(),
+        default_client_file: std::fs::canonicalize(&default_client_file).ok(),
     })?;
-    let client = OAuthClient::load(&client_file).map_err(|error| error.to_string())?;
-    let (parent, folder_path) = match (args.folder_id, args.folder_path, &existing) {
-        (None, None, Some(config)) => (config.folder_id.clone(), String::new()),
-        (None, None, None) => {
-            return Err(
-                "choose the remote folder with --folder-id ID and/or --folder-path PATH"
-                    .to_string(),
-            );
-        }
-        (id, path, _) => (
-            id.unwrap_or_else(|| MY_DRIVE.to_string()),
-            path.unwrap_or_default(),
-        ),
+    let client = oauth::client_for(&issuer).map_err(|error| error.to_string())?;
+    let marker = match mode {
+        RemoteMode::Encrypted => gdrive::STORE_MARKER,
+        RemoteMode::Plain => gdrive::PLAIN_MARKER,
     };
+    let folder_choice = match (args.folder_id, args.folder_path, &existing) {
+        (None, None, Some(config)) => FolderChoice::Path {
+            parent: config.folder_id.clone(),
+            path: String::new(),
+        },
+        (None, None, None) => FolderChoice::Marked {
+            marker,
+            name: args.folder_name.unwrap_or_else(|| {
+                match mode {
+                    RemoteMode::Encrypted => "ZeroTrust Drive",
+                    RemoteMode::Plain => "ZeroTrust Drive (plain)",
+                }
+                .to_string()
+            }),
+        },
+        (id, path, _) => FolderChoice::Path {
+            parent: id.unwrap_or_else(|| gdrive::MY_DRIVE.to_string()),
+            path: path.unwrap_or_default(),
+        },
+    };
+    if let FolderChoice::Marked { name: folder, .. } = &folder_choice
+        && (folder.is_empty() || folder.len() > 255 || folder.contains(['/', '\n', '\r']))
+    {
+        return Err(format!(
+            "--folder-name {folder:?} must be 1-255 characters without '/' or line breaks"
+        ));
+    }
 
     let mut terminal = TerminalReader::open();
-    let passphrase = read_passphrase(args.passphrase, terminal.as_mut(), true)?;
-    let agent = http_agent();
-    let endpoints = Endpoints::google();
-    let login_hint = existing.as_ref().map(|config| config.account.as_str());
-    let mut stderr = std::io::stderr();
-    let consent = if args.no_browser {
-        let reader = terminal
-            .as_mut()
-            .ok_or("--no-browser reads the redirected address from a terminal; run it from one")?;
-        Consent::Paste(reader)
-    } else {
-        Consent::Loopback {
-            open: &oauth::open_in_browser,
-            timeout: oauth::CONSENT_TIMEOUT,
+    let passphrase = match mode {
+        RemoteMode::Encrypted => Some(read_passphrase(
+            args.passphrase,
+            args.passphrase_file.as_deref(),
+            terminal.as_mut(),
+            true,
+        )?),
+        RemoteMode::Plain => {
+            note("plain mode: files are stored unencrypted, and Google can read every one of them");
+            None
         }
     };
-    let authorization = oauth::authorize(
-        &agent,
-        &client,
-        &endpoints,
-        login_hint,
-        consent,
-        &mut stderr,
-    )
+    let wanted_account = args
+        .account
+        .as_deref()
+        .map(str::trim)
+        .filter(|account| !account.is_empty());
+    let login_hint =
+        wanted_account.or_else(|| existing.as_ref().map(|config| config.account.as_str()));
+    let agent = http_agent();
+    let endpoints = Endpoints::google();
+    let mut stderr = std::io::stderr();
+    let authorization = match flow {
+        Flow::Device => oauth::authorize_device(
+            &agent,
+            &client,
+            &endpoints,
+            &issuer.scope,
+            &mut stderr,
+            &std::thread::sleep,
+        ),
+        Flow::Browser | Flow::Paste => {
+            let consent = if flow == Flow::Paste {
+                let reader = terminal.as_mut().ok_or(
+                    "pasting the redirected address needs a terminal; run from one, or sign in with --device-code",
+                )?;
+                Consent::Paste(reader)
+            } else {
+                Consent::Loopback {
+                    open: &oauth::open_in_browser,
+                    timeout: oauth::CONSENT_TIMEOUT,
+                }
+            };
+            oauth::authorize(
+                &agent,
+                &client,
+                &endpoints,
+                &issuer.scope,
+                login_hint,
+                consent,
+                &mut stderr,
+            )
+        }
+    }
     .map_err(|error| error.to_string())?;
     let refresh_token = authorization.refresh_token;
     let drive = GoogleDrive::new(Box::new(RefreshTokenSource::new(
@@ -262,6 +482,14 @@ fn auth(args: AuthArgs) -> Result<Vec<String>, String> {
         &endpoints,
     )));
     let account = drive.about().map_err(|error| error.to_string())?;
+    if let Some(wanted) = wanted_account
+        && !wanted.eq_ignore_ascii_case(&account.email)
+    {
+        return Err(format!(
+            "you signed in as {}, not {wanted}; run the sign-in again and choose {wanted}",
+            account.email
+        ));
+    }
     if let Some(config) = &existing
         && config.account != account.email
     {
@@ -270,17 +498,7 @@ fn auth(args: AuthArgs) -> Result<Vec<String>, String> {
             config.account, account.email
         ));
     }
-    let parent_folder = drive.get(&parent).map_err(|error| error.to_string())?;
-    let folder = drive
-        .resolve_folder_path(&parent, &folder_path, true)
-        .map_err(|error| error.to_string())?;
-    if parent_folder.trashed || folder.trashed {
-        return Err(format!(
-            "the folder {} is in the Drive trash; restore it or choose another",
-            folder.name
-        ));
-    }
-    let hint = folder_hint(&parent_folder.name, &folder_path);
+    let (folder, hint) = choose_folder(&drive, mode, folder_choice, issuer.client.bundled())?;
     if let Some(config) = &existing
         && config.folder_id != folder.id
     {
@@ -289,41 +507,160 @@ fn auth(args: AuthArgs) -> Result<Vec<String>, String> {
             config.folder_hint
         ));
     }
-    let token = SealedToken::seal(&name, &passphrase, &refresh_token, KdfParams::new_random())
-        .map_err(|error| error.to_string())?;
-    RemoteConfig::new(
-        &name,
-        &account.email,
-        &folder.id,
-        &hint,
-        &client_file,
-        token,
-    )
-    .save(&paths)
-    .map_err(|error| error.to_string())?;
+    let config = match &passphrase {
+        Some(passphrase) => {
+            let token =
+                SealedToken::seal(&name, passphrase, &refresh_token, KdfParams::new_random())
+                    .map_err(|error| error.to_string())?;
+            RemoteConfig::encrypted(&name, &account.email, &folder.id, &hint, &issuer, token)
+        }
+        None => {
+            config::save_plain_token(&paths, &name, &refresh_token)
+                .map_err(|error| error.to_string())?;
+            RemoteConfig::plain(&name, &account.email, &folder.id, &hint, &issuer)
+        }
+    };
+    config.save(&paths).map_err(|error| error.to_string())?;
 
     let mut lines = vec![
-        format!("remote {name}: authorized for {}", account.email),
+        format!(
+            "remote {name}: authorized for {} ({}, {})",
+            account.email,
+            mode.as_str(),
+            access_label(&issuer)
+        ),
         format!("folder: {hint} (id {})", folder.id),
     ];
     if let (Some(limit), Some(usage)) = (account.limit, account.usage) {
         lines.push(format!("storage: {} used of {}", size(usage), size(limit)));
+    }
+    if mode == RemoteMode::Plain {
+        return Ok(Authorized { lines, store: None });
     }
     let remote = Remote {
         drive: &drive,
         folder_id: &folder.id,
         log: &note,
     };
-    lines.push(match sync::remote_kdf(&remote) {
-        Ok(_) => format!(
-            "the folder holds a zerotrust-drive store: run `zdrive remote pull --remote {name} --encrypted-dir DIR` with an empty DIR to replicate it"
-        ),
-        Err(RemoteError::NotFound(_)) => format!(
-            "the folder holds no store yet: `zdrive remote push --remote {name} --encrypted-dir DIR` creates it"
-        ),
-        Err(error) => format!("could not inspect the folder yet: {error}"),
-    });
-    Ok(lines)
+    let store = match sync::remote_kdf(&remote) {
+        Ok(_) => RemoteStore::Present,
+        Err(RemoteError::NotFound(_)) => RemoteStore::Absent,
+        Err(error) => RemoteStore::Unknown(error.to_string()),
+    };
+    Ok(Authorized {
+        lines,
+        store: Some(store),
+    })
+}
+
+/// Resolves the Drive folder of a remote being authorized; a plain remote
+/// always ends in a folder carrying the plain sync marker.
+fn choose_folder(
+    drive: &GoogleDrive,
+    mode: RemoteMode,
+    choice: FolderChoice,
+    bundled: bool,
+) -> Result<(gdrive::DriveFile, String), String> {
+    let (folder, hint) = match choice {
+        FolderChoice::Marked {
+            marker,
+            name: folder_name,
+        } => {
+            let (folder, created) = match mode {
+                RemoteMode::Encrypted => drive
+                    .find_or_create_marked_folder(marker, &folder_name)
+                    .map_err(|error| error.to_string())?,
+                RemoteMode::Plain => plain_folder(crate::plain::find_or_create_folder(
+                    drive,
+                    gdrive::MY_DRIVE,
+                    &folder_name,
+                ))?,
+            };
+            note(&if created {
+                format!("created the Drive folder \"{}\" in My Drive", folder.name)
+            } else {
+                format!("joining the existing Drive folder \"{}\"", folder.name)
+            });
+            let hint = folder.name.clone();
+            (folder, hint)
+        }
+        FolderChoice::Path { parent, path } => {
+            let parent_folder = drive.folder(&parent).map_err(|error| match error {
+                RemoteError::NotFound(_) if bundled => format!(
+                    "Drive folder {parent} is not visible to zdrive: the bundled sign-in sees only folders zdrive created; omit --folder-id, or use your own client with --client-file"
+                ),
+                error => error.to_string(),
+            })?;
+            let trimmed = path.trim_matches('/');
+            let folder = match mode {
+                RemoteMode::Plain if !trimmed.is_empty() => {
+                    let (prefix, last) = trimmed.rsplit_once('/').unwrap_or(("", trimmed));
+                    let container = drive
+                        .resolve_folder_path(&parent, prefix, true)
+                        .map_err(|error| error.to_string())?;
+                    plain_folder(crate::plain::find_or_create_child_folder(
+                        drive,
+                        &container.id,
+                        last,
+                    ))?
+                    .0
+                }
+                _ => drive
+                    .resolve_folder_path(&parent, &path, true)
+                    .map_err(|error| error.to_string())?,
+            };
+            if parent_folder.trashed {
+                return Err(format!(
+                    "the folder {} is in the Drive trash; restore it or choose another",
+                    parent_folder.name
+                ));
+            }
+            (folder, folder_hint(&parent_folder.name, &path))
+        }
+    };
+    if folder.trashed {
+        return Err(format!(
+            "the folder {} is in the Drive trash; restore it or choose another",
+            folder.name
+        ));
+    }
+    if mode == RemoteMode::Plain {
+        // The sync engine refuses an unmarked folder; never save a remote
+        // whose first sync would fail.
+        crate::plain::check_marker(&folder).map_err(|error| {
+            format!("{error}; pass --folder-path NAME to let zdrive create a plain folder there")
+        })?;
+    }
+    Ok((folder, hint))
+}
+
+/// The plain-marked folder chosen by `lookup`; true when it was created.
+fn plain_folder(
+    lookup: Result<crate::plain::FolderChoice, String>,
+) -> Result<(gdrive::DriveFile, bool), String> {
+    Ok(match lookup? {
+        crate::plain::FolderChoice::Created(folder) => (folder, true),
+        crate::plain::FolderChoice::Existing(folder) => (folder, false),
+    })
+}
+
+fn canonical_client_file(path: &Path) -> Result<PathBuf, String> {
+    let path = crate::expand_home_from_env(path)?;
+    std::fs::canonicalize(&path).map_err(|error| {
+        format!(
+            "cannot open the OAuth client file {}: {error}; download the Desktop client JSON from Google Cloud and save it there with mode 0600",
+            path.display()
+        )
+    })
+}
+
+/// What the credential can reach, for status lines.
+pub(crate) fn access_label(issuer: &Issuer) -> &'static str {
+    if issuer.scope == SCOPE_DRIVE {
+        "full Drive access"
+    } else {
+        "access to files zdrive creates"
+    }
 }
 
 fn folder_hint(parent: &str, path: &str) -> String {
@@ -335,7 +672,7 @@ fn folder_hint(parent: &str, path: &str) -> String {
     }
 }
 
-fn store_command(args: StoreArgs, action: Action) -> Result<Summary, String> {
+pub(crate) fn store_command(args: StoreArgs, action: Action) -> Result<Summary, String> {
     let paths = Paths::from_env().map_err(|error| error.to_string())?;
     let name = RemoteName::parse(&args.remote).map_err(|error| error.to_string())?;
     let expanded = crate::expand_home_from_env(&args.encrypted_dir)?;
@@ -359,10 +696,20 @@ fn store_command(args: StoreArgs, action: Action) -> Result<Summary, String> {
     admit(action, kind, &name, &display).map_err(|error| error.to_string())?;
 
     let config = RemoteConfig::load(&paths, &name).map_err(|error| error.to_string())?;
-    let client = OAuthClient::load(&config.client_file).map_err(|error| error.to_string())?;
+    if config.mode != RemoteMode::Encrypted {
+        return Err(format!(
+            "remote {name} stores plain files; sync it with `zdrive sync --remote {name} --dir DIR`"
+        ));
+    }
+    let client = oauth::client_for(&config.issuer()).map_err(|error| error.to_string())?;
     let mut terminal = TerminalReader::open();
-    let passphrase = read_passphrase(args.passphrase, terminal.as_mut(), false)?;
-    let drive = open_drive(client, &config, &name, &passphrase)?;
+    let passphrase = read_passphrase(
+        args.passphrase,
+        args.passphrase_file.as_deref(),
+        terminal.as_mut(),
+        false,
+    )?;
+    let drive = open_drive(client, &paths, &config, &name, Some(&passphrase))?;
     let remote = Remote {
         drive: &drive,
         folder_id: &config.folder_id,
@@ -388,16 +735,16 @@ fn store_command(args: StoreArgs, action: Action) -> Result<Summary, String> {
 }
 
 /// The Drive client of a configured remote, with its credential unsealed
-/// by the store passphrase.
+/// by the store passphrase (encrypted) or read from its token file (plain).
 pub(crate) fn open_drive(
     client: OAuthClient,
+    paths: &Paths,
     config: &RemoteConfig,
     name: &RemoteName,
-    passphrase: &str,
+    passphrase: Option<&str>,
 ) -> Result<GoogleDrive, String> {
     let refresh_token = config
-        .token
-        .unseal(name, passphrase)
+        .refresh_token(paths, name, passphrase)
         .map_err(|error| error.to_string())?;
     Ok(GoogleDrive::new(Box::new(RefreshTokenSource::new(
         client,
@@ -558,7 +905,7 @@ fn bootstrap(
     Ok(pull_summary(&report))
 }
 
-fn size(bytes: u64) -> String {
+pub(crate) fn size(bytes: u64) -> String {
     const MIB: u64 = 1 << 20;
     const GIB: u64 = 1 << 30;
     if bytes >= GIB {
@@ -621,11 +968,11 @@ pub(crate) fn pull_summary(report: &PullReport) -> Summary {
         ),
         PullOutcome::UpToDate => format!("up to date at generation {}", report.number),
         PullOutcome::LocalAhead => format!(
-            "local generation {} is ahead of the remote; `zdrive remote push` publishes it",
+            "local generation {} is ahead of the remote; a mounted drive uploads it by itself, otherwise `zdrive remote push` does",
             report.number
         ),
         PullOutcome::RemoteEmpty => {
-            "the remote holds no generation yet; `zdrive remote push` publishes the local store"
+            "the remote holds no generation yet; a mounted drive uploads the local store by itself, otherwise `zdrive remote push` does"
                 .to_string()
         }
         PullOutcome::Bootstrapped => format!(

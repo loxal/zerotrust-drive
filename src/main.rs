@@ -1,17 +1,22 @@
 // SPDX-FileCopyrightText: Copyright 2026 Alexander Orlov <info@lifub.com>
 
 mod crypto;
+mod doctor;
 mod fault;
 mod fs;
 #[cfg(all(test, target_os = "macos"))]
 mod macos_integration_tests;
 mod migrate;
+mod plain;
 mod prompt;
 mod rekey;
 mod remote;
+mod service;
+mod setup;
 mod shutdown;
 #[allow(dead_code)]
 mod storage;
+mod telemetry;
 mod transaction_lock;
 mod v2;
 mod v2_migrate;
@@ -48,19 +53,26 @@ struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
 
-    /// Directory for encrypted .age files (storage backend, auto-managed — do not modify directly)
-    #[arg(long, default_value = "~/g.drive/.zerotrust.drive.encrypted")]
-    encrypted_dir: PathBuf,
+    /// Directory for encrypted .age files (storage backend, auto-managed - do
+    /// not modify directly) [default: $XDG_DATA_HOME/zerotrust-drive/store,
+    /// that is ~/.local/share/zerotrust-drive/store]
+    #[arg(long)]
+    encrypted_dir: Option<PathBuf>,
 
     /// FUSE mount point showing decrypted files
     #[arg(long, default_value = "~/z.drive")]
     decrypted_dir: PathBuf,
 
-    /// Encryption passphrase. Prefer the ZEROTRUST_PASSPHRASE env var or the
-    /// terminal prompt: arguments are visible to other local users in the
-    /// process list
+    /// Encryption passphrase. Prefer the ZEROTRUST_PASSPHRASE env var,
+    /// --passphrase-file or the terminal prompt: arguments are visible to
+    /// other local users in the process list
     #[arg(long)]
     passphrase: Option<String>,
+
+    /// Read the passphrase from this private file (owned by you, mode 0600
+    /// or stricter), for unattended starts
+    #[arg(long, value_name = "FILE")]
+    passphrase_file: Option<PathBuf>,
 
     /// Rotate the passphrase: re-encrypt every file under a new passphrase
     /// read from ZEROTRUST_NEW_PASSPHRASE or a terminal prompt (mounts
@@ -148,6 +160,138 @@ struct Cli {
         ]
     )]
     remote: Option<String>,
+
+    /// With --remote: how long unmounting waits for the final upload before
+    /// it exits with status 75 (the next start uploads the rest)
+    #[arg(long, value_name = "SECONDS", requires = "remote")]
+    final_push_wait: Option<u64>,
+
+    #[command(flatten)]
+    run: RunOptions,
+}
+
+/// Options of every long-running drive process: a mount or a plain sync.
+#[derive(clap::Args, Clone, Debug, Default)]
+pub(crate) struct RunOptions {
+    /// Local telemetry for this run: off, standard or full. Overrides
+    /// ZDRIVE_TELEMETRY and `zdrive telemetry level`; nothing leaves this
+    /// machine [default: standard]
+    #[arg(long, value_name = "LEVEL")]
+    pub(crate) telemetry: Option<telemetry::Level>,
+
+    /// Keep this drive's telemetry apart from other drives' under this name
+    #[arg(long, value_name = "NAME", value_parser = parse_telemetry_instance)]
+    pub(crate) telemetry_instance: Option<String>,
+
+    /// Run unattended under launchd or systemd (set by `zdrive service`):
+    /// never prompt, and report readiness to the service manager
+    #[arg(long)]
+    pub(crate) service: bool,
+}
+
+fn parse_telemetry_instance(name: &str) -> Result<String, String> {
+    telemetry::validate_instance(name).map(|()| name.to_string())
+}
+
+/// Starts local telemetry for this process. Telemetry never stops a drive:
+/// any problem only disables it, with a note.
+pub(crate) fn start_telemetry(options: &RunOptions, mode: &'static str, remote_kind: &'static str) {
+    telemetry::install_panic_hook();
+    let started = remote::config::Paths::from_env()
+        .map_err(|error| error.to_string())
+        .and_then(|paths| {
+            let env = std::env::var(telemetry::ENV_VAR).ok();
+            let (level, _) =
+                telemetry::resolve_level(options.telemetry, env.as_deref(), &paths.config)?;
+            let instance = options
+                .telemetry_instance
+                .clone()
+                .unwrap_or_else(|| telemetry::DEFAULT_INSTANCE.to_string());
+            telemetry::start(
+                telemetry::Start {
+                    instance,
+                    level,
+                    mode,
+                    remote_kind,
+                    service: options.service,
+                },
+                &paths.state,
+            )
+        });
+    if let Err(error) = started {
+        eprintln!("zerotrust-drive: note: telemetry is off for this run: {error}");
+    }
+}
+
+/// Ends telemetry and the process with `code`.
+pub(crate) fn exit_process(code: i32) -> ! {
+    telemetry::stop(exit_reason(code), code);
+    std::process::exit(code);
+}
+
+fn exit_reason(code: i32) -> &'static str {
+    match code {
+        0 => "exit",
+        remote::mount::EXIT_UNSYNCED => "unsynced",
+        _ => "error",
+    }
+}
+
+/// Records the end of `main` when it returns or unwinds instead of exiting.
+struct TelemetryStop;
+
+impl Drop for TelemetryStop {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            telemetry::stop("panic", 101);
+        } else {
+            telemetry::stop("exit", 0);
+        }
+    }
+}
+
+/// Where versions before 0.18 kept the store of a bare `zdrive` mount.
+const LEGACY_ENCRYPTED_DIR: &str = "~/g.drive/.zerotrust.drive.encrypted";
+
+/// The store of a bare `zdrive` mount: `new`, unless only the pre-0.18
+/// default `legacy` holds a store. Never silently mounts either one in the
+/// other's place.
+fn default_encrypted_dir(new: &Path, legacy: &Path) -> Result<PathBuf, String> {
+    if std::fs::symlink_metadata(new).is_ok() {
+        return Ok(new.to_path_buf());
+    }
+    let holds_store = match std::fs::read_dir(legacy) {
+        Ok(entries) => {
+            let mut found = false;
+            for entry in entries {
+                let entry = entry.map_err(|error| format!("{}: {error}", legacy.display()))?;
+                if entry.file_name() != ".DS_Store" {
+                    found = true;
+                    break;
+                }
+            }
+            found
+        }
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            false
+        }
+        Err(error) => return Err(format!("cannot inspect {}: {error}", legacy.display())),
+    };
+    if holds_store {
+        let parent = new.parent().unwrap_or(new);
+        return Err(format!(
+            "zdrive 0.18 keeps the default store in {new}, but {legacy} holds the store of an earlier version. Mount it explicitly with `--encrypted-dir {legacy}`, or adopt the new default by moving it while it is not mounted: `mkdir -p {parent} && mv {legacy} {new}`",
+            new = new.display(),
+            legacy = legacy.display(),
+            parent = parent.display(),
+        ));
+    }
+    Ok(new.to_path_buf())
 }
 
 #[derive(Subcommand)]
@@ -156,6 +300,25 @@ enum Command {
     /// only receives ciphertext. Mounting stays the default without a command
     #[command(subcommand)]
     Remote(remote::cli::RemoteCommand),
+    /// Run drive instances as auto-start services: a macOS LaunchAgent or a
+    /// Linux systemd user unit per instance
+    #[command(subcommand)]
+    Service(service::cli::ServiceCommand),
+    /// Inspect, export or delete the local-only telemetry; nothing leaves
+    /// this machine
+    #[command(subcommand)]
+    Telemetry(telemetry::TelemetryCommand),
+    /// Check this installation: FUSE, the Google client, remotes, services
+    /// and telemetry. Prints no secrets
+    Doctor(doctor::DoctorArgs),
+    /// Set up a drive in one guided run: sign in to Google, create or join
+    /// the Drive folder, sync, and start it automatically. Encrypted unless
+    /// --plain
+    Setup(setup::SetupArgs),
+    /// Sync a local folder with a plain remote's Drive folder: once, or
+    /// continuously with --watch. Plain remotes are readable by Google; no
+    /// FUSE needed
+    Sync(plain::cli::SyncArgs),
 }
 
 fn expand_home_path(path: &Path, home: Option<&Path>) -> Result<PathBuf, String> {
@@ -595,15 +758,71 @@ impl DriveOperationLock {
 
 fn exit_with_error(message: impl std::fmt::Display) -> ! {
     eprintln!("zerotrust-drive: error: {message}");
-    std::process::exit(1);
+    if let Some(note) = service_status(&message.to_string()) {
+        let _ = service::notify::status(&note);
+    }
+    exit_process(1);
+}
+
+/// The service manager's one-line status for an error, bounded so a long
+/// message stays one readable line.
+fn service_status(message: &str) -> Option<String> {
+    std::env::var_os("NOTIFY_SOCKET")?;
+    let line: String = message
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .take(200)
+        .collect();
+    Some(format!("error: {line}"))
 }
 
 fn main() {
     let mut cli = Cli::parse();
     // Before any other thread exists, so every thread inherits the mask.
     shutdown::install().unwrap_or_else(|e| exit_with_error(e));
-    if let Some(Command::Remote(command)) = cli.command.take() {
-        std::process::exit(remote::cli::run(command));
+    match cli.command.take() {
+        Some(Command::Remote(command)) => {
+            start_telemetry(&RunOptions::default(), "remote", "google-drive");
+            exit_process(remote::cli::run(command))
+        }
+        Some(Command::Service(command)) => std::process::exit(service::cli::run(command)),
+        Some(Command::Telemetry(command)) => std::process::exit(telemetry::run(command)),
+        Some(Command::Doctor(args)) => std::process::exit(doctor::run(args)),
+        Some(Command::Setup(args)) => {
+            start_telemetry(&RunOptions::default(), "setup", "google-drive");
+            exit_process(setup::run(args))
+        }
+        Some(Command::Sync(args)) => {
+            start_telemetry(&args.run, "plain", "google-drive");
+            exit_process(plain::cli::run(args))
+        }
+        None => {}
+    }
+    let gc_requested_early = cli.gc_v2
+        || cli.gc_v2_quarantine.is_some()
+        || cli.gc_v2_restore.is_some()
+        || cli.gc_v2_purge.is_some();
+    let maintenance = cli.migrate_format
+        || cli.migrate_v2
+        || gc_requested_early
+        || cli.rekey
+        || cli.new_passphrase.is_some()
+        || cli.continue_rekey;
+    start_telemetry(
+        &cli.run,
+        if maintenance { "maintenance" } else { "mount" },
+        if cli.remote.is_some() {
+            "google-drive"
+        } else {
+            "none"
+        },
+    );
+    let _telemetry_stop = TelemetryStop;
+    if cli.run.service && maintenance {
+        exit_with_error("--service runs a drive; migration, rekey and GC need a terminal");
+    }
+    if cli.run.service {
+        shutdown::unattended();
     }
     let gc_mutation_requested =
         cli.gc_v2_quarantine.is_some() || cli.gc_v2_restore.is_some() || cli.gc_v2_purge.is_some();
@@ -612,8 +831,23 @@ fn main() {
     if cli.confirm_sync_paused && !gc_mutation_requested {
         exit_with_error("--confirm-sync-paused is accepted only with a mutating v2 GC operation");
     }
-    let expanded_base =
-        expand_home_from_env(&cli.encrypted_dir).unwrap_or_else(|e| exit_with_error(e));
+    let expanded_base = match &cli.encrypted_dir {
+        Some(path) => expand_home_from_env(path).unwrap_or_else(|e| exit_with_error(e)),
+        None => {
+            let paths = remote::config::Paths::from_env()
+                .unwrap_or_else(|e| exit_with_error(e.to_string()));
+            let legacy = expand_home_from_env(Path::new(LEGACY_ENCRYPTED_DIR))
+                .unwrap_or_else(|e| exit_with_error(e));
+            default_encrypted_dir(&paths.default_store(), &legacy)
+                .unwrap_or_else(|e| exit_with_error(e))
+        }
+    };
+    cli.passphrase_file = cli
+        .passphrase_file
+        .as_deref()
+        .map(expand_home_from_env)
+        .transpose()
+        .unwrap_or_else(|e| exit_with_error(e));
     let expanded_mountpoint =
         expand_home_from_env(&cli.decrypted_dir).unwrap_or_else(|e| exit_with_error(e));
     if !cli.migrate_format && !cli.migrate_v2 && !gc_requested {
@@ -661,7 +895,22 @@ fn main() {
     // Catch up with the remote before the store is inspected for mounting:
     // this fills an empty directory, finishes an interrupted first pull and
     // fast-forwards an existing replica.
-    let mut terminal = prompt::TerminalReader::open();
+    let mut terminal = if cli.run.service {
+        None
+    } else {
+        prompt::TerminalReader::open()
+    };
+    if cli.run.service
+        && cli.passphrase.is_none()
+        && prompt::stored_passphrase(cli.passphrase_file.as_deref())
+            .unwrap_or_else(|e| exit_with_error(e))
+            .is_none()
+    {
+        exit_with_error(format!(
+            "--service never prompts: provide the passphrase through ZEROTRUST_PASSPHRASE, $CREDENTIALS_DIRECTORY/{} or --passphrase-file",
+            service::custody::CREDENTIAL_NAME
+        ));
+    }
     let prepared_remote = cli.remote.take().map(|remote| {
         remote::mount::prepare(
             &remote,
@@ -669,6 +918,7 @@ fn main() {
             &base_path,
             &drive_operation_lock,
             cli.passphrase.take(),
+            cli.passphrase_file.as_deref(),
             terminal.as_mut(),
         )
         .unwrap_or_else(|e| exit_with_error(e))
@@ -708,7 +958,8 @@ fn main() {
         Some(prepared) => prepared.passphrase().to_string(),
         None => {
             prompt::resolve_current(
-                std::env::var("ZEROTRUST_PASSPHRASE").ok(),
+                prompt::stored_passphrase(cli.passphrase_file.as_deref())
+                    .unwrap_or_else(|e| exit_with_error(e)),
                 cli.passphrase.take(),
                 terminal
                     .as_mut()
@@ -735,7 +986,7 @@ fn main() {
             "zerotrust-drive: set ZEROTRUST_PASSPHRASE or run from a terminal to be prompted for a real secret,"
         );
         eprintln!("zerotrust-drive: or pass --allow-default-passphrase for a throwaway test drive");
-        std::process::exit(1);
+        exit_process(1);
     }
 
     if gc_requested {
@@ -856,14 +1107,14 @@ fn main() {
             eprintln!(
                 "zerotrust-drive: error: --migrate-format upgrades in place with the current passphrase; do not combine it with --rekey"
             );
-            std::process::exit(1);
+            exit_process(1);
         }
         if !base_path.join("_index.age").exists() {
             eprintln!(
                 "zerotrust-drive: error: no _index.age found in {} — nothing to migrate",
                 display_base_path.display()
             );
-            std::process::exit(1);
+            exit_process(1);
         }
         if !migrate::needs_migration(&base_path).unwrap_or_else(|e| exit_with_error(e)) {
             eprintln!("zerotrust-drive: drive is already in the v1 on-disk format — nothing to do");
@@ -897,7 +1148,7 @@ fn main() {
                         "zerotrust-drive: cannot determine migration commit state; preserve all recovery artifacts: {check_error}"
                     ),
                 }
-                std::process::exit(1);
+                exit_process(1);
             }
         }
     }
@@ -968,7 +1219,7 @@ fn main() {
         eprintln!(
             "zerotrust-drive: ChaCha20-Poly1305 → XChaCha20-Poly1305 and the homemade KDF → Argon2id"
         );
-        std::process::exit(1);
+        exit_process(1);
     }
 
     // Online rekey: mount read-only and re-encrypt in the background.
@@ -985,7 +1236,7 @@ fn main() {
                 "zerotrust-drive: error: no _index.age found in {}",
                 display_base_path.display()
             );
-            std::process::exit(1);
+            exit_process(1);
         }
         let new_passphrase = prompt::resolve_new(
             std::env::var("ZEROTRUST_NEW_PASSPHRASE").ok(),
@@ -997,7 +1248,7 @@ fn main() {
         .unwrap_or_else(|e| exit_with_error(e));
         if new_passphrase == passphrase {
             eprintln!("zerotrust-drive: error: new passphrase is the same as the current one");
-            std::process::exit(1);
+            exit_process(1);
         }
         if insecure_new_store_passphrase(&new_passphrase) && !cli.allow_default_passphrase {
             exit_with_error(
@@ -1070,7 +1321,7 @@ fn main() {
             "zerotrust-drive: if you are sure no rekey is running, delete {} manually",
             display_base_path.join("_rekey.lock").display()
         );
-        std::process::exit(1);
+        exit_process(1);
     }
 
     eprintln!("zerotrust-drive: mounting at {}", mountpoint.display());
@@ -1106,7 +1357,11 @@ fn main() {
             .start(inner.clone())
             .unwrap_or_else(|e| exit_with_error(e))
     });
-    eprintln!("zerotrust-drive: press Ctrl+C to unmount and flush");
+    if shutdown::is_unattended() {
+        eprintln!("zerotrust-drive: stopping the service unmounts and flushes");
+    } else {
+        eprintln!("zerotrust-drive: press Ctrl+C to unmount and flush");
+    }
 
     serve(ztfs, &mountpoint, replicator.is_some())
         .unwrap_or_else(|e| exit_with_error(format!("failed to mount filesystem: {e}")));
@@ -1121,12 +1376,15 @@ fn main() {
     if flushed {
         exit_unless_persisted(&inner);
     }
-    let outcome = replicator.finish(remote::mount::FINAL_WAIT);
+    let final_wait = cli
+        .final_push_wait
+        .map_or(remote::mount::FINAL_WAIT, std::time::Duration::from_secs);
+    let outcome = replicator.finish(final_wait);
     let status = replicator.report(&outcome);
     if !flushed {
         exit_unless_persisted(&inner);
     }
-    std::process::exit(status);
+    exit_process(status);
 }
 
 /// Finder name of the mounted volume.
@@ -1162,9 +1420,22 @@ fn serve(filesystem: fs::ZeroTrustFs, mountpoint: &Path, remote: bool) -> std::i
     config.mount_options = mount_options(remote);
     let session = fuser::Session::new(filesystem, mountpoint, &config)?;
     shutdown::mounted(mountpoint);
+    // A Type=notify unit stays "activating" until this arrives.
+    report_to_service_manager(service::notify::ready());
+    report_to_service_manager(service::notify::status(&format!(
+        "mounted at {}",
+        mountpoint.display()
+    )));
     let result = session.run();
     shutdown::session_ended();
+    report_to_service_manager(service::notify::stopping());
     result
+}
+
+fn report_to_service_manager(sent: std::io::Result<bool>) {
+    if let Err(error) = sent {
+        eprintln!("zerotrust-drive: warning: cannot notify the service manager: {error}");
+    }
 }
 
 fn exit_unless_persisted(inner: &fs::FsInner) {
@@ -1478,5 +1749,151 @@ mod main_tests {
         std::fs::remove_file(identity_lock_path).unwrap();
         std::fs::remove_file(legacy_lock_path).unwrap();
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn the_default_store_refuses_to_hide_a_pre_018_store() {
+        let root = unique_test_directory("legacy-default");
+        let new = root.join("share/zerotrust-drive/store");
+        let legacy = root.join("g.drive/.zerotrust.drive.encrypted");
+
+        // Neither exists: the new default.
+        assert_eq!(default_encrypted_dir(&new, &legacy).unwrap(), new);
+
+        // An empty legacy directory (Finder metadata aside) holds no store.
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join(".DS_Store"), b"finder").unwrap();
+        assert_eq!(default_encrypted_dir(&new, &legacy).unwrap(), new);
+
+        // A legacy store without a new one is refused with both paths and the
+        // flag that keeps using it.
+        std::fs::write(legacy.join("_root.age"), b"store").unwrap();
+        let error = default_encrypted_dir(&new, &legacy).unwrap_err();
+        assert!(error.contains(&new.display().to_string()), "{error}");
+        assert!(
+            error.contains(&format!("--encrypted-dir {}", legacy.display())),
+            "{error}"
+        );
+
+        // Once the new store exists it wins, and the legacy one stays as is.
+        std::fs::create_dir_all(&new).unwrap();
+        assert_eq!(default_encrypted_dir(&new, &legacy).unwrap(), new);
+        assert!(legacy.join("_root.age").exists());
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn mount_flags_parse_passphrase_file_and_final_wait() {
+        let cli = Cli::try_parse_from([
+            "zdrive",
+            "--passphrase-file",
+            "~/p",
+            "--remote",
+            "gd",
+            "--final-push-wait",
+            "60",
+        ])
+        .unwrap();
+        assert_eq!(cli.passphrase_file.as_deref(), Some(Path::new("~/p")));
+        assert_eq!(cli.final_push_wait, Some(60));
+        assert!(cli.encrypted_dir.is_none());
+        // A final wait only means something with a remote.
+        assert!(Cli::try_parse_from(["zdrive", "--final-push-wait", "60"]).is_err());
+    }
+
+    #[test]
+    fn mount_accepts_every_encrypted_service_command_line() {
+        use service::definition::{Custody, Definition, Instance};
+        let credentials = Path::new("/run/user/1000/credentials/u.service");
+        for (remote, custody) in [
+            (Some("home"), Custody::SystemdCreds),
+            (Some("home"), Custody::File(PathBuf::from("/abs/pass"))),
+            (None, Custody::File(PathBuf::from("/abs/pass"))),
+        ] {
+            let definition = Definition {
+                name: "work".to_string(),
+                instance: Instance::Encrypted {
+                    remote: remote.map(str::to_string),
+                    encrypted_dir: PathBuf::from("/abs/store"),
+                    mount_dir: PathBuf::from("/abs/mount"),
+                    custody: custody.clone(),
+                },
+                final_push_wait_secs: 60,
+            };
+            let args = service::run::exec_args(&definition, Some(credentials));
+            let cli = Cli::try_parse_from(
+                std::iter::once(std::ffi::OsString::from("zdrive")).chain(args),
+            )
+            .unwrap_or_else(|error| panic!("{custody:?} {remote:?}: {error}"));
+            assert!(cli.command.is_none());
+            assert!(cli.run.service);
+            assert_eq!(cli.run.telemetry_instance.as_deref(), Some("work"));
+            assert_eq!(cli.remote.as_deref(), remote);
+            assert_eq!(cli.encrypted_dir.as_deref(), Some(Path::new("/abs/store")));
+            assert_eq!(cli.decrypted_dir, PathBuf::from("/abs/mount"));
+            assert!(cli.passphrase_file.is_some());
+        }
+    }
+
+    #[test]
+    fn plain_service_exec_args_parse_as_a_watching_sync() {
+        use service::definition::{Definition, Instance};
+        let definition = Definition {
+            name: "photos".to_string(),
+            instance: Instance::Plain {
+                remote: "home".to_string(),
+                local_dir: PathBuf::from("/abs/photos"),
+            },
+            final_push_wait_secs: 60,
+        };
+        let args = service::run::exec_args(&definition, None);
+        let cli =
+            Cli::try_parse_from(std::iter::once(std::ffi::OsString::from("zdrive")).chain(args))
+                .unwrap_or_else(|error| panic!("{error}"));
+        let Some(Command::Sync(sync)) = cli.command else {
+            panic!("not a sync command");
+        };
+        assert_eq!(sync.remote, "home");
+        assert_eq!(sync.dir, PathBuf::from("/abs/photos"));
+        assert!(sync.watch);
+        assert_eq!(sync.interval, plain::cli::DEFAULT_INTERVAL_SECS);
+        assert!(sync.run.service);
+        assert_eq!(sync.run.telemetry_instance.as_deref(), Some("photos"));
+        assert_eq!(sync.run.telemetry, None);
+    }
+
+    #[test]
+    fn sync_interval_requires_watch_and_stays_in_range() {
+        let parse = |extra: &[&str]| {
+            Cli::try_parse_from(
+                ["zdrive", "sync", "--remote", "home", "--dir", "/abs/x"]
+                    .iter()
+                    .chain(extra),
+            )
+        };
+        assert!(parse(&[]).is_ok());
+        assert!(parse(&["--watch", "--interval", "60"]).is_ok());
+        assert!(parse(&["--interval", "60"]).is_err());
+        assert!(parse(&["--watch", "--interval", "0"]).is_err());
+        assert!(parse(&["--watch", "--interval", "86401"]).is_err());
+        assert!(parse(&["--watch", "--telemetry", "full"]).is_ok());
+    }
+
+    #[test]
+    fn telemetry_flags_parse_and_reject_bad_values() {
+        let cli = Cli::try_parse_from([
+            "zdrive",
+            "--telemetry",
+            "full",
+            "--telemetry-instance",
+            "home",
+        ])
+        .unwrap();
+        assert_eq!(cli.run.telemetry, Some(telemetry::Level::Full));
+        assert_eq!(cli.run.telemetry_instance.as_deref(), Some("home"));
+        assert!(!cli.run.service);
+        assert!(Cli::try_parse_from(["zdrive", "--telemetry", "verbose"]).is_err());
+        assert!(Cli::try_parse_from(["zdrive", "--telemetry-instance", "../x"]).is_err());
     }
 }

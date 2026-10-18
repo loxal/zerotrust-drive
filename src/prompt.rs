@@ -5,6 +5,7 @@
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
 
 /// Reads one secret line after showing a prompt.
@@ -39,6 +40,20 @@ impl SecretReader for TerminalReader {
         let line = line?;
         String::from_utf8(line)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "passphrase is not UTF-8"))
+    }
+}
+
+/// A terminal that also asks for ordinary, echoed answers.
+pub(crate) trait Prompter: SecretReader {
+    fn read_visible(&mut self, prompt: &str) -> io::Result<String>;
+}
+
+impl Prompter for TerminalReader {
+    fn read_visible(&mut self, prompt: &str) -> io::Result<String> {
+        self.tty.write_all(prompt.as_bytes())?;
+        self.tty.flush()?;
+        String::from_utf8(read_line(&mut self.tty)?)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "the answer is not UTF-8"))
     }
 }
 
@@ -130,6 +145,10 @@ fn read_line(reader: &mut impl Read) -> io::Result<Vec<u8>> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PassphraseSource {
     Environment,
+    /// `$CREDENTIALS_DIRECTORY/zdrive-passphrase`, provided by systemd.
+    Credential,
+    /// `--passphrase-file`.
+    File,
     Argument,
     Prompt,
     /// The built-in demo passphrase: no source and no terminal, or an
@@ -137,19 +156,96 @@ pub(crate) enum PassphraseSource {
     Default,
 }
 
-/// Resolve the current passphrase. Precedence: environment, argument, then a
-/// terminal prompt, unless `allow_default` asks for the demo passphrase. A
-/// brand-new store asks twice so a typo cannot lock the data away.
-pub(crate) fn resolve_current(
+use crate::service::custody::CREDENTIAL_NAME;
+/// The largest passphrase file or credential zdrive reads.
+pub(crate) const MAX_PASSPHRASE_FILE: u64 = 4096;
+
+/// The passphrase from a source that needs no terminal, in precedence order:
+/// `ZEROTRUST_PASSPHRASE`, the systemd credential, then `--passphrase-file`.
+pub(crate) fn stored_passphrase(
+    passphrase_file: Option<&Path>,
+) -> Result<Option<(String, PassphraseSource)>, String> {
+    let credentials = std::env::var_os("CREDENTIALS_DIRECTORY").map(PathBuf::from);
+    resolve_stored(
+        std::env::var("ZEROTRUST_PASSPHRASE").ok(),
+        credentials.as_deref(),
+        passphrase_file,
+    )
+}
+
+fn resolve_stored(
     from_env: Option<String>,
+    credentials_dir: Option<&Path>,
+    passphrase_file: Option<&Path>,
+) -> Result<Option<(String, PassphraseSource)>, String> {
+    if let Some(passphrase) = from_env {
+        return Ok(Some((passphrase, PassphraseSource::Environment)));
+    }
+    // systemd owns the credentials directory (private, read-only, per
+    // service), so only absence is tolerated: a unit may load other
+    // credentials without this one.
+    if let Some(directory) = credentials_dir.filter(|directory| directory.is_absolute()) {
+        let path = directory.join(CREDENTIAL_NAME);
+        match std::fs::File::open(&path) {
+            Ok(file) => {
+                let mut bytes = Vec::new();
+                file.take(MAX_PASSPHRASE_FILE + 1)
+                    .read_to_end(&mut bytes)
+                    .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+                let passphrase = secret_from_bytes(bytes, &path)?;
+                return Ok(Some((passphrase, PassphraseSource::Credential)));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("cannot open {}: {error}", path.display())),
+        }
+    }
+    let Some(path) = passphrase_file else {
+        return Ok(None);
+    };
+    let passphrase = crate::service::custody::read_passphrase_file(path)?;
+    Ok(Some((passphrase, PassphraseSource::File)))
+}
+
+/// One line of UTF-8; a single trailing newline is not part of the secret.
+pub(crate) fn secret_from_bytes(mut bytes: Vec<u8>, path: &Path) -> Result<String, String> {
+    if bytes.len() as u64 > MAX_PASSPHRASE_FILE {
+        return Err(format!(
+            "{} is larger than {MAX_PASSPHRASE_FILE} bytes",
+            path.display()
+        ));
+    }
+    if bytes.last() == Some(&b'\n') {
+        bytes.pop();
+        if bytes.last() == Some(&b'\r') {
+            bytes.pop();
+        }
+    }
+    if bytes.contains(&b'\n') {
+        return Err(format!(
+            "{} holds more than one line; it must contain only the passphrase",
+            path.display()
+        ));
+    }
+    if bytes.is_empty() {
+        return Err(format!("{} holds an empty passphrase", path.display()));
+    }
+    String::from_utf8(bytes).map_err(|_| format!("{} is not UTF-8", path.display()))
+}
+
+/// Resolve the current passphrase. Precedence: a stored source (see
+/// [`stored_passphrase`]), argument, then a terminal prompt, unless
+/// `allow_default` asks for the demo passphrase. A brand-new store asks
+/// twice so a typo cannot lock the data away.
+pub(crate) fn resolve_current(
+    stored: Option<(String, PassphraseSource)>,
     from_argument: Option<String>,
     reader: Option<&mut dyn SecretReader>,
     allow_default: bool,
     creating_store: bool,
     default: &str,
 ) -> Result<(String, PassphraseSource), String> {
-    if let Some(passphrase) = from_env {
-        return Ok((passphrase, PassphraseSource::Environment));
+    if let Some(stored) = stored {
+        return Ok(stored);
     }
     if let Some(passphrase) = from_argument {
         return Ok((passphrase, PassphraseSource::Argument));
@@ -249,7 +345,7 @@ mod tests {
         creating: bool,
     ) -> Result<(String, PassphraseSource), String> {
         resolve_current(
-            env.map(str::to_string),
+            env.map(|env| (env.to_string(), PassphraseSource::Environment)),
             argument.map(str::to_string),
             reader.map(|reader| reader as &mut dyn SecretReader),
             allow_default,
@@ -367,5 +463,102 @@ mod tests {
         assert_eq!(read_line(&mut input).unwrap(), b"secret value");
         assert_eq!(read_line(&mut input).unwrap(), b"next line");
         assert_eq!(read_line(&mut input).unwrap(), b"");
+    }
+
+    fn private_file(dir: &Path, name: &str, contents: &[u8], mode: u32) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        std::fs::write(&path, contents).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        path
+    }
+
+    #[test]
+    fn stored_sources_follow_environment_credential_file_precedence() {
+        let root = crate::remote::TestDir::new("stored-passphrase");
+        let credentials = root.path().join("credentials");
+        std::fs::create_dir(&credentials).unwrap();
+        let file = private_file(root.path(), "pass", b"from file\n", 0o600);
+
+        assert_eq!(resolve_stored(None, None, None), Ok(None));
+        assert_eq!(
+            resolve_stored(None, Some(&credentials), Some(&file)),
+            Ok(Some(("from file".to_string(), PassphraseSource::File)))
+        );
+        private_file(&credentials, CREDENTIAL_NAME, b"from systemd", 0o400);
+        assert_eq!(
+            resolve_stored(None, Some(&credentials), Some(&file)),
+            Ok(Some((
+                "from systemd".to_string(),
+                PassphraseSource::Credential
+            )))
+        );
+        assert_eq!(
+            resolve_stored(Some("env".to_string()), Some(&credentials), Some(&file)),
+            Ok(Some(("env".to_string(), PassphraseSource::Environment)))
+        );
+        // A relative credentials directory is not one systemd provides.
+        assert_eq!(
+            resolve_stored(None, Some(Path::new("credentials")), None),
+            Ok(None)
+        );
+        // A stored source never prompts.
+        let mut reader = Scripted::new(&[]);
+        let stored = resolve_stored(None, None, Some(&file)).unwrap();
+        assert_eq!(
+            resolve_current(
+                stored,
+                Some("arg".to_string()),
+                Some(&mut reader),
+                false,
+                true,
+                "demo"
+            ),
+            Ok(("from file".to_string(), PassphraseSource::File))
+        );
+        assert!(reader.prompts.is_empty());
+    }
+
+    #[test]
+    fn passphrase_files_must_be_private_single_line_and_non_empty() {
+        let root = crate::remote::TestDir::new("passphrase-file-refusals");
+        let missing = root.path().join("missing");
+        let error = resolve_stored(None, None, Some(&missing)).unwrap_err();
+        assert!(error.contains("does not exist"), "{error}");
+
+        let shared = private_file(root.path(), "shared", b"secret\n", 0o640);
+        let error = resolve_stored(None, None, Some(&shared)).unwrap_err();
+        assert!(error.contains("chmod 600"), "{error}");
+
+        let link = root.path().join("link");
+        std::os::unix::fs::symlink(&shared, &link).unwrap();
+        assert!(resolve_stored(None, None, Some(&link)).is_err());
+
+        for (name, contents, expected) in [
+            ("empty", &b"\n"[..], "empty passphrase"),
+            ("two-lines", &b"one\ntwo\n"[..], "more than one line"),
+            ("binary", &b"\xff\xfe"[..], "not UTF-8"),
+        ] {
+            let path = private_file(root.path(), name, contents, 0o600);
+            let error = resolve_stored(None, None, Some(&path)).unwrap_err();
+            assert!(error.contains(expected), "{name}: {error}");
+        }
+        let large = private_file(root.path(), "large", &[b'x'; 5000], 0o600);
+        assert!(resolve_stored(None, None, Some(&large)).is_err());
+
+        let crlf = private_file(root.path(), "crlf", b"windows line\r\n", 0o600);
+        assert_eq!(
+            resolve_stored(None, None, Some(&crlf)),
+            Ok(Some(("windows line".to_string(), PassphraseSource::File)))
+        );
+        // Interior spaces are part of the secret.
+        let spaced = private_file(root.path(), "spaced", b" a b ", 0o600);
+        assert_eq!(
+            resolve_stored(None, None, Some(&spaced))
+                .unwrap()
+                .unwrap()
+                .0,
+            " a b "
+        );
     }
 }

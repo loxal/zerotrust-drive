@@ -13,7 +13,7 @@ pub(crate) mod config;
 #[cfg(test)]
 mod crash_tests;
 #[cfg(test)]
-mod fake;
+pub(crate) mod fake;
 pub(crate) mod format;
 pub(crate) mod gdrive;
 pub(crate) mod lease;
@@ -216,14 +216,20 @@ fn current_uid() -> u32 {
 }
 
 /// Creates `path` (and missing parents) and requires the final directory to
-/// be a real directory that only the current user can enter. A directory this
-/// call creates is made 0700; an existing one is never silently loosened or
-/// tightened, only refused.
+/// be a real directory that only the current user can enter. Every directory
+/// this call creates, parents included, is made 0700 as the XDG base
+/// directory spec asks, so a later check of a parent such as the state root
+/// passes; an existing one is never silently loosened or tightened, only
+/// refused.
 pub(crate) fn ensure_private_dir(path: &std::path::Path) -> Result<(), RemoteError> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
     let context = |detail: String| RemoteError::Local(format!("{}: {detail}", path.display()));
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|error| context(error.to_string()))?;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(parent)
+            .map_err(|error| context(error.to_string()))?;
     }
     match std::fs::DirBuilder::new().mode(0o700).create(path) {
         Ok(()) => {
@@ -399,6 +405,29 @@ mod tests {
         assert_eq!(pairs["code"], "4/0A");
         assert_eq!(pairs["scope"], "");
         assert!(form_pairs("state=x&state=y").is_none());
+    }
+
+    #[test]
+    fn private_dirs_create_missing_parents_privately_and_leave_existing_ones() {
+        use std::os::unix::fs::PermissionsExt;
+        let test = TestDir::new("private-parents");
+        let mode =
+            |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        let shared = test.path().join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let app = shared.join("app");
+        ensure_private_dir(&app.join("telemetry").join("instance")).unwrap();
+        assert_eq!(mode(&app), 0o700);
+        assert_eq!(mode(&app.join("telemetry")), 0o700);
+        // A later check of the app root, as the sync state makes, passes.
+        ensure_private_dir(&app).unwrap();
+        // An existing shared directory is refused, never tightened.
+        assert_eq!(mode(&shared), 0o755);
+        let refused = ensure_private_dir(&shared).unwrap_err().to_string();
+        assert!(refused.contains("chmod 700"), "{refused}");
+        assert_eq!(mode(&shared), 0o755);
     }
 
     #[test]

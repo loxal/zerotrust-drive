@@ -13,18 +13,25 @@
 //! - **Mounted**: the drive is unmounted instead. The FUSE session then ends
 //!   on its own, `destroy` flushes every acknowledged write, and the process
 //!   exits normally. A busy mount is not detached lazily or forcibly: the
-//!   error is reported, the drive keeps serving, and the next signal retries.
+//!   error is reported and the drive keeps serving. Interactively the next
+//!   signal retries; under a service manager, which sends a single stop
+//!   signal (see [`unattended`]), the drive retries every second by itself.
 //! - **Unmounting**: further signals are reported and ignored until the final
 //!   flush completes.
 //! - **Finishing** (the final upload of automatic remote sync, after the local
 //!   flush): a signal abandons the upload. Local data is already durable and
 //!   the next push or mount resumes the upload.
+//! - **Stoppable** (a plain-mode sync loop, no mount): the first signal only
+//!   sets the flag [`stop_requested`] reports, so the loop ends after its
+//!   current and one final cycle; a second signal terminates at once.
 //!
 //! A signal the parent process set to be ignored (for example SIGHUP under
 //! `nohup`) stays ignored.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant};
 
 const HANDLED_SIGNALS: [libc::c_int; 3] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP];
 
@@ -33,12 +40,42 @@ enum Phase {
     Mounted(PathBuf),
     Unmounting,
     Finishing(Box<dyn Fn() + Send>),
+    Stoppable,
 }
 
 static PHASE: Mutex<Phase> = Mutex::new(Phase::Default);
+static STOP: AtomicBool = AtomicBool::new(false);
+static UNATTENDED: AtomicBool = AtomicBool::new(false);
+static BUSY_RETRY: Mutex<Option<BusyRetry>> = Mutex::new(None);
+const BUSY_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Progress of the unattended busy-unmount retry. The main thread reports it
+/// in [`session_ended`]: the successful attempt ends the FUSE session, so the
+/// main thread can flush and exit before the retry thread runs again.
+struct BusyRetry {
+    mountpoint: PathBuf,
+    started: Instant,
+    attempts: u64,
+}
 
 fn phase() -> MutexGuard<'static, Phase> {
     PHASE.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn busy_retry() -> MutexGuard<'static, Option<BusyRetry>> {
+    BUSY_RETRY.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Mark this process as run by a service manager. systemd and launchd send
+/// one stop signal and then wait for the exit, so a refused unmount is
+/// retried until it succeeds instead of waiting for another signal.
+pub(crate) fn unattended() {
+    UNATTENDED.store(true, Ordering::SeqCst);
+}
+
+/// Whether [`unattended`] was called: no terminal, no second signal.
+pub(crate) fn is_unattended() -> bool {
+    UNATTENDED.load(Ordering::SeqCst)
 }
 
 /// Block the handled signals and start the receiving thread. Call this before
@@ -83,14 +120,47 @@ pub(crate) fn mounted(mountpoint: &Path) {
     *phase() = Phase::Mounted(mountpoint.to_path_buf());
 }
 
-/// Restore the default signal behaviour once the FUSE session has ended.
+/// Restore the default signal behaviour once the FUSE session has ended, and
+/// report a busy unmount that the unattended retry resolved.
 pub(crate) fn session_ended() {
     *phase() = Phase::Default;
+    let Some(retry) = busy_retry().take() else {
+        return;
+    };
+    let waited = retry.started.elapsed();
+    eprintln!(
+        "zerotrust-drive: {} unmounted after {} attempts in {} s",
+        retry.mountpoint.display(),
+        retry.attempts,
+        waited.as_secs()
+    );
+    crate::telemetry::event(
+        crate::telemetry::Level::Standard,
+        "unmount.retried",
+        &[
+            ("attempts", crate::telemetry::Field::U64(retry.attempts)),
+            (
+                "waited_ms",
+                crate::telemetry::Field::U64(u64::try_from(waited.as_millis()).unwrap_or(u64::MAX)),
+            ),
+        ],
+    );
 }
 
 /// Route later signals to `abandon` while the final upload runs.
 pub(crate) fn finishing(abandon: Box<dyn Fn() + Send>) {
     *phase() = Phase::Finishing(abandon);
+}
+
+/// Let the first later signal request a stop instead of terminating, for a
+/// loop that polls [`stop_requested`]. Never used while a drive is mounted.
+pub(crate) fn stoppable() {
+    *phase() = Phase::Stoppable;
+}
+
+/// Whether a signal arrived since [`stoppable`].
+pub(crate) fn stop_requested() -> bool {
+    STOP.load(Ordering::SeqCst)
 }
 
 fn receive(set: libc::sigset_t) {
@@ -118,6 +188,7 @@ fn handle(signal: libc::c_int) {
         Phase::Default => {
             drop(current);
             crate::prompt::restore_terminal_after_signal();
+            crate::telemetry::stop("signal", 128 + signal);
             terminate_with(signal);
         }
         Phase::Unmounting => eprintln!(
@@ -131,10 +202,34 @@ fn handle(signal: libc::c_int) {
             );
             abandon();
         }
+        Phase::Stoppable => {
+            if STOP.swap(true, Ordering::SeqCst) {
+                drop(current);
+                crate::prompt::restore_terminal_after_signal();
+                crate::telemetry::stop("signal", 128 + signal);
+                terminate_with(signal);
+            }
+            let _ = crate::service::notify::stopping();
+            crate::telemetry::event(
+                crate::telemetry::Level::Standard,
+                "signal",
+                &[("signal", crate::telemetry::Field::Tag(signal_name(signal)))],
+            );
+            eprintln!(
+                "zerotrust-drive: {} received; finishing the current sync cycle (send it again to stop immediately)",
+                signal_name(signal)
+            );
+        }
         Phase::Mounted(mountpoint) => {
             let mountpoint = mountpoint.clone();
             *current = Phase::Unmounting;
             drop(current);
+            let _ = crate::service::notify::stopping();
+            crate::telemetry::event(
+                crate::telemetry::Level::Standard,
+                "signal",
+                &[("signal", crate::telemetry::Field::Tag(signal_name(signal)))],
+            );
             eprintln!(
                 "zerotrust-drive: {} received; unmounting {}",
                 signal_name(signal),
@@ -147,15 +242,19 @@ fn handle(signal: libc::c_int) {
                     mountpoint.display()
                 ),
                 Err(error) => {
+                    eprintln!(
+                        "zerotrust-drive: cannot unmount {}: {error}",
+                        mountpoint.display()
+                    );
+                    crate::telemetry::event(crate::telemetry::Level::Standard, "unmount.busy", &[]);
+                    if is_unattended() && retry_busy_unmount(mountpoint.clone()) {
+                        return;
+                    }
                     let mut current = phase();
                     if matches!(*current, Phase::Unmounting) {
                         *current = Phase::Mounted(mountpoint.clone());
                     }
                     drop(current);
-                    eprintln!(
-                        "zerotrust-drive: cannot unmount {}: {error}",
-                        mountpoint.display()
-                    );
                     eprintln!(
                         "zerotrust-drive: the drive stays mounted and keeps serving; close files and programs using it, then press Ctrl+C (or send the signal) again"
                     );
@@ -163,6 +262,46 @@ fn handle(signal: libc::c_int) {
             }
         }
     }
+}
+
+/// Retry a refused unmount every second while the phase stays
+/// `Unmounting`, for a service manager that sends no second signal. The
+/// drive keeps serving meanwhile; the manager's stop timeout still bounds the
+/// wait, and [`session_ended`] reports the outcome. Returns false if the retry
+/// thread cannot start.
+fn retry_busy_unmount(mountpoint: PathBuf) -> bool {
+    *busy_retry() = Some(BusyRetry {
+        mountpoint: mountpoint.clone(),
+        started: Instant::now(),
+        attempts: 1,
+    });
+    let spawned = std::thread::Builder::new()
+        .name("zdrive-unmount-retry".to_string())
+        .spawn(move || {
+            loop {
+                std::thread::sleep(BUSY_RETRY_INTERVAL);
+                if !matches!(*phase(), Phase::Unmounting) {
+                    return;
+                }
+                if let Some(retry) = busy_retry().as_mut() {
+                    retry.attempts += 1;
+                }
+                match unmount(&mountpoint) {
+                    // The session ends now; session_ended reports it.
+                    Ok(()) => return,
+                    Err(error) if error.raw_os_error() == Some(libc::EINVAL) => return,
+                    Err(_) => {}
+                }
+            }
+        });
+    if spawned.is_err() {
+        *busy_retry() = None;
+        return false;
+    }
+    eprintln!(
+        "zerotrust-drive: the drive keeps serving and retries the unmount every second until the files and programs using it close"
+    );
+    true
 }
 
 /// Terminate through the signal's default action so the exit status still

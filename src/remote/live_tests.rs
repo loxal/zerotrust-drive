@@ -60,8 +60,10 @@ impl Account {
             .expect("set ZEROTRUST_PASSPHRASE to the passphrase that sealed the remote");
         let paths = Paths::from_env().unwrap();
         let config = RemoteConfig::load(&paths, &name).unwrap();
-        let client = OAuthClient::load(&config.client_file).unwrap();
-        let refresh_token = config.token.unseal(&name, &passphrase).unwrap();
+        let client = oauth::client_for(&config.issuer()).unwrap();
+        let refresh_token = config
+            .refresh_token(&paths, &name, Some(&passphrase))
+            .unwrap();
         let drive = GoogleDrive::new(Box::new(RefreshTokenSource::new(
             client.clone(),
             refresh_token.clone(),

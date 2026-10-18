@@ -23,12 +23,24 @@ use ureq::http::Response;
 
 use super::format::valid_file_id;
 use super::{RemoteError, hex, md5_file, unhex};
+use crate::telemetry::{self, RequestClass};
 
 pub(crate) const GOOGLE_API: &str = "https://www.googleapis.com";
 pub(crate) const FOLDER_MIME: &str = "application/vnd.google-apps.folder";
-const FILE_FIELDS: &str = "id,name,size,md5Checksum,mimeType,parents,appProperties,trashed";
-const LIST_FIELDS: &str =
-    "nextPageToken,files(id,name,size,md5Checksum,mimeType,parents,appProperties)";
+/// Drive's alias for the root of My Drive.
+pub(crate) const MY_DRIVE: &str = "root";
+/// The app property that marks folders zerotrust-drive created.
+pub(crate) const MARKER_KEY: &str = "zdrive";
+/// [`MARKER_KEY`] value of an encrypted store folder.
+pub(crate) const STORE_MARKER: &str = "store-v1";
+/// [`MARKER_KEY`] value of a plain-mode sync folder.
+pub(crate) const PLAIN_MARKER: &str = "plain-v1";
+const FILE_FIELDS: &str =
+    "id,name,size,md5Checksum,mimeType,parents,appProperties,trashed,modifiedTime,version";
+const LIST_FIELDS: &str = "nextPageToken,files(id,name,size,md5Checksum,mimeType,parents,appProperties,modifiedTime,version)";
+const CHANGE_FIELDS: &str = "nextPageToken,newStartPageToken,changes(changeType,fileId,removed,file(id,name,size,md5Checksum,mimeType,parents,appProperties,trashed,modifiedTime,version))";
+/// Longest page token accepted from the changes feed.
+const MAX_PAGE_TOKEN: usize = 1024;
 /// Files up to this size are created in one multipart request.
 pub(crate) const MULTIPART_LIMIT: u64 = 5 << 20;
 /// Resumable chunk size; Drive requires a multiple of 256 KiB.
@@ -152,12 +164,36 @@ pub(crate) struct DriveFile {
     pub(crate) parents: Vec<String>,
     #[serde(default)]
     pub(crate) app_properties: BTreeMap<String, String>,
-    /// Only `get` reports this; listings exclude trashed files.
+    /// Only `get` and the changes feed report this; listings exclude
+    /// trashed files.
     #[serde(default)]
     pub(crate) trashed: bool,
+    /// RFC 3339 time of the last content or metadata change.
+    #[serde(default)]
+    pub(crate) modified_time: Option<String>,
+    /// Drive's monotonically increasing version of this file.
+    #[serde(default)]
+    pub(crate) version: Option<String>,
 }
 
 impl DriveFile {
+    /// My Drive under its [`MY_DRIVE`] alias, for when its real id is
+    /// hidden.
+    fn my_drive() -> Self {
+        Self {
+            id: MY_DRIVE.to_string(),
+            name: "My Drive".to_string(),
+            size: None,
+            md5_checksum: None,
+            mime_type: FOLDER_MIME.to_string(),
+            parents: Vec::new(),
+            app_properties: BTreeMap::new(),
+            trashed: false,
+            modified_time: None,
+            version: None,
+        }
+    }
+
     pub(crate) fn size(&self) -> Option<u64> {
         self.size.as_deref()?.parse().ok()
     }
@@ -169,6 +205,158 @@ impl DriveFile {
     pub(crate) fn is_folder(&self) -> bool {
         self.mime_type == FOLDER_MIME
     }
+}
+
+/// One entry of the Drive changes feed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Change {
+    pub(crate) file_id: String,
+    /// The file was deleted forever or this client lost access to it.
+    pub(crate) removed: bool,
+    /// Current metadata, absent for a removal. A trashed file is reported
+    /// with `trashed` set rather than as removed.
+    pub(crate) file: Option<DriveFile>,
+}
+
+/// One page of the changes feed. Exactly one of the tokens is present:
+/// `next_page_token` continues this listing, `new_start_page_token` is
+/// where the next poll starts.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ChangesPage {
+    pub(crate) changes: Vec<Change>,
+    pub(crate) next_page_token: Option<String>,
+    pub(crate) new_start_page_token: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawChangesPage {
+    #[serde(default)]
+    changes: Vec<RawChange>,
+    #[serde(default)]
+    next_page_token: Option<String>,
+    #[serde(default)]
+    new_start_page_token: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawChange {
+    #[serde(default)]
+    change_type: Option<String>,
+    #[serde(default)]
+    file_id: Option<String>,
+    #[serde(default)]
+    removed: bool,
+    #[serde(default)]
+    file: Option<DriveFile>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StartPageToken {
+    #[serde(default)]
+    start_page_token: Option<String>,
+}
+
+fn valid_page_token(token: &str) -> bool {
+    !token.is_empty()
+        && token.len() <= MAX_PAGE_TOKEN
+        && token.bytes().all(|byte| byte.is_ascii_graphic())
+}
+
+/// Size and modification time of an open file, taken before reading it, so
+/// an upload can prove its source did not change while it was read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SourceStamp {
+    size: u64,
+    mtime: (i64, i64),
+}
+
+impl SourceStamp {
+    fn of(file: &File) -> std::io::Result<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = file.metadata()?;
+        Ok(Self {
+            size: metadata.len(),
+            mtime: (metadata.mtime(), metadata.mtime_nsec()),
+        })
+    }
+
+    fn unchanged(&self, file: &File, source: &Path) -> Result<(), RemoteError> {
+        if Self::of(file)? == *self {
+            Ok(())
+        } else {
+            Err(RemoteError::Local(format!(
+                "{} changed while uploading",
+                source.display()
+            )))
+        }
+    }
+}
+
+/// Opens a regular upload source without following a symlink, and returns
+/// its stamp and md5, proven to belong to that stamp.
+fn open_source(local: &Path) -> Result<(File, SourceStamp, [u8; 16]), RemoteError> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(local)?;
+    if !file.metadata()?.is_file() {
+        return Err(RemoteError::Local(format!(
+            "{} is not a regular file",
+            local.display()
+        )));
+    }
+    let stamp = SourceStamp::of(&file)?;
+    let (md5, len) = md5_open(&mut file)?;
+    stamp.unchanged(&file, local)?;
+    if len != stamp.size {
+        return Err(RemoteError::Local(format!(
+            "{} changed while uploading",
+            local.display()
+        )));
+    }
+    Ok((file, stamp, md5))
+}
+
+/// The whole content of an opened source, proven unchanged since `stamp`.
+fn read_source(
+    file: &mut File,
+    stamp: &SourceStamp,
+    md5: [u8; 16],
+    local: &Path,
+) -> Result<Vec<u8>, RemoteError> {
+    file.seek(SeekFrom::Start(0))?;
+    let mut bytes = Vec::with_capacity(usize::try_from(stamp.size).unwrap_or(0));
+    file.read_to_end(&mut bytes)?;
+    stamp.unchanged(file, local)?;
+    if bytes.len() as u64 != stamp.size || super::md5_bytes(&bytes) != md5 {
+        return Err(RemoteError::Local(format!(
+            "{} changed while uploading",
+            local.display()
+        )));
+    }
+    Ok(bytes)
+}
+
+/// MD5 and length of an open file from its start.
+fn md5_open(file: &mut File) -> std::io::Result<([u8; 16], u64)> {
+    use md5::Digest;
+    file.seek(SeekFrom::Start(0))?;
+    let mut hasher = md5::Md5::new();
+    let mut buffer = vec![0u8; 1 << 20];
+    let mut total = 0u64;
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+        total += read as u64;
+    }
+    Ok((hasher.finalize().into(), total))
 }
 
 /// Persistent identity of one in-flight upload.
@@ -244,10 +432,10 @@ pub(crate) struct AccountInfo {
     pub(crate) usage: Option<u64>,
 }
 
-/// Result of one HTTP attempt.
+/// Result of one HTTP attempt. A retry carries its telemetry reason.
 enum Outcome {
     Done(Response<Body>),
-    Retry(String, Option<Duration>),
+    Retry(String, Option<Duration>, &'static str),
     Unauthorized(String),
     Fail(RemoteError),
 }
@@ -303,7 +491,7 @@ fn retry_after(response: &Response<Body>) -> Option<Duration> {
 fn classify(op: &str, result: Result<Response<Body>, ureq::Error>) -> Outcome {
     let mut response = match result {
         Ok(response) => response,
-        Err(error) => return Outcome::Retry(format!("{op}: {error}"), None),
+        Err(error) => return Outcome::Retry(format!("{op}: {error}"), None, "network"),
     };
     let status = response.status().as_u16();
     if (200..300).contains(&status) || status == 308 {
@@ -340,17 +528,54 @@ fn classify(op: &str, result: Result<Response<Body>, ureq::Error>) -> Outcome {
     };
     match status {
         401 => Outcome::Unauthorized(detail),
-        403 if has(&["rateLimitExceeded", "userRateLimitExceeded", "backendError"]) => {
-            Outcome::Retry(detail, after)
+        403 if has(&["rateLimitExceeded", "userRateLimitExceeded"]) => {
+            Outcome::Retry(detail, after, "rate_limit")
         }
+        403 if has(&["backendError"]) => Outcome::Retry(detail, after, "server"),
         403 if has(&["storageQuotaExceeded", "teamDriveFileLimitExceeded"]) => {
             Outcome::Fail(RemoteError::Quota(detail))
         }
         403 if has(&["dailyLimitExceeded"]) => Outcome::Fail(RemoteError::Quota(detail)),
         404 | 410 => Outcome::Fail(RemoteError::NotFound(detail)),
         409 => Outcome::Fail(RemoteError::Conflict(detail)),
-        408 | 429 | 500 | 502 | 503 | 504 => Outcome::Retry(detail, after),
+        408 => Outcome::Retry(detail, after, "timeout"),
+        429 => Outcome::Retry(detail, after, "rate_limit"),
+        500 | 502 | 503 | 504 => Outcome::Retry(detail, after, "server"),
         _ => Outcome::Fail(RemoteError::Protocol(detail)),
+    }
+}
+
+/// Telemetry class of an operation label; labels never carry names or ids.
+/// The first matching keyword wins, so the specific ones come first.
+fn request_class(op: &str) -> RequestClass {
+    const CLASSES: [(&str, RequestClass); 12] = [
+        ("update file content", RequestClass::Upload),
+        ("update file", RequestClass::Update),
+        ("upload", RequestClass::Upload),
+        ("download", RequestClass::Download),
+        ("changes", RequestClass::Changes),
+        ("list", RequestClass::List),
+        ("find", RequestClass::List),
+        ("account", RequestClass::About),
+        ("metadata", RequestClass::Get),
+        ("create", RequestClass::Create),
+        ("bin", RequestClass::Trash),
+        ("token", RequestClass::Token),
+    ];
+    CLASSES
+        .iter()
+        .find(|(keyword, _)| op.contains(keyword))
+        .map_or(RequestClass::Other, |(_, class)| *class)
+}
+
+/// The token source reports errors rather than statuses: a rejected grant is
+/// a 4xx answer and a transport or availability failure counts as network.
+fn token_status<T>(fetched: &Result<T, RemoteError>) -> Option<u16> {
+    match fetched {
+        Ok(_) => Some(200),
+        Err(RemoteError::Network(_)) => None,
+        Err(RemoteError::Auth(_)) => Some(401),
+        Err(_) => Some(400),
     }
 }
 
@@ -454,7 +679,15 @@ impl GoogleDrive {
         {
             return Ok(format!("Bearer {token}"));
         }
-        let (token, lifetime) = self.tokens.fetch(&self.agent)?;
+        let started = Instant::now();
+        let fetched = self.tokens.fetch(&self.agent);
+        telemetry::remote_request(
+            RequestClass::Token,
+            token_status(&fetched),
+            started.elapsed(),
+            1,
+        );
+        let (token, lifetime) = fetched?;
         *cached = Some((token.clone(), Instant::now() + lifetime));
         Ok(format!("Bearer {token}"))
     }
@@ -472,8 +705,9 @@ impl GoogleDrive {
         }
     }
 
-    /// One paced HTTP attempt with a current bearer token.
-    fn attempt<S>(&self, op: &str, write: bool, send: &mut S) -> (Outcome, String)
+    /// One paced HTTP attempt with a current bearer token; `number` counts
+    /// the attempts of this request for telemetry.
+    fn attempt<S>(&self, op: &str, write: bool, number: u32, send: &mut S) -> (Outcome, String)
     where
         S: FnMut(&ureq::Agent, &str) -> Result<Response<Body>, ureq::Error>,
     {
@@ -484,17 +718,23 @@ impl GoogleDrive {
         let bearer = match self.bearer() {
             Ok(bearer) => bearer,
             Err(RemoteError::Network(detail)) => {
-                return (Outcome::Retry(detail, None), String::new());
+                return (Outcome::Retry(detail, None, "network"), String::new());
             }
             Err(error) => return (Outcome::Fail(error), String::new()),
         };
         let token_wait = authorizing.elapsed();
         let started = Instant::now();
-        let outcome = classify(op, send(&self.agent, &bearer));
+        let sent = send(&self.agent, &bearer);
+        let status = sent
+            .as_ref()
+            .ok()
+            .map(|response| response.status().as_u16());
+        telemetry::remote_request(request_class(op), status, started.elapsed(), number);
+        let outcome = classify(op, sent);
         if self.trace {
             let result = match &outcome {
                 Outcome::Done(response) => format!("HTTP {}", response.status().as_u16()),
-                Outcome::Retry(detail, _) => format!("retry ({detail})"),
+                Outcome::Retry(detail, _, _) => format!("retry ({detail})"),
                 Outcome::Unauthorized(_) => "unauthorized".to_string(),
                 Outcome::Fail(error) => format!("failed ({error})"),
             };
@@ -524,13 +764,15 @@ impl GoogleDrive {
     {
         let mut refreshed = false;
         let mut attempt = 0u32;
+        let mut tries = 0u32;
         loop {
-            let (outcome, bearer) = self.attempt(op, write, &mut send);
+            tries += 1;
+            let (outcome, bearer) = self.attempt(op, write, tries, &mut send);
             let detail = match outcome {
                 Outcome::Done(response) => match finish(response) {
                     Step::Done(value) => return Ok(value),
                     Step::Fail(error) => return Err(error),
-                    Step::Retry(detail) => (detail, None),
+                    Step::Retry(detail) => (detail, None, "body"),
                 },
                 Outcome::Unauthorized(detail) => {
                     if refreshed {
@@ -540,7 +782,7 @@ impl GoogleDrive {
                     self.invalidate(&bearer);
                     continue;
                 }
-                Outcome::Retry(detail, after) => (detail, after),
+                Outcome::Retry(detail, after, reason) => (detail, after, reason),
                 Outcome::Fail(error) => return Err(error),
             };
             attempt += 1;
@@ -554,6 +796,7 @@ impl GoogleDrive {
                 .1
                 .map(|after| after.min(self.policy.cap))
                 .unwrap_or_else(|| self.policy.delay(attempt));
+            telemetry::retry(request_class(op), detail.2, delay);
             std::thread::sleep(delay);
         }
     }
@@ -607,6 +850,16 @@ impl GoogleDrive {
         })
     }
 
+    /// The folder `id`. My Drive itself stays usable through the [`MY_DRIVE`]
+    /// alias as a parent, in queries and in creates even where `drive.file`
+    /// hides it from `files.get`, so that refusal yields the alias instead.
+    pub(crate) fn folder(&self, id: &str) -> Result<DriveFile, RemoteError> {
+        match self.get(id) {
+            Err(RemoteError::NotFound(_)) if id == MY_DRIVE => Ok(DriveFile::my_drive()),
+            result => result,
+        }
+    }
+
     /// Every non-trashed child of `parent`, across all pages.
     pub(crate) fn list(
         &self,
@@ -618,15 +871,67 @@ impl GoogleDrive {
         if folders_only {
             query.push_str(&format!(" and mimeType = '{FOLDER_MIME}'"));
         }
+        self.query_all("list folder", &query)
+    }
+
+    /// Every non-trashed folder anywhere in the Drive that carries the app
+    /// property [`MARKER_KEY`]`=marker`. Under `drive.file` only folders
+    /// this app created are visible, whatever they were renamed to.
+    pub(crate) fn find_marked_folders(&self, marker: &str) -> Result<Vec<DriveFile>, RemoteError> {
+        if marker.is_empty()
+            || !marker
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        {
+            return Err(RemoteError::Protocol(format!(
+                "invalid folder marker {marker:?}"
+            )));
+        }
+        let query = format!(
+            "appProperties has {{ key='{MARKER_KEY}' and value='{marker}' }} and mimeType = '{FOLDER_MIME}' and trashed = false"
+        );
+        self.query_all("find marked folders", &query)
+    }
+
+    /// The single folder marked `marker`, or a new one named `name` in My
+    /// Drive when none exists; `true` when it was created. Several marked
+    /// folders are refused with their ids, so two installs never split one
+    /// drive between them.
+    pub(crate) fn find_or_create_marked_folder(
+        &self,
+        marker: &str,
+        name: &str,
+    ) -> Result<(DriveFile, bool), RemoteError> {
+        let mut found = self.find_marked_folders(marker)?;
+        match found.len() {
+            0 => {
+                let id = self.generate_ids(1)?.remove(0);
+                let props = BTreeMap::from([(MARKER_KEY.to_string(), marker.to_string())]);
+                let folder = self.create_folder_with(MY_DRIVE, name, &id, &props)?;
+                Ok((folder, true))
+            }
+            1 => Ok((found.remove(0), false)),
+            _ => {
+                let ids: Vec<&str> = found.iter().map(|folder| folder.id.as_str()).collect();
+                Err(RemoteError::Conflict(format!(
+                    "{} Drive folders are marked as zerotrust-drive {marker} folders (ids {}); move all but one to the bin, or choose one with --folder-id",
+                    found.len(),
+                    ids.join(", ")
+                )))
+            }
+        }
+    }
+
+    fn query_all(&self, op: &'static str, query: &str) -> Result<Vec<DriveFile>, RemoteError> {
         let url = self.url("/drive/v3/files");
         let mut files = Vec::new();
         let mut page_token: Option<String> = None;
         loop {
-            let page: FileList = self.run_json("list folder", false, |agent, bearer| {
+            let page: FileList = self.run_json(op, false, |agent, bearer| {
                 let mut request = agent
                     .get(&url)
                     .header("Authorization", bearer)
-                    .query("q", &query)
+                    .query("q", query)
                     .query("fields", LIST_FIELDS)
                     .query("pageSize", "1000")
                     .query("supportsAllDrives", "true")
@@ -682,9 +987,9 @@ impl GoogleDrive {
             None => true,
         };
         if existing.name == name
-            && existing.parents.iter().any(|candidate| candidate == parent)
             && existing.is_folder() == folder
             && content_matches
+            && self.placed_in(&existing, parent)?
         {
             Ok(existing)
         } else {
@@ -692,6 +997,23 @@ impl GoogleDrive {
                 "Drive file id {id} already exists with different identity or content"
             )))
         }
+    }
+
+    /// Whether `file` sits directly in `parent`. Drive reports My Drive's
+    /// real id in `parents`, never the [`MY_DRIVE`] alias a caller passed,
+    /// and `drive.file` hides that real id, so the alias is checked by
+    /// listing My Drive's children instead.
+    fn placed_in(&self, file: &DriveFile, parent: &str) -> Result<bool, RemoteError> {
+        if file.parents.iter().any(|candidate| candidate == parent) {
+            return Ok(true);
+        }
+        if parent != MY_DRIVE {
+            return Ok(false);
+        }
+        Ok(self
+            .list(MY_DRIVE, file.is_folder())?
+            .iter()
+            .any(|child| child.id == file.id))
     }
 
     fn metadata_json(
@@ -717,10 +1039,21 @@ impl GoogleDrive {
         name: &str,
         id: &str,
     ) -> Result<DriveFile, RemoteError> {
+        self.create_folder_with(parent, name, id, &BTreeMap::new())
+    }
+
+    /// Creates a folder carrying the app properties `props`.
+    pub(crate) fn create_folder_with(
+        &self,
+        parent: &str,
+        name: &str,
+        id: &str,
+        props: &BTreeMap<String, String>,
+    ) -> Result<DriveFile, RemoteError> {
         require_id(parent)?;
         require_id(id)?;
         let url = self.url("/drive/v3/files");
-        let body = Self::metadata_json(id, parent, name, Some(FOLDER_MIME), &BTreeMap::new());
+        let body = Self::metadata_json(id, parent, name, Some(FOLDER_MIME), props);
         match self.run_json("create folder", true, |agent, bearer| {
             agent
                 .post(&url)
@@ -747,24 +1080,9 @@ impl GoogleDrive {
         require_id(parent)?;
         require_id(id)?;
         let md5 = super::md5_bytes(bytes);
-        let mut boundary_bytes = [0u8; 16];
-        crate::crypto::fill_random(&mut boundary_bytes);
-        let boundary = format!("zdrive-{}", hex(&boundary_bytes));
         let metadata = Self::metadata_json(id, parent, name, None, props);
-        let mut body = Vec::with_capacity(bytes.len() + metadata.len() + 256);
-        body.extend_from_slice(
-            format!("--{boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n")
-                .as_bytes(),
-        );
-        body.extend_from_slice(&metadata);
-        body.extend_from_slice(
-            format!("\r\n--{boundary}\r\nContent-Type: application/octet-stream\r\n\r\n")
-                .as_bytes(),
-        );
-        body.extend_from_slice(bytes);
-        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        let (body, content_type) = multipart_body(&metadata, bytes);
         let url = self.url("/upload/drive/v3/files");
-        let content_type = format!("multipart/related; boundary={boundary}");
         let created = match self.run_json::<DriveFile, _>("upload file", true, |agent, bearer| {
             agent
                 .post(&url)
@@ -854,7 +1172,7 @@ impl GoogleDrive {
                     }
                 },
             };
-            let status = match self.send_session(&session, &mut file, size) {
+            let status = match self.send_session(&session, &mut file, size, None) {
                 // Another attempt already completed this id.
                 Err(RemoteError::Conflict(_)) => {
                     return self.reconcile(
@@ -897,15 +1215,32 @@ impl GoogleDrive {
         id: &str,
         size: u64,
     ) -> Result<Option<String>, RemoteError> {
-        let url = self.url("/upload/drive/v3/files");
         let metadata = Self::metadata_json(id, parent, name, None, &BTreeMap::new());
+        self.open_session(None, &metadata, size)
+    }
+
+    /// Opens a resumable session that creates a file (`update` is `None`)
+    /// or replaces the content of the file `update` names.
+    fn open_session(
+        &self,
+        update: Option<&str>,
+        metadata: &[u8],
+        size: u64,
+    ) -> Result<Option<String>, RemoteError> {
+        let url = match update {
+            Some(id) => self.url(&format!("/upload/drive/v3/files/{id}")),
+            None => self.url("/upload/drive/v3/files"),
+        };
         let expected_origin = origin(&self.api_base).map(str::to_string);
         let result = self.run(
             "start resumable upload",
             true,
             |agent, bearer| {
-                agent
-                    .post(&url)
+                let request = match update {
+                    Some(_) => agent.patch(&url),
+                    None => agent.post(&url),
+                };
+                request
                     .header("Authorization", bearer)
                     .header("Content-Type", "application/json; charset=UTF-8")
                     .header("X-Upload-Content-Type", "application/octet-stream")
@@ -913,7 +1248,7 @@ impl GoogleDrive {
                     .query("uploadType", "resumable")
                     .query("fields", FILE_FIELDS)
                     .query("supportsAllDrives", "true")
-                    .send(&metadata[..])
+                    .send(metadata)
             },
             |response| match header(&response, "location") {
                 Some(location)
@@ -979,11 +1314,15 @@ impl GoogleDrive {
 
     /// Sends the remaining bytes of a session. Every interrupted chunk is
     /// followed by a status query, because Drive may have kept part of it.
+    /// With a `stamp`, every chunk is checked against it after being read,
+    /// so the final chunk, which completes the upload, is never sent from a
+    /// source that changed since its first byte was read.
     fn send_session(
         &self,
         session: &str,
         file: &mut File,
         size: u64,
+        stamp: Option<(&SourceStamp, &Path)>,
     ) -> Result<SessionStatus, RemoteError> {
         let mut offset = match self.query_session(session, size)? {
             SessionStatus::Offset(offset) if offset <= size => offset,
@@ -996,6 +1335,7 @@ impl GoogleDrive {
         };
         let mut failures = 0u32;
         let mut refreshed = false;
+        let mut tries = 0u32;
         let mut chunk = Vec::new();
         loop {
             let len = self.chunk.min(size - offset);
@@ -1011,10 +1351,15 @@ impl GoogleDrive {
             chunk.resize(len as usize, 0);
             file.seek(SeekFrom::Start(offset))?;
             file.read_exact(&mut chunk)?;
+            if let Some((stamp, source)) = stamp {
+                stamp.unchanged(file, source)?;
+            }
             let range = format!("bytes {offset}-{}/{size}", offset + len - 1);
+            tries += 1;
             let (outcome, bearer) = self.attempt(
                 "upload chunk",
                 false,
+                tries,
                 &mut |agent: &ureq::Agent, bearer: &str| {
                     agent
                         .put(session)
@@ -1028,13 +1373,14 @@ impl GoogleDrive {
                     Step::Done(SessionStatus::Offset(next)) if next > offset && next <= size => {
                         offset = next;
                         failures = 0;
+                        tries = 0;
                         continue;
                     }
                     Step::Done(SessionStatus::Offset(_)) => {
-                        "upload chunk made no progress".to_string()
+                        ("upload chunk made no progress".to_string(), "stalled")
                     }
                     Step::Done(terminal) => return Ok(terminal),
-                    Step::Retry(detail) => detail,
+                    Step::Retry(detail) => (detail, "body"),
                     Step::Fail(error) => return Err(error),
                 },
                 Outcome::Unauthorized(detail) => {
@@ -1043,19 +1389,22 @@ impl GoogleDrive {
                     }
                     refreshed = true;
                     self.invalidate(&bearer);
-                    detail
+                    (detail, "auth")
                 }
-                Outcome::Retry(detail, _) => detail,
+                Outcome::Retry(detail, _, reason) => (detail, reason),
                 Outcome::Fail(RemoteError::NotFound(_)) => return Ok(SessionStatus::Expired),
                 Outcome::Fail(error) => return Err(error),
             };
             failures += 1;
             if failures >= self.policy.attempts {
                 return Err(RemoteError::Network(format!(
-                    "{detail} after {failures} attempts"
+                    "{} after {failures} attempts",
+                    detail.0
                 )));
             }
-            std::thread::sleep(self.policy.delay(failures));
+            let delay = self.policy.delay(failures);
+            telemetry::retry(RequestClass::Upload, detail.1, delay);
+            std::thread::sleep(delay);
             offset = match self.query_session(session, size)? {
                 SessionStatus::Offset(confirmed) if confirmed <= size => confirmed,
                 SessionStatus::Offset(_) => {
@@ -1208,7 +1557,9 @@ impl GoogleDrive {
                             file.name
                         )));
                     }
-                    std::thread::sleep(self.policy.delay(failures));
+                    let delay = self.policy.delay(failures);
+                    telemetry::retry(RequestClass::Download, "body", delay);
+                    std::thread::sleep(delay);
                 } else {
                     failures = 0;
                 }
@@ -1256,9 +1607,248 @@ impl GoogleDrive {
         })
     }
 
-    /// Moves a file or folder to the Drive bin; live tests clean up with it.
-    /// Replication itself never removes anything.
-    #[cfg(test)]
+    /// Replaces the content of the existing file `id` with the local file
+    /// `local`, keeping its id, name and parents; Drive keeps the previous
+    /// content as a revision. Small files go in one multipart request,
+    /// larger ones through a resumable session. A source that changes while
+    /// it is read fails with [`RemoteError::Local`] before the upload can
+    /// complete, and the stored size and md5 are verified.
+    pub(crate) fn update_content(&self, id: &str, local: &Path) -> Result<DriveFile, RemoteError> {
+        require_id(id)?;
+        let (mut file, stamp, md5) = open_source(local)?;
+        let size = stamp.size;
+        if size <= self.multipart_limit {
+            let bytes = read_source(&mut file, &stamp, md5, local)?;
+            let (body, content_type) = multipart_body(b"{}", &bytes);
+            let url = self.url(&format!("/upload/drive/v3/files/{id}"));
+            let updated: DriveFile =
+                self.run_json("update file content", true, |agent, bearer| {
+                    agent
+                        .patch(&url)
+                        .header("Authorization", bearer)
+                        .header("Content-Type", &content_type)
+                        .query("uploadType", "multipart")
+                        .query("fields", FILE_FIELDS)
+                        .query("supportsAllDrives", "true")
+                        .send(&body[..])
+                })?;
+            return self.verify_created(&updated, id, size, md5);
+        }
+        let mut restarts = 0u32;
+        loop {
+            let session = self.open_session(Some(id), b"{}", size)?.ok_or_else(|| {
+                RemoteError::Conflict(format!("Drive refused to update the content of {id}"))
+            })?;
+            match self.send_session(&session, &mut file, size, Some((&stamp, local)))? {
+                SessionStatus::Complete(updated) => {
+                    return self.verify_created(&updated, id, size, md5);
+                }
+                SessionStatus::Expired => {
+                    restarts += 1;
+                    if restarts > MAX_SESSION_RESTARTS {
+                        return Err(RemoteError::Network(format!(
+                            "resumable update of {id} kept expiring"
+                        )));
+                    }
+                }
+                SessionStatus::Offset(_) => {
+                    return Err(RemoteError::Protocol(
+                        "resumable update ended without a terminal state".to_string(),
+                    ));
+                }
+            }
+        }
+    }
+
+    /// Creates `name` in `parent` from the local file `local`, under `id`
+    /// when given (a pre-generated id makes a retried create idempotent:
+    /// an existing file with that id must match exactly) or a fresh one.
+    /// Unlike [`Self::upload_file`] it keeps no session checkpoint, and like
+    /// [`Self::update_content`] a source that changes while it is read
+    /// fails before the upload completes.
+    pub(crate) fn create_file(
+        &self,
+        parent: &str,
+        name: &str,
+        id: Option<&str>,
+        local: &Path,
+    ) -> Result<DriveFile, RemoteError> {
+        require_id(parent)?;
+        let id =
+            match id {
+                Some(id) => id.to_string(),
+                None => self.generate_ids(1)?.into_iter().next().ok_or_else(|| {
+                    RemoteError::Protocol("Drive generated no file id".to_string())
+                })?,
+            };
+        require_id(&id)?;
+        let (mut file, stamp, md5) = open_source(local)?;
+        let size = stamp.size;
+        if size <= self.multipart_limit {
+            let bytes = read_source(&mut file, &stamp, md5, local)?;
+            return self.create_small(parent, name, &id, &bytes, &BTreeMap::new());
+        }
+        let mut restarts = 0u32;
+        loop {
+            let Some(session) = self.start_session(parent, name, &id, size)? else {
+                return self.reconcile(&id, parent, name, Some((size, md5)), false);
+            };
+            let status = match self.send_session(&session, &mut file, size, Some((&stamp, local))) {
+                Err(RemoteError::Conflict(_)) => {
+                    return self.reconcile(&id, parent, name, Some((size, md5)), false);
+                }
+                other => other?,
+            };
+            match status {
+                SessionStatus::Complete(created) => {
+                    return self.verify_created(&created, &id, size, md5);
+                }
+                SessionStatus::Expired => {
+                    restarts += 1;
+                    if restarts > MAX_SESSION_RESTARTS {
+                        return Err(RemoteError::Network(format!(
+                            "resumable upload of {name} kept expiring"
+                        )));
+                    }
+                }
+                SessionStatus::Offset(_) => {
+                    return Err(RemoteError::Protocol(
+                        "resumable upload ended without a terminal state".to_string(),
+                    ));
+                }
+            }
+        }
+    }
+
+    /// Renames and/or moves `id`, keeping its id and content. A move names
+    /// the parent to add and the parent to remove.
+    pub(crate) fn update_metadata(
+        &self,
+        id: &str,
+        new_name: Option<&str>,
+        add_parent: Option<&str>,
+        remove_parent: Option<&str>,
+    ) -> Result<DriveFile, RemoteError> {
+        require_id(id)?;
+        for parent in [add_parent, remove_parent].into_iter().flatten() {
+            require_id(parent)?;
+        }
+        let mut metadata = serde_json::json!({});
+        if let Some(name) = new_name {
+            if name.is_empty() {
+                return Err(RemoteError::Protocol(
+                    "a Drive name cannot be empty".to_string(),
+                ));
+            }
+            metadata["name"] = serde_json::Value::String(name.to_string());
+        }
+        let body = serde_json::to_vec(&metadata).expect("metadata serializes");
+        let url = self.url(&format!("/drive/v3/files/{id}"));
+        self.run_json("update file metadata", true, |agent, bearer| {
+            let mut request = agent
+                .patch(&url)
+                .header("Authorization", bearer)
+                .header("Content-Type", "application/json; charset=UTF-8")
+                .query("fields", FILE_FIELDS)
+                .query("supportsAllDrives", "true");
+            if let Some(parent) = add_parent {
+                request = request.query("addParents", parent);
+            }
+            if let Some(parent) = remove_parent {
+                request = request.query("removeParents", parent);
+            }
+            request.send(&body[..])
+        })
+    }
+
+    /// The token from which [`Self::changes_page`] reports later changes.
+    pub(crate) fn changes_start_token(&self) -> Result<String, RemoteError> {
+        let url = self.url("/drive/v3/changes/startPageToken");
+        let token: StartPageToken =
+            self.run_json("read changes start token", false, |agent, bearer| {
+                agent
+                    .get(&url)
+                    .header("Authorization", bearer)
+                    .query("supportsAllDrives", "true")
+                    .call()
+            })?;
+        match token.start_page_token {
+            Some(token) if valid_page_token(&token) => Ok(token),
+            _ => Err(RemoteError::Protocol(
+                "Drive returned no valid changes start token".to_string(),
+            )),
+        }
+    }
+
+    /// One page of changes from `token`, including removals and trashed
+    /// files. Changes to shared drives themselves are left out. A change
+    /// that is neither removed nor carries file metadata keeps `file`
+    /// `None`; the caller reads the file to learn its state.
+    pub(crate) fn changes_page(&self, token: &str) -> Result<ChangesPage, RemoteError> {
+        if !valid_page_token(token) {
+            return Err(RemoteError::Protocol(format!(
+                "invalid changes page token {token:?}"
+            )));
+        }
+        let url = self.url("/drive/v3/changes");
+        let raw: RawChangesPage = self.run_json("list changes", false, |agent, bearer| {
+            agent
+                .get(&url)
+                .header("Authorization", bearer)
+                .query("pageToken", token)
+                .query("fields", CHANGE_FIELDS)
+                .query("pageSize", "1000")
+                .query("includeRemoved", "true")
+                .query("spaces", "drive")
+                .query("supportsAllDrives", "true")
+                .query("includeItemsFromAllDrives", "true")
+                .call()
+        })?;
+        let mut changes = Vec::with_capacity(raw.changes.len());
+        for change in raw.changes {
+            if change
+                .change_type
+                .as_deref()
+                .is_some_and(|kind| kind != "file")
+            {
+                continue;
+            }
+            let file_id = change.file_id.unwrap_or_default();
+            require_id(&file_id)?;
+            let file = if change.removed { None } else { change.file };
+            if let Some(file) = &file
+                && file.id != file_id
+            {
+                return Err(RemoteError::Protocol(format!(
+                    "change for {file_id} carries the metadata of {}",
+                    file.id
+                )));
+            }
+            changes.push(Change {
+                file_id,
+                removed: change.removed,
+                file,
+            });
+        }
+        let valid = |token: &Option<String>| token.as_deref().is_none_or(valid_page_token);
+        if !valid(&raw.next_page_token)
+            || !valid(&raw.new_start_page_token)
+            || raw.next_page_token.is_some() == raw.new_start_page_token.is_some()
+        {
+            return Err(RemoteError::Protocol(
+                "changes page has no single valid continuation token".to_string(),
+            ));
+        }
+        Ok(ChangesPage {
+            changes,
+            next_page_token: raw.next_page_token,
+            new_start_page_token: raw.new_start_page_token,
+        })
+    }
+
+    /// Moves a file or folder to the Drive bin, where it stays recoverable
+    /// for 30 days. Encrypted replication never removes anything; plain
+    /// sync mirrors a local deletion with it.
     pub(crate) fn trash(&self, id: &str) -> Result<DriveFile, RemoteError> {
         require_id(id)?;
         let url = self.url(&format!("/drive/v3/files/{id}"));
@@ -1282,7 +1872,7 @@ impl GoogleDrive {
         path: &str,
         create: bool,
     ) -> Result<DriveFile, RemoteError> {
-        let mut current = self.get(parent)?;
+        let mut current = self.folder(parent)?;
         if !current.is_folder() {
             return Err(RemoteError::Conflict(format!(
                 "{} is not a folder",
@@ -1323,6 +1913,25 @@ impl GoogleDrive {
     }
 }
 
+/// A `multipart/related` body of JSON metadata and media, with its
+/// content type.
+fn multipart_body(metadata: &[u8], bytes: &[u8]) -> (Vec<u8>, String) {
+    let mut boundary_bytes = [0u8; 16];
+    crate::crypto::fill_random(&mut boundary_bytes);
+    let boundary = format!("zdrive-{}", hex(&boundary_bytes));
+    let mut body = Vec::with_capacity(bytes.len() + metadata.len() + 256);
+    body.extend_from_slice(
+        format!("--{boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n").as_bytes(),
+    );
+    body.extend_from_slice(metadata);
+    body.extend_from_slice(
+        format!("\r\n--{boundary}\r\nContent-Type: application/octet-stream\r\n\r\n").as_bytes(),
+    );
+    body.extend_from_slice(bytes);
+    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+    (body, format!("multipart/related; boundary={boundary}"))
+}
+
 fn copy_counting(reader: &mut dyn Read, writer: &mut File) -> (u64, Option<std::io::Error>) {
     let mut buffer = vec![0u8; 1 << 20];
     let mut total = 0u64;
@@ -1339,6 +1948,16 @@ fn copy_counting(reader: &mut dyn Read, writer: &mut File) -> (u64, Option<std::
             Err(error) => return (total, Some(error)),
         }
     }
+}
+
+/// Queues the transient failures Drive answers under load for the next
+/// listings: throttling, an unavailable backend and a dropped connection.
+#[cfg(test)]
+pub(crate) fn fault_listings(fake: &super::fake::FakeDrive) {
+    use super::fake::{Fault, Op};
+    fake.fault(Op::List, Fault::Status(429, "rateLimitExceeded"));
+    fake.fault(Op::List, Fault::Status(503, "backendError"));
+    fake.fault(Op::List, Fault::Drop);
 }
 
 #[cfg(test)]
@@ -1384,7 +2003,7 @@ mod tests {
         assert_eq!(origin("no-scheme"), None);
     }
 
-    use crate::remote::fake::{FakeDrive, Fault, Op, ROOT_ID};
+    use crate::remote::fake::{FakeDrive, Fault, Op, ROOT_ID, ROOT_REAL_ID};
 
     fn pattern(len: usize) -> Vec<u8> {
         (0..len)
@@ -1424,6 +2043,57 @@ mod tests {
     }
 
     #[test]
+    fn marked_folders_are_created_once_joined_by_marker_and_never_split() {
+        let fake = FakeDrive::start();
+        let drive = fake.client();
+        // An unmarked folder of the same name is not ours to join.
+        fake.insert(ROOT_ID, "ZeroTrust Drive", Some(FOLDER_MIME), b"");
+        let (created, fresh) = drive
+            .find_or_create_marked_folder(STORE_MARKER, "ZeroTrust Drive")
+            .unwrap();
+        assert!(fresh);
+        let stored = fake.file(&created.id).unwrap();
+        assert_eq!(stored.parents, [ROOT_REAL_ID]);
+        assert_eq!(stored.mime, FOLDER_MIME);
+        assert_eq!(
+            stored.app_properties.get(MARKER_KEY).map(String::as_str),
+            Some(STORE_MARKER)
+        );
+
+        // A second install joins the same folder, even after a rename, and
+        // the other mode's marker stays separate.
+        let (joined, fresh) = drive
+            .find_or_create_marked_folder(STORE_MARKER, "Renamed")
+            .unwrap();
+        assert!(!fresh);
+        assert_eq!(joined.id, created.id);
+        let (plain, fresh) = drive
+            .find_or_create_marked_folder(PLAIN_MARKER, "ZeroTrust Drive (plain)")
+            .unwrap();
+        assert!(fresh);
+        assert_ne!(plain.id, created.id);
+
+        // Two marked folders are refused rather than guessed between.
+        let props = BTreeMap::from([(MARKER_KEY.to_string(), STORE_MARKER.to_string())]);
+        let second = drive.generate_ids(1).unwrap().remove(0);
+        drive
+            .create_folder_with(MY_DRIVE, "Other", &second, &props)
+            .unwrap();
+        let error = drive
+            .find_or_create_marked_folder(STORE_MARKER, "ZeroTrust Drive")
+            .unwrap_err();
+        assert!(matches!(error, RemoteError::Conflict(_)), "{error}");
+        assert!(error.to_string().contains(&created.id), "{error}");
+        assert!(error.to_string().contains(&second), "{error}");
+
+        // Markers never reach the query unescaped.
+        assert!(matches!(
+            drive.find_marked_folders("x' or name contains '"),
+            Err(RemoteError::Protocol(_))
+        ));
+    }
+
+    #[test]
     fn ambiguous_create_reconciles_the_committed_file_once() {
         let fake = FakeDrive::start();
         let drive = fake.client();
@@ -1438,6 +2108,51 @@ mod tests {
         assert_eq!(fake.count(Op::Get), 1);
         let other = drive.create_small(ROOT_ID, "a.bin", &id, b"different", &BTreeMap::new());
         assert!(matches!(other, Err(RemoteError::Conflict(_))));
+    }
+
+    #[test]
+    fn a_hidden_my_drive_still_resolves_paths_and_reconciles_creates() {
+        let fake = FakeDrive::start();
+        fake.hide_my_drive_root(true);
+        let drive = fake.client();
+        assert!(matches!(drive.get(MY_DRIVE), Err(RemoteError::NotFound(_))));
+        let root = drive.folder(MY_DRIVE).unwrap();
+        assert_eq!((root.id.as_str(), root.is_folder()), (MY_DRIVE, true));
+        // Only the alias is answered locally; other ids stay real lookups.
+        assert!(matches!(
+            drive.folder(ROOT_REAL_ID),
+            Err(RemoteError::NotFound(_))
+        ));
+        assert!(matches!(
+            drive.folder("missing"),
+            Err(RemoteError::NotFound(_))
+        ));
+
+        let nested = drive
+            .resolve_folder_path(MY_DRIVE, "tests/enc", true)
+            .unwrap();
+        let found = drive
+            .resolve_folder_path(MY_DRIVE, "/tests/enc/", false)
+            .unwrap();
+        assert_eq!(found.id, nested.id);
+
+        // An uncertain create in My Drive reconciles to the committed folder.
+        let creates = fake.count(Op::CreateFolder);
+        fake.fault(Op::CreateFolder, Fault::CommitThenDrop);
+        let (created, fresh) = drive
+            .find_or_create_marked_folder(STORE_MARKER, "ZeroTrust Drive")
+            .unwrap();
+        assert!(fresh);
+        assert_eq!(fake.file(&created.id).unwrap().parents, [ROOT_REAL_ID]);
+        assert_eq!(fake.count(Op::CreateFolder), creates + 2);
+
+        // The same id committed elsewhere is still a conflict, not My Drive.
+        let id = drive.generate_ids(1).unwrap().remove(0);
+        drive.create_folder(&nested.id, "x", &id).unwrap();
+        assert!(matches!(
+            drive.create_folder(MY_DRIVE, "x", &id),
+            Err(RemoteError::Conflict(_))
+        ));
     }
 
     #[test]
@@ -1688,6 +2403,246 @@ mod tests {
         let props = BTreeMap::from([("heartbeat".to_string(), "42".to_string())]);
         let updated = drive.set_app_properties(&id, &props).unwrap();
         assert_eq!(updated.app_properties, props);
+    }
+
+    #[test]
+    fn content_updates_keep_the_id_and_verify_the_stored_bytes() {
+        let fake = FakeDrive::start();
+        let drive = fake.client().with_upload_sizes(1024, 256 << 10);
+        let (dir, path) = temp_file(b"first");
+        let created = drive.create_file(ROOT_ID, "doc.txt", None, &path).unwrap();
+        assert_eq!(fake.file(&created.id).unwrap().content, b"first");
+        std::fs::write(&path, b"second version").unwrap();
+        let updated = drive.update_content(&created.id, &path).unwrap();
+        assert_eq!(updated.id, created.id);
+        assert_eq!(updated.size(), Some(14));
+        let stored = fake.file(&created.id).unwrap();
+        assert_eq!(stored.content, b"second version");
+        assert_eq!((stored.name.as_str(), stored.version), ("doc.txt", 2));
+        assert_eq!(fake.count(Op::UpdateMedia), 1);
+
+        let large = pattern((1 << 20) + 5);
+        std::fs::write(&path, &large).unwrap();
+        fake.fault(Op::Chunk, Fault::PartialChunk(700));
+        fake.fault(Op::Chunk, Fault::Drop);
+        fake.fault(Op::Chunk, Fault::ExpireSession);
+        let updated = drive.update_content(&created.id, &path).unwrap();
+        assert_eq!(updated.size(), Some(large.len() as u64));
+        assert_eq!(fake.file(&created.id).unwrap().content, large);
+        assert_eq!(fake.count(Op::UpdateSession), 2);
+        assert_eq!(fake.files().len(), 1);
+        assert!(matches!(
+            drive.update_content("missing-id", &path),
+            Err(RemoteError::NotFound(_))
+        ));
+        std::os::unix::fs::symlink(&path, dir.path().join("link")).unwrap();
+        assert!(
+            drive
+                .update_content(&created.id, &dir.path().join("link"))
+                .is_err()
+        );
+        assert_eq!(fake.file(&created.id).unwrap().content, large);
+    }
+
+    #[test]
+    fn creates_under_a_pregenerated_id_are_idempotent() {
+        let fake = FakeDrive::start();
+        let drive = fake.client().with_upload_sizes(1024, 256 << 10);
+        let (_dir, path) = temp_file(b"payload");
+        let id = drive.generate_ids(1).unwrap().remove(0);
+        fake.fault(Op::Multipart, Fault::CommitThenDrop);
+        let created = drive
+            .create_file(ROOT_ID, "a.txt", Some(&id), &path)
+            .unwrap();
+        assert_eq!(created.id, id);
+        let again = drive
+            .create_file(ROOT_ID, "a.txt", Some(&id), &path)
+            .unwrap();
+        assert_eq!(again.id, id);
+        assert_eq!(fake.files().len(), 1);
+
+        let large = pattern((1 << 20) + 9);
+        std::fs::write(&path, &large).unwrap();
+        let id = drive.generate_ids(1).unwrap().remove(0);
+        fake.fault(Op::Chunk, Fault::CommitThenDrop);
+        let created = drive
+            .create_file(ROOT_ID, "b.bin", Some(&id), &path)
+            .unwrap();
+        assert_eq!(fake.file(&created.id).unwrap().content, large);
+        let again = drive
+            .create_file(ROOT_ID, "b.bin", Some(&id), &path)
+            .unwrap();
+        assert_eq!(again.id, id);
+        std::fs::write(&path, b"other").unwrap();
+        assert!(matches!(
+            drive.create_file(ROOT_ID, "b.bin", Some(&id), &path),
+            Err(RemoteError::Conflict(_))
+        ));
+        assert_eq!(fake.files().len(), 2);
+    }
+
+    #[test]
+    fn a_source_changed_mid_upload_never_completes_the_upload() {
+        let fake = FakeDrive::start();
+        let drive = fake.client().with_upload_sizes(1024, 256 << 10);
+        let (_dir, path) = temp_file(b"old");
+        let created = drive
+            .create_file(ROOT_ID, "moving.bin", None, &path)
+            .unwrap();
+        let first = pattern(1 << 20);
+        std::fs::write(&path, &first).unwrap();
+        fake.hold(crate::remote::fake::Hold {
+            op: Op::Chunk,
+            suffix: "moving.bin",
+            skip: 1,
+            commit: false,
+        });
+        let result = std::thread::scope(|scope| {
+            let upload = scope.spawn(|| drive.update_content(&created.id, &path));
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while fake.held() == 0 && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert_eq!(fake.held(), 1);
+            let mut changed = first.clone();
+            changed[(1 << 20) - 1] ^= 0xff;
+            std::thread::sleep(Duration::from_millis(20));
+            std::fs::write(&path, &changed).unwrap();
+            fake.release_held();
+            upload.join().unwrap()
+        });
+        assert!(
+            matches!(&result, Err(RemoteError::Local(message)) if message.contains("changed while uploading")),
+            "{result:?}"
+        );
+        assert_eq!(fake.file(&created.id).unwrap().content, b"old");
+    }
+
+    #[test]
+    fn metadata_updates_rename_and_move_but_never_into_a_descendant() {
+        let fake = FakeDrive::start();
+        let drive = fake.client();
+        let a = fake.insert(ROOT_ID, "a", Some(FOLDER_MIME), b"");
+        let b = fake.insert(&a, "b", Some(FOLDER_MIME), b"");
+        let file = fake.insert(&a, "f.txt", None, b"x");
+        let moved = drive
+            .update_metadata(&file, Some("g.txt"), Some(&b), Some(&a))
+            .unwrap();
+        assert_eq!(moved.name, "g.txt");
+        assert_eq!(moved.parents, vec![b.clone()]);
+        let renamed = drive
+            .update_metadata(&file, Some("h.txt"), None, None)
+            .unwrap();
+        assert_eq!(
+            (renamed.name.as_str(), renamed.parents.clone()),
+            ("h.txt", vec![b.clone()])
+        );
+        assert!(
+            drive
+                .update_metadata(&a, None, Some(&b), Some(ROOT_ID))
+                .is_err()
+        );
+        assert!(drive.update_metadata(&file, Some(""), None, None).is_err());
+        assert_eq!(
+            fake.file(&a).unwrap().parents,
+            vec![ROOT_REAL_ID.to_string()]
+        );
+    }
+
+    #[test]
+    fn the_changes_feed_pages_through_every_change_once_per_file() {
+        let fake = FakeDrive::start();
+        let drive = fake.client();
+        let start = drive.changes_start_token().unwrap();
+        let folder = fake.insert(ROOT_ID, "dir", Some(FOLDER_MIME), b"");
+        let kept = fake.insert(&folder, "kept.txt", None, b"1");
+        fake.update_foreign(&kept, b"22");
+        fake.rename_foreign(&kept, "renamed.txt");
+        let binned = fake.insert(&folder, "binned.txt", None, b"3");
+        let (_dir, path) = temp_file(b"4");
+        let doomed = drive
+            .create_file(&folder, "doomed.txt", None, &path)
+            .unwrap();
+        drive.trash(&binned).unwrap();
+        fake.delete_foreign(&doomed.id);
+        fake.set_page_size(2);
+        let mut token = start;
+        let mut changes = Vec::new();
+        let next_start = loop {
+            let page = drive.changes_page(&token).unwrap();
+            assert!(page.changes.len() <= 2);
+            changes.extend(page.changes);
+            match (page.next_page_token, page.new_start_page_token) {
+                (Some(next), None) => token = next,
+                (None, Some(start)) => break start,
+                other => panic!("bad continuation {other:?}"),
+            }
+        };
+        let ids: Vec<&str> = changes
+            .iter()
+            .map(|change| change.file_id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                folder.as_str(),
+                kept.as_str(),
+                binned.as_str(),
+                doomed.id.as_str()
+            ]
+        );
+        let kept_change = changes[1].file.as_ref().unwrap();
+        assert_eq!(kept_change.name, "renamed.txt");
+        assert_eq!(kept_change.size(), Some(2));
+        assert_eq!(kept_change.version.as_deref(), Some("3"));
+        assert!(kept_change.modified_time.is_some());
+        assert!(changes[2].file.as_ref().unwrap().trashed);
+        assert!(changes[3].removed && changes[3].file.is_none());
+        let names: Vec<String> = drive
+            .list(&folder, false)
+            .unwrap()
+            .into_iter()
+            .map(|file| file.name)
+            .collect();
+        assert_eq!(names, vec!["renamed.txt".to_string()]);
+        let idle = drive.changes_page(&next_start).unwrap();
+        assert!(idle.changes.is_empty());
+        assert_eq!(idle.new_start_page_token, Some(next_start));
+        assert!(drive.changes_page("").is_err());
+        assert!(drive.changes_page("not a token").is_err());
+    }
+
+    #[test]
+    fn every_operation_label_has_its_telemetry_class() {
+        let source = include_str!("gdrive.rs");
+        let code = &source[..source.find("\nmod tests {").expect("test module")];
+        let expected = [
+            ("read account", RequestClass::About),
+            ("read file metadata", RequestClass::Get),
+            ("list folder", RequestClass::List),
+            ("find marked folders", RequestClass::List),
+            ("generate file ids", RequestClass::Other),
+            ("create folder", RequestClass::Create),
+            ("upload file", RequestClass::Upload),
+            ("start resumable upload", RequestClass::Upload),
+            ("query resumable upload", RequestClass::Upload),
+            ("upload chunk", RequestClass::Upload),
+            ("download range", RequestClass::Download),
+            ("download file", RequestClass::Download),
+            ("update file properties", RequestClass::Update),
+            ("update file content", RequestClass::Upload),
+            ("update file metadata", RequestClass::Update),
+            ("read changes start token", RequestClass::Changes),
+            ("list changes", RequestClass::Changes),
+            ("move to the bin", RequestClass::Trash),
+        ];
+        for (label, class) in expected {
+            assert!(
+                code.contains(&format!("\"{label}\"")),
+                "{label:?} is no longer an operation label"
+            );
+            assert_eq!(request_class(label), class, "{label:?}");
+        }
     }
 
     #[test]

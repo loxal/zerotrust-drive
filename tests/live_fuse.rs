@@ -81,6 +81,10 @@ struct Mounted {
 
 impl Mounted {
     fn start(drive: &Drive, label: &str) -> Self {
+        Self::start_with(drive, label, &[])
+    }
+
+    fn start_with(drive: &Drive, label: &str, extra_args: &[&str]) -> Self {
         let log = drive.root.join(format!("{label}.log"));
         let log_file = File::create(&log).expect("create process log");
         let child = Command::new(env!("CARGO_BIN_EXE_zerotrust-drive"))
@@ -88,6 +92,7 @@ impl Mounted {
             .arg(&drive.store)
             .arg("--decrypted-dir")
             .arg(&drive.mountpoint)
+            .args(extra_args)
             .env("ZEROTRUST_PASSPHRASE", PASSPHRASE)
             .env_remove("ZEROTRUST_NEW_PASSPHRASE")
             .stdin(Stdio::null())
@@ -168,12 +173,17 @@ impl Mounted {
     }
 
     /// Stop the process gracefully and require a clean, flushed exit.
-    fn stop(mut self, signal: libc::c_int) {
+    fn stop(self, signal: libc::c_int) {
         self.signal(signal);
+        self.expect_clean_exit(&format!("signal {signal}"));
+    }
+
+    /// Require a clean, flushed exit without sending anything more.
+    fn expect_clean_exit(mut self, after: &str) {
         let status = self.wait_exit();
         assert!(
             status.success(),
-            "expected a clean exit after signal {signal}, got {status}; log:\n{}",
+            "expected a clean exit after {after}, got {status}; log:\n{}",
             self.log()
         );
         assert!(
@@ -346,6 +356,47 @@ fn busy_mount_keeps_serving_until_files_are_closed() {
 
     drop(open_file);
     mounted.stop(libc::SIGINT);
+
+    let remounted = Mounted::start(&drive, "second");
+    assert_files(&drive.mountpoint, &files);
+    remounted.stop(libc::SIGTERM);
+}
+
+/// systemd and launchd send one stop signal and then wait, so a service must
+/// finish a refused unmount by itself once the drive is no longer busy.
+#[test]
+#[ignore = "mounts a real FUSE filesystem; set ZDRIVE_RUN_LIVE_FUSE_TESTS=1"]
+fn a_service_unmounts_a_busy_drive_once_files_close_without_another_signal() {
+    if !opted_in() {
+        return;
+    }
+    let drive = Drive::new("service-busy");
+    let files = sample_files("service-busy");
+
+    let mut mounted = Mounted::start_with(&drive, "first", &["--service", "--telemetry", "off"]);
+    write_files(&drive.mountpoint, &files);
+    let (busy_path, busy_content) = &files[1];
+    let mut open_file = File::open(drive.mountpoint.join(busy_path)).expect("open through mount");
+
+    mounted.signal(libc::SIGTERM);
+    mounted.wait_for_log("retries the unmount every second");
+    assert!(mounted.running(), "a busy service mount must keep serving");
+    assert!(
+        is_mounted(&drive.mountpoint),
+        "a busy service mount must stay mounted"
+    );
+    let mut served = Vec::new();
+    open_file
+        .read_to_end(&mut served)
+        .expect("read through the still-mounted drive");
+    assert!(served == *busy_content, "busy mount served different bytes");
+
+    drop(open_file);
+    let log = mounted.log.clone();
+    mounted.expect_clean_exit("the file closed, with no second signal");
+    let log = fs::read_to_string(log).expect("read process log");
+    assert!(log.contains("unmounted after"), "log:\n{log}");
+    assert!(!log.contains("press Ctrl+C"), "log:\n{log}");
 
     let remounted = Mounted::start(&drive, "second");
     assert_files(&drive.mountpoint, &files);
