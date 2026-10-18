@@ -1043,7 +1043,7 @@ fn main() {
             .revalidate()
             .unwrap_or_else(|e| exit_with_error(e));
 
-        let mount_result = serve(ztfs, &mountpoint);
+        let mount_result = serve(ztfs, &mountpoint, false);
         if !rekey_worker.is_finished() {
             eprintln!(
                 "zerotrust-drive: unmounted; waiting for the passphrase rotation to finish (Ctrl+C stops it, --continue-rekey resumes it)"
@@ -1108,7 +1108,7 @@ fn main() {
     });
     eprintln!("zerotrust-drive: press Ctrl+C to unmount and flush");
 
-    serve(ztfs, &mountpoint)
+    serve(ztfs, &mountpoint, replicator.is_some())
         .unwrap_or_else(|e| exit_with_error(format!("failed to mount filesystem: {e}")));
     let Some(replicator) = replicator.as_mut() else {
         exit_unless_persisted(&inner);
@@ -1129,14 +1129,37 @@ fn main() {
     std::process::exit(status);
 }
 
-/// Mount and serve until the filesystem is unmounted, by a signal or
-/// externally. `destroy` has flushed pending state when this returns.
-fn serve(filesystem: fs::ZeroTrustFs, mountpoint: &Path) -> std::io::Result<()> {
-    let mut config = Config::default();
-    config.mount_options = vec![
+/// Finder name of the mounted volume.
+fn volume_name(remote: bool) -> &'static str {
+    if remote {
+        "ZeroTrust Drive - Google Drive"
+    } else {
+        "ZeroTrust Drive"
+    }
+}
+
+fn mount_options(remote: bool) -> Vec<MountOption> {
+    let mut options = vec![
         MountOption::RW,
         MountOption::FSName("zerotrust-drive".to_string()),
     ];
+    // macFUSE's mount helper parses `volname=` exactly like `fsname=`
+    // (both are kernel options in lib/mount_darwin.c). Linux pure-Rust
+    // mounts would pass an unknown option to the kernel, so stay macOS-only.
+    if cfg!(target_os = "macos") {
+        options.push(MountOption::CUSTOM(format!(
+            "volname={}",
+            volume_name(remote)
+        )));
+    }
+    options
+}
+
+/// Mount and serve until the filesystem is unmounted, by a signal or
+/// externally. `destroy` has flushed pending state when this returns.
+fn serve(filesystem: fs::ZeroTrustFs, mountpoint: &Path, remote: bool) -> std::io::Result<()> {
+    let mut config = Config::default();
+    config.mount_options = mount_options(remote);
     let session = fuser::Session::new(filesystem, mountpoint, &config)?;
     shutdown::mounted(mountpoint);
     let result = session.run();
@@ -1197,6 +1220,28 @@ mod main_tests {
         assert!(insecure_new_store_passphrase(DEMO_PASSPHRASE));
         assert!(insecure_new_store_passphrase(""));
         assert!(!insecure_new_store_passphrase("a-real-secret"));
+    }
+
+    #[test]
+    fn mount_options_name_the_volume_only_on_macos() {
+        for remote in [false, true] {
+            let options = mount_options(remote);
+            assert_eq!(
+                options[..2],
+                [
+                    MountOption::RW,
+                    MountOption::FSName("zerotrust-drive".to_string())
+                ]
+            );
+            let volname = format!("volname={}", volume_name(remote));
+            // A comma would split the value into another mount option.
+            assert!(!volname.contains(','));
+            let expected = cfg!(target_os = "macos").then(|| MountOption::CUSTOM(volname));
+            assert_eq!(options.get(2), expected.as_ref());
+            assert_eq!(options.len(), 2 + usize::from(expected.is_some()));
+        }
+        assert_eq!(volume_name(false), "ZeroTrust Drive");
+        assert_eq!(volume_name(true), "ZeroTrust Drive - Google Drive");
     }
 
     #[test]

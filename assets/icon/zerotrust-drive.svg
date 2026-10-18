@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- SPDX-FileCopyrightText: Copyright 2026 Alexander Orlov <info@lifub.com> -->
+<!-- ZeroTrust Drive: a locked folder with a generic cloud badge, Ayu Mirage palette. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <title>ZeroTrust Drive</title>
+  <defs>
+    <linearGradient id="front" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#7DBBFF"/>
+      <stop offset="1" stop-color="#57A6FF"/>
+    </linearGradient>
+  </defs>
+  <path fill="#3385DB" d="M160 196H392Q420 196 438 216L476 256H864Q912 256 912 304V780Q912 828 864 828H160Q112 828 112 780V244Q112 196 160 196Z"/>
+  <rect fill="url(#front)" x="112" y="320" width="800" height="508" rx="48"/>
+  <path fill="none" stroke="#FFC96B" stroke-width="44" stroke-linecap="round" d="M422 520V450A90 90 0 0 1 602 450V520"/>
+  <rect fill="#20242F" x="372" y="508" width="280" height="232" rx="36"/>
+  <circle fill="#FFC96B" cx="512" cy="600" r="30"/>
+  <rect fill="#FFC96B" x="499" y="610" width="26" height="72" rx="12"/>
+  <circle fill="#20242F" stroke="#2A2F3D" stroke-width="16" cx="800" cy="780" r="140"/>
+  <g fill="#6AE0FC">
+    <rect x="714" y="790" width="176" height="64" rx="32"/>
+    <circle cx="764" cy="800" r="44"/>
+    <circle cx="822" cy="776" r="58"/>
+    <circle cx="862" cy="816" r="38"/>
+  </g>
+</svg>

@@ -92,6 +92,23 @@ release-all: release-macos release-linux
     @echo "all supported platforms built in target/dist/"
     @ls -lh target/dist/zdrive-*
 
+# Rebuild the committed macOS icon from its SVG source (needs rsvg-convert
+# from librsvg and the iconutil that ships with macOS).
+icons:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    work=$(mktemp -d)
+    trap 'rm -rf "$work"' EXIT
+    set="$work/zerotrust-drive.iconset"
+    mkdir "$set"
+    for size in 16 32 128 256 512; do
+        rsvg-convert -w "$size" -h "$size" assets/icon/zerotrust-drive.svg -o "$set/icon_${size}x${size}.png"
+        double=$((size * 2))
+        rsvg-convert -w "$double" -h "$double" assets/icon/zerotrust-drive.svg -o "$set/icon_${size}x${size}@2x.png"
+    done
+    iconutil -c icns "$set" -o assets/icon/zerotrust-drive.icns
+    echo "built: assets/icon/zerotrust-drive.icns"
+
 # Build artifacts only: the encrypted store and the mount point hold real data.
 clean:
     cargo clean
