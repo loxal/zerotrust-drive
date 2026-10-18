@@ -140,22 +140,76 @@ jobs:
   release-linux:
     needs: [test, durability-ext4, durability-apfs]
     if: startsWith(github.ref, 'refs/tags/v')
-    # Pinned: the build host's glibc is the oldest the artifact runs on, and
-    # ubuntu-latest moving to a newer release would raise it silently.
-    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            arch: x86_64
+            deb_arch: amd64
+          - runner: ubuntu-22.04-arm
+            arch: aarch64
+            deb_arch: arm64
+    # Pinned: the build host's glibc is the oldest the artifacts run on.
+    # Ubuntu 22.04 (glibc 2.35) covers Debian 12 and Ubuntu 22.04 through
+    # 26.04; ubuntu-latest moving to a newer release would raise it silently.
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
-      - name: Install FUSE
-        run: sudo apt-get update && sudo apt-get install -y libfuse3-dev fuse3
+      # fuser mounts through its pure-Rust path and fusermount3, so the build
+      # needs no libfuse3-dev; dpkg-dev provides dpkg-shlibdeps.
+      - name: Install packaging tools
+        run: sudo apt-get update && sudo apt-get install -y dpkg-dev
+      - name: Check tag against the crate version
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          crate_version="$(cargo metadata --locked --no-deps --format-version 1 | python3 -c 'import json, sys; print(json.load(sys.stdin)["packages"][0]["version"])')"
+          if [ "$version" != "$crate_version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $crate_version"
+            exit 1
+          fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
       - name: Build release
+        env:
+          ZDRIVE_GOOGLE_DESKTOP_CLIENT_ID: ${{ secrets.ZDRIVE_GOOGLE_DESKTOP_CLIENT_ID }}
+          ZDRIVE_GOOGLE_DESKTOP_CLIENT_SECRET: ${{ secrets.ZDRIVE_GOOGLE_DESKTOP_CLIENT_SECRET }}
+          ZDRIVE_GOOGLE_DEVICE_CLIENT_ID: ${{ secrets.ZDRIVE_GOOGLE_DEVICE_CLIENT_ID }}
+          ZDRIVE_GOOGLE_DEVICE_CLIENT_SECRET: ${{ secrets.ZDRIVE_GOOGLE_DEVICE_CLIENT_SECRET }}
         run: cargo build --release --locked
-      - name: Prepare artifact
-        run: cp target/release/zerotrust-drive zdrive-linux-x86_64
+      - name: Prepare artifacts
+        run: |
+          mkdir dist
+          cp target/release/zerotrust-drive "dist/zdrive-linux-${{ matrix.arch }}"
+          packaging/linux/build-tarball.sh "$VERSION" "${{ matrix.arch }}" target/release/zerotrust-drive dist
+          packaging/deb/build-deb.sh "$VERSION" "${{ matrix.deb_arch }}" target/release/zerotrust-drive dist
+          ls -l dist
+      - name: Prove the bundled Google OAuth clients
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: packaging/check-bundled-clients.sh "dist/zdrive-linux-${{ matrix.arch }}"
+      - name: Inspect the .deb
+        run: |
+          deb="dist/zerotrust-drive_${VERSION}_${{ matrix.deb_arch }}.deb"
+          dpkg -I "$deb"
+          dpkg -c "$deb"
+      - name: Install the .deb and check its version
+        run: |
+          sudo apt-get install -y "./dist/zerotrust-drive_${VERSION}_${{ matrix.deb_arch }}.deb"
+          dpkg-query -W -f '${Package} ${Version} ${Status}\n' zerotrust-drive fuse3
+          installed="$(/usr/bin/zdrive --version)"
+          echo "$installed"
+          if [ "${installed##* }" != "$VERSION" ]; then
+            echo "::error::installed zdrive reports '$installed', expected version $VERSION"
+            exit 1
+          fi
+      - name: Smoke-test the installed zdrive through FUSE
+        timeout-minutes: 5
+        run: packaging/linux/smoke-test.sh /usr/bin/zdrive "$RUNNER_TEMP/zdrive-smoke"
       - uses: actions/upload-artifact@v7
         with:
-          name: zdrive-linux-x86_64
-          path: zdrive-linux-x86_64
+          name: zdrive-linux-${{ matrix.arch }}
+          path: dist/
+          if-no-files-found: error
 
   release-macos:
     needs: [test, durability-ext4, durability-apfs]
@@ -167,13 +221,24 @@ jobs:
       - name: Install macFUSE
         run: brew install macfuse
       - name: Build release
+        env:
+          ZDRIVE_GOOGLE_DESKTOP_CLIENT_ID: ${{ secrets.ZDRIVE_GOOGLE_DESKTOP_CLIENT_ID }}
+          ZDRIVE_GOOGLE_DESKTOP_CLIENT_SECRET: ${{ secrets.ZDRIVE_GOOGLE_DESKTOP_CLIENT_SECRET }}
+          ZDRIVE_GOOGLE_DEVICE_CLIENT_ID: ${{ secrets.ZDRIVE_GOOGLE_DEVICE_CLIENT_ID }}
+          ZDRIVE_GOOGLE_DEVICE_CLIENT_SECRET: ${{ secrets.ZDRIVE_GOOGLE_DEVICE_CLIENT_SECRET }}
         run: cargo build --release --locked
       - name: Prepare artifact
-        run: cp target/release/zerotrust-drive zdrive-macos-aarch64
+        run: |
+          mkdir dist
+          cp target/release/zerotrust-drive dist/zdrive-macos-aarch64
+      - name: Prove the bundled Google OAuth clients
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: packaging/check-bundled-clients.sh dist/zdrive-macos-aarch64
       - uses: actions/upload-artifact@v7
         with:
           name: zdrive-macos-aarch64
-          path: zdrive-macos-aarch64
+          path: dist/
+          if-no-files-found: error
 
   publish-release:
     needs: [release-linux, release-macos]
@@ -184,15 +249,38 @@ jobs:
     steps:
       - uses: actions/download-artifact@v8
         with:
-          name: zdrive-linux-x86_64
-      - uses: actions/download-artifact@v8
-        with:
-          name: zdrive-macos-aarch64
+          pattern: zdrive-*
+          path: dist
+          merge-multiple: true
+      - name: Check the asset set and write SHA256SUMS
+        working-directory: dist
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          expected="$(printf '%s\n' \
+            zdrive-linux-x86_64 \
+            zdrive-linux-aarch64 \
+            zdrive-macos-aarch64 \
+            "zdrive-${version}-linux-x86_64.tar.gz" \
+            "zdrive-${version}-linux-aarch64.tar.gz" \
+            "zerotrust-drive_${version}_amd64.deb" \
+            "zerotrust-drive_${version}_arm64.deb" | LC_ALL=C sort)"
+          actual="$(find . -mindepth 1 -maxdepth 1 -printf '%f\n' | LC_ALL=C sort)"
+          if [ "$actual" != "$expected" ]; then
+            echo "::error::release assets differ from the expected set"
+            diff <(printf '%s\n' "$expected") <(printf '%s\n' "$actual") || true
+            exit 1
+          fi
+          printf '%s\n' "$expected" | xargs sha256sum -- > SHA256SUMS
+          cat SHA256SUMS
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
         with:
           generate_release_notes: true
           prerelease: true
           files: |
-            zdrive-linux-x86_64
-            zdrive-macos-aarch64
+            dist/zdrive-linux-x86_64
+            dist/zdrive-linux-aarch64
+            dist/zdrive-macos-aarch64
+            dist/zdrive-*-linux-*.tar.gz
+            dist/zerotrust-drive_*.deb
+            dist/SHA256SUMS
