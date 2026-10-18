@@ -2,6 +2,8 @@
 
 # ZeroTrust Drive
 
+<img src="assets/icon/zerotrust-drive.svg" width="96" alt="ZeroTrust Drive icon: a locked folder">
+
 FUSE-based encrypted overlay filesystem. You work with decrypted files in the mount directory
 while all data is stored encrypted at rest with XChaCha20-Poly1305 AEAD encryption, under a key
 derived from your passphrase with Argon2id (the `.age` file extension is a naming convention -
@@ -21,6 +23,8 @@ and every data object are unreadable.
 
 Point `--encrypted-dir` at a fully local cloud-sync folder and its provider handles replication
 of the ciphertext. Placeholder/on-demand storage is not a safe backing filesystem for this tool.
+For Google Drive, `zdrive` can instead replicate a store outside any synced folder through the
+Drive API itself; see [Native Google Drive API sync](#native-google-drive-api-sync).
 
 V2 does not buffer complete open files. Read, write, and flush memory are bounded independently of
 logical file size: a bounded read decrypts at most one fixed-size chunk at a time in addition to
@@ -54,7 +58,12 @@ root as transaction evidence; the first generation is published with atomic no-r
 
 ### Cloud backend guidance
 
-The primary recommended beta backing target is a dedicated folder in Google Drive `My Drive`, with Google
+For a new store on Google Drive, prefer [native Google Drive API sync](#native-google-drive-api-sync)
+(beta since 0.17.0): it uploads a generation only after every object it needs, which Drive for
+desktop does not guarantee, and it also runs on Linux. The folder-sync guidance below applies when
+a desktop client replicates the encrypted folder.
+
+For folder sync, the primary recommended beta backing target is a dedicated folder in Google Drive `My Drive`, with Google
 Drive for desktop configured to **Mirror files**. Mirror mode keeps ordinary local files and
 best matches the POSIX `fsync` and atomic-rename behavior used here. Do not use Google Drive
 Stream mode or a Shared Drive as the backing store.
@@ -265,6 +274,161 @@ remaining interval can leave an incompatible canonical KDF beside preserved conf
 Do not delete either side automatically.
 Back up `_kdf.json` separately with the encrypted store. Its salt is not secret, but losing or
 corrupting this single file makes every ciphertext undecryptable even with the correct passphrase.
+
+### Native Google Drive API sync
+
+Since 0.17.0 `zdrive` can replicate a v2 store to Google Drive through the Drive REST API itself, as
+rclone does for its encrypted remotes, instead of leaving the upload to Drive for desktop. The
+store stays a complete local directory, outside every folder a desktop client syncs, on each
+computer that uses it. `zdrive` uploads the objects it has already encrypted and authenticated, so
+Google only ever receives ciphertext. This mode also works on Linux, which has no Google desktop
+client. It is beta in 0.17.0.
+
+Drive for desktop uploads changed files in its own order. In eight of the nine benchmark runs
+below it made a new `_root.age` visible on Drive while objects that root needs were still
+missing: for 24-31 seconds with up to 261 missing objects after writing a 1 GiB file, for 86-89
+seconds with up to 654 missing after 200 small edits, and in two of three runs with 2,000 small
+files for 504-510 seconds with up to 6,003 missing. A computer that synchronized during such a
+window would receive a store it cannot open.
+API mode creates a root record only after every object that root needs has been uploaded and
+verified, so Drive always holds a complete generation.
+
+#### Setup
+
+1. Create your own OAuth client; `zdrive` deliberately ships none:
+   - In the Google Cloud console, create a project and enable the Google Drive API.
+   - Configure the OAuth consent screen as **External** and **publish it to production**. An app
+     left in "Testing" receives refresh tokens that expire after seven days.
+   - Create an OAuth client of type **Desktop app**, download its JSON, and save it as
+     `~/.config/zerotrust-drive/google-oauth-client.json` with mode `0600`.
+
+   `zdrive` requests the full `drive` scope, so that a remote can live in a folder created by
+   something else, such as a Computers folder of Drive for desktop. Google therefore shows an
+   "unverified app" warning at consent; for your own client that is expected.
+2. Authorize a named remote and choose its folder:
+
+       zdrive remote auth --remote gdrive --folder-path zerotrust-drive
+
+   This opens the browser (`open` on macOS, `xdg-open` on Linux) and receives Google's answer on a
+   loopback address, with PKCE and a `state` check. On a headless host, `--no-browser` prints the
+   address and reads the redirected address back. `--folder-path` is a slash-separated path below
+   My Drive or below `--folder-id ID`; missing folders are created and duplicate names are refused.
+   `--client-file FILE` selects another client JSON.
+
+   The prompt asks for the store passphrase: it seals the refresh token with XChaCha20-Poly1305
+   under an Argon2id key in `~/.config/zerotrust-drive/remotes/gdrive.json` (mode `0600`). Remote
+   commands never accept the built-in demo passphrase or an empty one. After a rekey, run
+   `zdrive remote auth` again.
+
+#### Mounting with automatic sync
+
+Keep the store out of synced folders, then mount it with `--remote`:
+
+    zdrive --remote gdrive --encrypted-dir ~/zerotrust.drive.encrypted --decrypted-dir ~/z.drive
+
+- Before mounting, `zdrive` fast-forwards the store to the remote head. On a new computer an absent
+  or empty `--encrypted-dir` becomes a replica of the remote store; with an empty remote folder a
+  new store is created there. Diverged histories are refused before anything is mounted.
+- If Google Drive is unreachable, the drive mounts offline after a few seconds and uploads once
+  Drive is reachable again.
+- Every commit is uploaded shortly after it is durable locally. Bursts coalesce: intermediate
+  generations travel as objects, and only the newest root record is written.
+- Every 60 seconds the mount checks whether another replica has published. If one has, this mount
+  latches read-only and explains how to recover; both histories stay preserved.
+- A mounted replica refreshes an advisory lease every two minutes. Another replica's lease that was
+  refreshed within ten minutes makes a new mount read-only.
+- On unmount (Ctrl+C, SIGTERM or SIGHUP) the drive first flushes locally as before, then waits up to
+  ten minutes for the final upload; another signal stops waiting. It exits with status 0 when
+  Drive holds the final generation, and with status **75** when it does not. Local data is durable
+  in both cases, and the message names the exact `zdrive remote push` command that finishes the
+  upload.
+- On macOS the volume is named "ZeroTrust Drive - Google Drive" ("ZeroTrust Drive" without
+  `--remote`). `assets/icon/zerotrust-drive.icns` can be pasted onto a folder in Finder's Get Info
+  window; the mounted volume keeps the macFUSE icon.
+
+#### Explicit commands
+
+    zdrive remote push   --remote gdrive --encrypted-dir DIR   # upload the local head and its objects
+    zdrive remote pull   --remote gdrive --encrypted-dir DIR   # fast-forward; an empty DIR becomes a replica
+    zdrive remote status --remote gdrive --encrypted-dir DIR   # compare heads without changing either
+    zdrive remote verify --remote gdrive --encrypted-dir DIR   # audit the remote copy; --full downloads every pack
+
+`push` and `pull` take the store's transaction lock, so they refuse a mounted store; a mount with
+`--remote` already does both. `status` reports one of: in sync, local ahead (push), remote ahead
+(pull), no remote store, remote store without a generation, a different store (other key
+material), DIVERGED or FORKED, and exits with status 1 for the last three. A push resumes
+interrupted uploads, including a resumable upload session that a killed process had begun.
+
+#### Remote layout
+
+Inside the chosen Drive folder:
+
+    zdrive-remote.json             plaintext marker: remote format, store format, creating version
+    _kdf.json                      exact copy of the store's non-secret KDF parameters
+    packs/<id>.zpk                 encrypted .z2 objects concatenated into packs of about 64 MiB
+    roots/<generation>-<id>.zr     exact bytes of each uploaded _root.age
+    leases/                        advisory leases of mounted replicas, named by random replica ids
+
+Files are created once under an id reserved in advance, so a retried upload cannot create a
+duplicate, and they are never overwritten or deleted. Drive offers no conditional update, so a
+push lists `roots/` first and refuses when Drive's head is not the generation this replica last
+synchronized; two different records for one generation are a fork that every command refuses to
+touch. A pull authenticates the root, requires the local head to be its ancestor, and installs
+only objects that root reaches, each checked against its authenticated digest. Per-replica sync
+state lives in `$XDG_STATE_HOME/zerotrust-drive/remotes/<name>/` (default `~/.local/state`), never
+inside the store.
+
+#### What Google sees
+
+Google stores ciphertext, the non-secret KDF parameters, the number and sizes of packs, the
+generation numbers in root-record names, upload times, lease heartbeat times, and the OAuth
+client that uploaded them. It never receives a passphrase, a key, a file name, or plaintext
+content. Anyone holding the Google account can still delete or roll back the remote copy, so
+keep an independent backup.
+
+#### Benchmark
+
+Same encrypted stores, same Google account and the same home Internet connection, on an M3 Max
+(14 cores, 36 GB RAM). The workloads were generated through
+`ZeroTrustFs` without a kernel mount; each arm received byte-identical work. Drive for desktop
+mirrored a folder in its normal Mirror configuration; `zdrive` pushed through the API. Times run
+from local durability to the moment Drive held what another computer needs to open the final
+generation: its root, the key material and every object. For `zdrive` that moment is the
+creation and verification of the root record. For Drive for desktop it comes from listing the
+folder through the API every two seconds, or as fast as a listing completes (about four seconds
+for 6,006 files), until those files matched by size and MD5, so its times may be up to one
+listing too long. Medians of three runs, alternating which arm went first:
+
+| Workload | Store files | `zdrive` push | Drive for desktop | Native broken-root window |
+|---|---|---|---|---|
+| W1: one 1 GiB file | 264 | 35.6 s (21 Drive files) | 39.6 s | 24-31 s in every run, up to 261 objects missing |
+| W2: 2,000 files of 4-64 KiB | 6,006 | 13.6 s (5 Drive files) | 528 s | 504-510 s in two of three runs, up to 6,003 objects missing |
+| W3: 200 fsync'd edits to a 64 MiB file | 1,624 | 15.6 s (25 Drive files) | 119 s | 86-89 s in every run, up to 654 objects missing |
+
+The W1 runs ranged 35.3-36.3 s for `zdrive` and 39.5-41.6 s for Drive for desktop. For W3 the
+clock starts at the last edit's fsync; both arms uploaded while the edits ran. Drive for desktop
+also uploads the store's local evidence files, which `zdrive` does not replicate because a
+replica does not need them. In four of seven W3 runs, counting an earlier series, it still
+lacked one or two files of the store when observation ended after 10-20 minutes; each one
+identified was an evidence file. A fresh pull of W1 onto an empty directory took 30 s (median);
+of W2, 38 s, which is bounded by one file and directory sync per installed object. Requests were
+not counted. The harness is
+`src/remote/bench_tests.rs`; it needs a configured remote and runs only when asked.
+
+#### Limits
+
+- Drive keeps every pack and root record: there is no remote garbage collection yet, so the Drive
+  footprint grows with every change, like the local store.
+- A pull downloads the missing packs before installing their objects, so it temporarily needs
+  about twice the missing data in free disk space.
+- MD5 only proves the transfer. Corruption on Drive behind a correct MD5 is caught when a pull
+  authenticates the objects, or by `zdrive remote verify --full`.
+- Leases depend on clocks and on Drive listings, which may lag; they are skipped offline. Two
+  computers mounted offline can therefore diverge. The second to push is refused and keeps its
+  history; nothing is merged automatically. Use one active mount.
+- If two computers create the remote store at the same moment, the store whose marker has the
+  smaller id wins and the other is refused.
+- v1 stores are refused; run `--migrate-v2` first.
 
 ### Prerequisites
 

@@ -6,7 +6,8 @@
 
 FUSE-based encrypted overlay filesystem. Files are stored encrypted at rest using
 XChaCha20-Poly1305 AEAD with keys derived via Argon2id. Point `--encrypted-dir` at a
-Google Drive sync folder for transparent cloud backup of encrypted content.
+Google Drive sync folder for transparent cloud backup of encrypted content, or keep it
+local and let `--remote` / `zdrive remote` replicate the ciphertext through the Drive API.
 
 ## Build & Run
 
@@ -17,9 +18,13 @@ just mount-release          # Mount using installed binary
 just umount                 # Unmount (Ctrl+C in the mounting terminal also unmounts and flushes)
 just rekey                  # Rotate a v1 passphrase (prompts, or ZEROTRUST_NEW_PASSPHRASE)
 just clean                  # cargo clean only; never touches the store or mount point
-cargo test                  # Run tests
+just icons                  # rebuild assets/icon/zerotrust-drive.icns from its SVG (rsvg-convert + iconutil)
+cargo test                  # Run tests (hermetic: the Drive API tests use an in-process fake server)
 # Live kernel-mounted signal/busy-unmount tests (Linux, needs fuse3):
 ZDRIVE_RUN_LIVE_FUSE_TESTS=1 cargo test --locked --test live_fuse -- --ignored --test-threads=1
+# Live Google Drive tests and the Drive-for-desktop benchmark (local only, need a configured
+# remote; see the module docs of src/remote/live_tests.rs and src/remote/bench_tests.rs):
+ZDRIVE_RUN_GDRIVE_TESTS=1 ZDRIVE_GDRIVE_REMOTE=NAME cargo test --locked remote::cli::live -- --ignored --test-threads=1
 ```
 
 The justfile must never interpolate a passphrase: the binary reads the inherited
@@ -49,8 +54,21 @@ environment or prompts on `/dev/tty`.
 | `src/fault.rs` | Deterministic returned-error and test-only real-process kill injection at durability boundaries |
 | `src/migrate.rs` | Crash-safe v0→v1 on-disk format migration |
 | `src/rekey.rs` | Passphrase re-keying (keeps the drive salt; new passphrase → new key) |
+| `src/remote/mod.rs` | Native Drive API replication of v2 stores: typed `RemoteError`, private config/state file helpers |
+| `src/remote/cli.rs` | `zdrive remote auth\|push\|pull\|status\|verify`; never falls back to the demo passphrase |
+| `src/remote/oauth.rs` | Installed-app OAuth: loopback redirect, PKCE S256, `state` check, `--no-browser` paste-back, token refresh |
+| `src/remote/config.rs` | `~/.config/zerotrust-drive/remotes/<name>.json`; refresh token sealed under an Argon2id key from the store passphrase |
+| `src/remote/gdrive.rs` | Blocking `ureq` Drive v3 client: GCRA pacer, jittered backoff, pre-generated ids, resumable uploads, md5 checks |
+| `src/remote/format.rs` | Remote layout: marker, `_kdf.json` copy, append-only `packs/*.zpk`, `roots/*.zr`, `leases/` |
+| `src/remote/sync.rs` | Checkpointed push (packs first, root record last, fork/writer refusal), fast-forward pull, status, verify |
+| `src/remote/state.rs` | Per-replica sync state and resumable upload sessions under `~/.local/state/zerotrust-drive/` |
+| `src/remote/mount.rs` | `--remote` mount: catch-up pull, replicator thread, 60 s remote-head watcher, read-only latch, final push (exit 75) |
+| `src/remote/lease.rs` | Advisory writer leases (random replica id, heartbeat); fork detection stays the guarantee |
+| `src/remote/fake.rs` | In-process fake Drive server with fault injection for the hermetic suite |
+| `src/remote/crash_tests.rs` | Subprocess SIGKILL matrix at every push and pull checkpoint |
 | `tests/live_fuse.rs` | Opt-in Linux live-mount tests: signals unmount, flush and exit 0; a busy mount keeps serving |
 | `tests/fixtures/format/` | Committed v1/v2 stores pinning the on-disk format (with KATs in `crypto.rs`) |
+| `assets/icon/` | ZeroTrust Drive icon: SVG source and the committed `.icns` built by `just icons` |
 
 ## Conventions
 

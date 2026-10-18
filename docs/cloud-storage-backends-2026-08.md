@@ -1,10 +1,14 @@
+<!-- SPDX-FileCopyrightText: Copyright 2026 Alexander Orlov <info@lifub.com> -->
+
 # Cloud storage backends for zerotrust-drive
 
-Research date: 2026-08-03
+Research date: 2026-08-03. Updated 2026-10-18 for native Google Drive API replication (0.17.0).
 
 ## Decision
 
 Use a dedicated folder in Google Drive `My Drive`, with Google Drive for desktop configured to **Mirror files**, as the primary recommended beta cloud-backed location.
+
+Since 0.17.0 Google Drive also has a second, client-independent path: keep the store on a local disk outside every synchronized folder and let `zdrive --remote NAME` (while mounted) or `zdrive remote push` replicate it through the Drive REST API. It publishes a generation on Drive only after every object it references is uploaded and verified, which closes the provider-ordering gap described below, and it runs on Linux, where Google ships no desktop client. It is the preferred Google path for a new store; Mirror mode stays supported for existing setups. See [Native Google Drive API replication](#native-google-drive-api-replication).
 
 Offer iCloud Drive as a beta backend on macOS, with the complete store folder marked **Keep Downloaded**.
 
@@ -40,6 +44,8 @@ The v2 format removes that blob/index publication dependency locally. It writes 
 
 Cloud replication can still reorder those already durable files. A second machine may temporarily receive a new `_root.age` before every immutable object it references, or receive objects while retaining the old root. The first state fails closed on missing or incorrectly digested authenticated objects; the second continues to expose the complete old generation. The client does not synthesize missing data, fall back to an unrelated root, or expose a partially materialized generation. Users must wait for provider synchronization to finish and remount after the referenced objects arrive. Cloud sync remains asynchronous replication, not the store's concurrency protocol.
 
+This window is observable. In the 0.17.0 benchmark, Drive for desktop in Mirror mode uploaded a 1 GiB store's new `_root.age` 24 to 31 seconds before up to 261 of the objects it referenced, in every run, and after 200 small fsync'd edits 86 to 89 seconds before up to 654 of them, again in every run. With 2,000 small files the root was visible 504 to 510 seconds before up to 6,003 of its objects in two of three runs; in the third no poll saw the root ahead of its objects. Another machine reading the cloud copy during such a window would have seen a broken store. Native API replication closes the gap for Google Drive: it uploads immutable packs first, verifies each pack's md5 and size, and only then creates the generation's root record, so the remote is always at a complete old or new generation. A subprocess `SIGKILL` matrix at every push and pull checkpoint pins that property against an in-process fake Drive server.
+
 Writable v2 startup now traverses and authenticates every reachable file root, tree, and chunk before accepting mutations. This prevents committing on top of incompleteness already present at startup, but startup work is proportional to live data and may force placeholder downloads. It is not a continuous full-data scrub: post-mount in-place removal or corruption of an otherwise unchanged immutable object can be inherited by a later metadata generation. The client separately pins the namespace, objects, and evidence directory identities, but a complete per-commit content scrub would be proportional to all live data. A mount-wide sixteen-slot dirty overlay caps logical retained chunk bytes and requested steady-state capacities at 64 MiB while compact new/sparse tails coalesce repeated small writes until capacity pressure, close, `fsync`, or the dirty timer publishes a root-last generation. Allocator over-allocation and transient reallocation add bounded-operation overhead. Commit-heavy workloads can still amplify uploads substantially. Evidence-aware offline handling provides preview, reversible quarantine, and additive restore. New destructive purge is disabled because current platforms provide no atomic way to exclude a final concurrent rename, write, or hard-link mutation; quarantine therefore reclaims no storage. Historical growth, incomplete production File Provider coordination and real-iCloud qualification, provider ordering uncertainty, and the absence of provider transactions keep the implementation a durability-focused beta and a poor fit for sustained write-heavy use with any consumer sync provider.
 
 ### Google Drive in Mirror mode
@@ -62,7 +68,7 @@ Costs and limitations:
 
 - Mirroring `My Drive` downloads the full `My Drive`, not only the `zerotrust-drive` folder. Users with large existing Drives may need substantial disk space or a dedicated Google account.
 - Google Drive for desktop is an additional installed process with filesystem and privacy permissions.
-- Google's official desktop client supports macOS and Windows, but not Linux. The public Drive REST API still provides a credible path to a future native server or Linux backend.
+- Google's official desktop client supports macOS and Windows, but not Linux. Native API replication (0.17.0) uses the public Drive REST API instead and runs on Linux and macOS.
 - Google documents upload quotas and item-count limits. V2 no longer rewrites whole file ciphertext, but immutable chunks and retained generations increase object count. Garbage collection therefore has to remain explicit, evidence-preserving, and aware of provider synchronization rather than deleting unfamiliar objects opportunistically.
 
 Sources:
@@ -83,6 +89,29 @@ Google documents a Pause Sync control. This is useful for rekey and migration op
 Google retains revisions for ordinary non-Google files under documented retention rules. This must not be presented as a `zerotrust-drive` recovery guarantee: replacement can be represented as delete-plus-create, and the backing store still needs an independent backup.
 
 - [Google Drive file versions](https://support.google.com/drive/answer/2409045)
+
+### Native Google Drive API replication
+
+Since 0.17.0 `zdrive` can replicate a local v2 store itself, as rclone does for its encrypted remotes. Google receives only packs of already encrypted and authenticated `.z2` objects, exact copies of each published `_root.age`, the non-secret `_kdf.json`, a plaintext format marker, and advisory leases. Every remote file is created once and never overwritten or deleted. Setup, commands, limits, and the benchmark are in the README.
+
+Drive behavior that shapes the design:
+
+- Drive v3 offers no conditional content update, so replacing a remote head file would be last-writer-wins. Each generation therefore gets a new root record named by its generation number, and a push lists those records before adding one: when the remote head is not the generation this replica last synced, it refuses, and two different records for one generation are a fork that every command refuses to touch.
+- A folder may hold several files with the same name, and a listing can lag a create. Every create uses an id reserved with `files.generateIds`; a retried create of an id that already exists returns `409`, and completion is confirmed by id rather than by listing.
+- Quotas are metered in per-minute quota units per project and per user. Excess is answered with `403 userRateLimitExceeded` or `429`, which Google asks clients to retry with truncated exponential backoff. Sustained file creation is in practice limited to a few files per second; rclone documents about two. One Drive file per v2 object would therefore be slower than the desktop client, so objects travel in packs of about 64 MiB. Writes are paced at one start per 400 ms, other requests at one per 100 ms with a burst of eight, and retries back off with jitter up to 64 seconds.
+- Resumable uploads accept chunks in multiples of 256 KiB. `zdrive` sends 16 MiB chunks, runs six pack uploads in parallel, and persists each session URI, so a push resumes an upload that a killed process began.
+- Drive reports `md5Checksum` and `size` for binary files. A root record is created only after every pack it needs matches both. MD5 is a transfer check only: a pull authenticates every object against its v2 digest before installing it, and `zdrive remote verify --full` downloads every pack to do the same remotely.
+- A mounted replica lists the root records every 60 seconds and latches itself read-only when another replica has published. Drive's changes feed (`changes.list` with a saved page token) could replace that poll; it is not used yet because one listing of the small `roots/` folder already answers the question exactly.
+- An External OAuth app whose publishing status is "Testing" receives refresh tokens that expire after seven days, so the app must be published to production; an unverified personal app shows Google's warning screen once at consent. The full `drive` scope lets `zdrive` use a folder created elsewhere, such as a Computers folder that Drive for desktop syncs; `drive.file` would only see files the app created.
+
+Sources:
+
+- [Google Drive API limits](https://developers.google.com/workspace/drive/api/guides/limits)
+- [Google Drive `files.generateIds`](https://developers.google.com/workspace/drive/api/reference/rest/v3/files/generateIds)
+- [Google Drive resumable uploads](https://developers.google.com/workspace/drive/api/guides/manage-uploads)
+- [Google Drive change tracking](https://developers.google.com/workspace/drive/api/guides/about-changes)
+- [Google OAuth 2.0 refresh token expiration](https://developers.google.com/identity/protocols/oauth2#expiration)
+- [rclone Google Drive limitations](https://rclone.org/drive/#limitations)
 
 ### iCloud Drive with Keep Downloaded
 
@@ -206,6 +235,8 @@ The REST API has some properties that fit v2 and others that do not:
 - File move is available, but overwrite is documented as deleting the existing target and moving the source. The reviewed documentation does not promise POSIX-atomic replacement, conditional `If-Match`, compare-and-swap, or directory durability. A future direct Yandex adapter must therefore keep `_root.age` conflict checks and must not map a successful API call to local `rename` plus directory `fsync` semantics.
 - Resource metadata includes MD5 and modification time. Those fields are useful for transfer diagnostics but do not replace v2's authenticated object digest and generation chain.
 
+The remote layout of 0.17.0's Google replication needs neither overwrite nor move: packs and per-generation root records are created once and never replaced, and fork detection works on a listing. A Yandex REST adapter can reuse it with `overwrite=false` uploads. Without resumable sessions it re-sends a whole pack (64 MiB target) after an interrupted `PUT`, and because `202` can mean the bytes have not reached Disk yet, it must confirm every pack by listing its size and MD5 before creating a root record. This is recorded in `TODO.md`; WebDAV stays out of scope.
+
 Sources:
 
 - [Yandex Disk upload API](https://yandex.com/dev/disk-api/doc/en/reference/upload)
@@ -319,6 +350,8 @@ Only one mounted `zerotrust-drive` instance may write a store at a time. Before 
 
 Provider conflict resolution is not a concurrency mechanism. In v1, encrypted index versions cannot be merged, and provider-generated sibling indexes can strand otherwise valid encrypted blobs. In v2, `_root.age` is the sole mutable visibility pointer and each authenticated generation names its parent, but two concurrent children of one parent are still divergent histories that require human reconciliation. The application fingerprints the complete active `_index.age` for v1 or `_root.age` for v2 and the exact `_kdf.json`, scans for alternate control artifacts, and refuses a local commit when a check indicates a competing or interrupted generation. Maintenance locks contain a hashed operating-system machine identity and PID so a lock synchronized from another device is not declared stale by probing its PID on the wrong host. These controls are detection, not a cross-machine lease or remote transaction, so the one-writer rule remains mandatory.
 
+Native API replication adds remote checks without changing the rule. A push lists the remote root records first and refuses when the remote head is not the generation this replica last synced; two root records for one generation with different bytes are a fork, and every command then fails closed and preserves both. A mounted replica keeps an advisory lease (random replica id, two-minute heartbeat, fresh for ten minutes) and mounts read-only while another replica's lease is fresh. A change watcher latches a running mount read-only when another replica publishes. Drive has no conditional update, leases depend on clocks and listings can lag, so these narrow the window for a mistake rather than making concurrent writers safe.
+
 After a mounted instance detects such a conflict, it latches persistence off until remount. Writes return read-only errors and flush/fsync report the stored conflict even if the provider later removes or hides the sibling. V2 recovery moves only byte-for-byte verified transaction artifacts into transaction-bound evidence names after authenticating the intent and generation relationship; it does not unlink roots or manifests. A separately fsynced manifest anchor lets remount detect a provider replacement raced with that move. Exact directory pins and checks prevent a persistent replacement visible at a validation boundary from looking self-healed or silently discarding evidence. They cannot atomically exclude an ABA provider rename or a change in the final check-to-root-exchange interval, so the local old-or-new proof assumes a stable selected namespace during publication and does not claim a provider transaction.
 
 Remote partial materialization is also an error, not an empty store. If `_kdf.json`, `_root.age`, a v2 write manifest, or referenced immutable objects arrive without their required counterparts, do not delete the directory and do not initialize a replacement drive. Wait for synchronization, preserve every artifact, and retry with the same passphrase. A missing object, digest mismatch, unsupported root, or root that is neither the authenticated old nor new generation fails closed.
@@ -370,10 +403,11 @@ V2 deliberately retains immutable objects from more than one generation, so a mi
 
 ## Support wording
 
+- **Recommended (beta, 0.17.0):** a local store replicated by `zdrive --remote` or `zdrive remote push` to a dedicated Google Drive folder through the Drive API, on macOS or Linux, one active mount.
 - **Recommended:** Google Drive `My Drive`, Mirror files, dedicated backing folder, one active mount.
 - **Constrained beta:** iCloud Drive only for small, low-write stores whose accumulated encrypted backing footprint stays comfortably below Apple's 50 GB per-folder limit; complete backing folder marked Keep Downloaded, one active mount.
 - **Experimental macOS:** Proton Drive dedicated folder under `My files`, complete backing folder marked Make Available Offline, latest successful sync verified, paid account and independent Proton recovery material, one active mount.
 - **Experimental secondary:** Yandex Disk fully local synchronized folder, preferably for Linux or cold secondary storage, one active mount, account and 30-day-upload monitoring.
 - **Unsupported:** Google Drive Stream mode, Shared Drives, Proton through rclone, the Proton CLI as a mounted or continuously synchronized backing store, Yandex WebDAV for writable mounts, concurrent mounts, network-mounted provider caches, or treating any provider as the only backup.
 
-All four labels still assume low-write beta use. Bounded dirty-chunk coalescing reduces write amplification, and evidence-aware orphan quarantine prevents unsafe opportunistic deletion, but it does not reclaim crash leftovers. Committed history/evidence retention, close/fsync-heavy commits, and unqualified remote-provider ordering remain. Proton's documented small-file penalty and Yandex's 30-day upload allowance make residual write amplification especially unfavorable on those providers.
+All of these labels still assume low-write beta use. Bounded dirty-chunk coalescing reduces write amplification, and evidence-aware orphan quarantine prevents unsafe opportunistic deletion, but it does not reclaim crash leftovers. Committed history/evidence retention, close/fsync-heavy commits, and unqualified remote-provider ordering remain. Proton's documented small-file penalty and Yandex's 30-day upload allowance make residual write amplification especially unfavorable on those providers.
