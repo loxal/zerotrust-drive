@@ -19,7 +19,7 @@ use super::local::{self, ASIDE_PREFIX, Kind, Stat, TEMP_PREFIX, join_rel, split_
 use super::prefetch::{Prefetch, Staged};
 use super::state::Entry;
 use crate::remote::format::MARKER_NAME;
-use crate::remote::gdrive::{DriveFile, MARKER_KEY, PLAIN_MARKER, STORE_MARKER};
+use crate::remote::gdrive::DriveFile;
 use crate::remote::{hex, md5_file};
 
 /// Deepest folder chain followed upwards on Drive.
@@ -280,10 +280,7 @@ impl Cycle<'_> {
     fn excluded(&self, file: &DriveFile) -> bool {
         self.options.mirror
             && file.is_folder()
-            && (matches!(
-                file.app_properties.get(MARKER_KEY).map(String::as_str),
-                Some(STORE_MARKER | PLAIN_MARKER)
-            ) || self.state.excluded.contains(&file.id))
+            && (super::own_folder(file) || self.state.excluded.contains(&file.id))
     }
 
     /// The local name of `file`, `None` when it cannot have one. An indexed

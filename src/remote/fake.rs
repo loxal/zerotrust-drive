@@ -1464,13 +1464,28 @@ fn handle(
                     .collect();
                 return Reply::json(200, &json!({ "files": matches }));
             }
-            let matches: Vec<Value> = if query == "trashed = false" {
-                // Everything visible, as a full-scope flat listing; My Drive
-                // itself is not an item of it.
+            let grouped = query
+                .strip_prefix('(')
+                .and_then(|rest| rest.strip_suffix(") and trashed = false"))
+                .map(|inner| {
+                    inner
+                        .split(" or ")
+                        .map(|term| {
+                            term.strip_prefix('\'')
+                                .and_then(|rest| rest.strip_suffix("' in parents"))
+                                .map(|parent| resolve(parent).to_string())
+                        })
+                        .collect::<Option<HashSet<String>>>()
+                });
+            let matches: Vec<Value> = if let Some(parents) = grouped {
+                // The children of several folders at once, as a fast list.
+                let Some(parents) = parents else {
+                    return Reply::error(400, "invalidQuery", "unsupported query");
+                };
                 state
                     .files
                     .values()
-                    .filter(|file| file.id != ROOT_REAL_ID)
+                    .filter(|file| file.parents.iter().any(|parent| parents.contains(parent)))
                     .filter(|file| !state.effectively_trashed(file))
                     .map(|file| state.file_json(file))
                     .collect()

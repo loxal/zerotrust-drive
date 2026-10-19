@@ -59,8 +59,11 @@ pub(crate) struct SyncArgs {
 
 pub(crate) fn run(args: SyncArgs) -> i32 {
     match sync(&args) {
-        Ok(0) => 0,
-        Ok(errors) => {
+        Ok((0, false)) => 0,
+        // The held deletions were explained with the command that applies
+        // them; the next run does not apply them by itself.
+        Ok((0, true)) => 1,
+        Ok((errors, _)) => {
             eprintln!(
                 "zerotrust-drive: {errors} item(s) were not synced; the next run retries them"
             );
@@ -77,8 +80,9 @@ pub(crate) fn run(args: SyncArgs) -> i32 {
     }
 }
 
-/// Per-item errors of the last cycle, or why syncing could not run.
-fn sync(args: &SyncArgs) -> Result<usize, Failure> {
+/// Per-item errors of the last cycle and whether it held deletions, or why
+/// syncing could not run.
+fn sync(args: &SyncArgs) -> Result<(usize, bool), Failure> {
     let paths = Paths::from_env().map_err(|error| error.to_string())?;
     let name = RemoteName::parse(&args.remote)
         .map_err(|error| Failure::refused(Class::Remote, error.to_string()))?;
@@ -105,7 +109,7 @@ fn sync(args: &SyncArgs) -> Result<usize, Failure> {
         record(&result);
         let report = result.map_err(Failure::from)?;
         print_report(&report, &rerun);
-        return Ok(report.errors.len() + usize::from(report.held_deletions > 0));
+        return Ok((report.errors.len(), report.held_deletions > 0));
     }
 
     let mut ready = false;
@@ -144,7 +148,7 @@ fn sync(args: &SyncArgs) -> Result<usize, Failure> {
             }
         },
     )?;
-    Ok(last_errors)
+    Ok((last_errors, last_held > 0))
 }
 
 /// The Drive client of plain remote `name` and the options syncing `dir`

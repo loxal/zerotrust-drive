@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use ureq::Body;
 use ureq::http::Response;
 
+use super::format::MARKER_NAME;
 use super::format::valid_file_id;
 use super::{RemoteError, hex, md5_file, unhex};
 use crate::telemetry::{self, RequestClass};
@@ -55,6 +56,9 @@ const ITEM_DENIALS: &[&str] = &[
     "cannotMoveTrashedItemOutOfTrash",
     "domainPolicy",
 ];
+/// Folders whose children one listing request asks for; their ids keep
+/// the query a few KiB long.
+const PARENTS_PER_QUERY: usize = 50;
 /// Items counted at a folder's top level before reporting "more than".
 pub(crate) const ITEM_COUNT_CAP: usize = 1000;
 /// Marked folders described in full when several refuse a join.
@@ -1096,11 +1100,50 @@ impl GoogleDrive {
         )
     }
 
-    /// Every non-trashed item the account can see outside shared drives:
-    /// all of My Drive plus what others shared, about one request per
-    /// thousand items. Callers place items by their `parents`.
-    pub(crate) fn list_everything(&self) -> Result<Vec<DriveFile>, RemoteError> {
-        self.query_pages("list everything", "trashed = false", LIST_FIELDS, false)
+    /// Every non-trashed item below the folder `root`, level by level, with
+    /// the children of up to [`PARENTS_PER_QUERY`] folders in one request
+    /// (as rclone's fast list does): about one request per that many folders
+    /// instead of one per folder. A corpus-wide query would be one request
+    /// per thousand items in theory, but Drive pages slowly through every
+    /// item shared with the account to answer it. Folders for which
+    /// `descend` is false are listed but not entered, and neither is a
+    /// folder holding a zerotrust-drive store's [`MARKER_NAME`].
+    pub(crate) fn list_below(
+        &self,
+        root: &str,
+        descend: &dyn Fn(&DriveFile) -> bool,
+    ) -> Result<Vec<DriveFile>, RemoteError> {
+        require_id(root)?;
+        let mut found = Vec::new();
+        let mut level = vec![root.to_string()];
+        while !level.is_empty() {
+            let mut children = Vec::new();
+            for batch in level.chunks(PARENTS_PER_QUERY) {
+                for parent in batch {
+                    require_id(parent)?;
+                }
+                let parents: Vec<String> = batch
+                    .iter()
+                    .map(|parent| format!("'{parent}' in parents"))
+                    .collect();
+                let query = format!("({}) and trashed = false", parents.join(" or "));
+                children.extend(self.query_all("list folders", &query, LIST_FIELDS)?);
+            }
+            let stores: std::collections::HashSet<&str> = children
+                .iter()
+                .filter(|child| child.name == MARKER_NAME && !child.is_folder())
+                .filter_map(|child| child.parents.first().map(String::as_str))
+                .collect();
+            let next: Vec<String> = children
+                .iter()
+                .filter(|child| child.is_folder() && descend(child))
+                .filter(|child| !stores.contains(child.id.as_str()))
+                .map(|child| child.id.clone())
+                .collect();
+            found.extend(children);
+            level = next;
+        }
+        Ok(found)
     }
 
     fn query_all(
@@ -1109,17 +1152,6 @@ impl GoogleDrive {
         query: &str,
         fields: &str,
     ) -> Result<Vec<DriveFile>, RemoteError> {
-        self.query_pages(op, query, fields, true)
-    }
-
-    fn query_pages(
-        &self,
-        op: &'static str,
-        query: &str,
-        fields: &str,
-        all_drives: bool,
-    ) -> Result<Vec<DriveFile>, RemoteError> {
-        let all_drives = if all_drives { "true" } else { "false" };
         let url = self.url("/drive/v3/files");
         let mut files = Vec::new();
         let mut page_token: Option<String> = None;
@@ -1132,7 +1164,7 @@ impl GoogleDrive {
                     .query("fields", fields)
                     .query("pageSize", "1000")
                     .query("supportsAllDrives", "true")
-                    .query("includeItemsFromAllDrives", all_drives);
+                    .query("includeItemsFromAllDrives", "true");
                 if let Some(token) = page_token.as_deref() {
                     request = request.query("pageToken", token);
                 }

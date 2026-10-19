@@ -169,12 +169,20 @@ pub(crate) struct MyDriveSize {
     pub without_content: u64,
 }
 
-/// Sizes the My Drive whose real id is `root` with one flat listing,
-/// leaving out what a mirror leaves out: zdrive's own folders and items
-/// outside My Drive.
+/// Whether `folder` is one of zdrive's own: an encrypted store or a plain
+/// sync folder, by its marker.
+pub(crate) fn own_folder(folder: &DriveFile) -> bool {
+    matches!(
+        folder.app_properties.get(MARKER_KEY).map(String::as_str),
+        Some(STORE_MARKER | PLAIN_MARKER)
+    )
+}
+
+/// Sizes the My Drive whose real id is `root`, leaving out what a mirror
+/// leaves out: zdrive's own folders.
 pub(crate) fn my_drive_size(drive: &GoogleDrive, root: &str) -> Result<MyDriveSize, RemoteError> {
     const GOOGLE_APPS: &str = "application/vnd.google-apps.";
-    let items = drive.list_everything()?;
+    let items = drive.list_below(root, &|folder| !own_folder(folder))?;
     let by_id: HashMap<&str, &DriveFile> =
         items.iter().map(|item| (item.id.as_str(), item)).collect();
     let stores: HashSet<&str> = items

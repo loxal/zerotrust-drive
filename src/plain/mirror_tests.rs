@@ -220,19 +220,23 @@ fn a_mirror_needs_its_own_my_drive_and_full_access() {
 }
 
 #[test]
-fn a_mirror_lists_my_drive_in_one_flat_listing() {
+fn a_mirror_lists_many_folders_per_request() {
     let env = Env::mirror();
-    let mut parent = ROOT_ID.to_string();
-    for depth in 0..20 {
-        parent = env
+    // 120 folders on one level, each with a file and a subfolder.
+    for n in 0..120 {
+        let folder = env
             .fake
-            .insert(&parent, &format!("d{depth}"), Some(FOLDER_MIME), b"");
-        env.fake.insert(&parent, "f.txt", None, b"f");
+            .insert(ROOT_ID, &format!("d{n:03}"), Some(FOLDER_MIME), b"");
+        env.fake.insert(&folder, "f.txt", None, b"f");
+        env.fake.insert(&folder, "sub", Some(FOLDER_MIME), b"");
     }
-    let replica = env.mirror_replica("flat");
+    let replica = env.mirror_replica("fast-list");
     let before = env.fake.count(Op::List);
-    assert_eq!(replica.sync(&env.drive).downloaded, 20);
-    assert_eq!(env.fake.count(Op::List) - before, 1);
+    assert_eq!(replica.sync(&env.drive).downloaded, 120);
+    // My Drive, then 120 folders in three requests of up to 50, then
+    // their 120 subfolders in three more: 7, not 241.
+    assert_eq!(env.fake.count(Op::List) - before, 7);
+    assert_eq!(replica.tree().len(), 360);
 }
 
 #[test]

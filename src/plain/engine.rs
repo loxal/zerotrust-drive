@@ -368,12 +368,11 @@ impl<'a> Cycle<'a> {
             .map_err(|error| transient("read the Drive changes position", error))?;
         let mut listed = HashSet::new();
         if self.options.mirror {
-            // One flat listing instead of a request per folder: a whole My
-            // Drive in about one request per thousand items. Items outside
-            // My Drive resolve as outside when they are placed.
+            // The children of many folders per request instead of one
+            // request per folder; zdrive's own folders are not entered.
             let everything = self
                 .drive
-                .list_everything()
+                .list_below(&self.state.folder_id, &|folder| !super::own_folder(folder))
                 .map_err(|error| transient("list My Drive", error))?;
             for item in everything {
                 listed.insert(item.id.clone());
