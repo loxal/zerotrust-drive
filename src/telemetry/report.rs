@@ -246,7 +246,7 @@ impl Summary {
                     .stop_reasons
                     .entry(str_of(record, "reason").to_string())
                     .or_default() += 1;
-                if record.get("exit_code").and_then(Value::as_i64).unwrap_or(0) != 0 {
+                if failed_stop(record) {
                     self.failed_exits += 1;
                 }
                 self.lifecycle
@@ -706,6 +706,13 @@ impl Summary {
     }
 }
 
+/// A stop with a non-zero exit, or a refusal: on macOS a refusal exits 0
+/// so that launchd stops restarting it, yet it still needs its operator.
+fn failed_stop(record: &Value) -> bool {
+    record.get("exit_code").and_then(Value::as_i64).unwrap_or(0) != 0
+        || str_of(record, "reason") == "refused"
+}
+
 fn join_counts(counts: &BTreeMap<String, u64>) -> String {
     counts
         .iter()
@@ -765,6 +772,20 @@ mod tests {
         assert_eq!(summary.unclean_exits, 3);
         assert_eq!(summary.running, 1);
         assert_eq!(summary.crashes, 4);
+    }
+
+    #[test]
+    fn a_refusal_is_a_failed_exit_whatever_its_exit_code() {
+        let stop = |reason: &str, code: i64| serde_json::json!({ "kind": "stop", "reason": reason, "exit_code": code });
+        assert!(!failed_stop(&stop("signal", 0)));
+        assert!(failed_stop(&stop("error", 1)));
+        // macOS exits 0 on a refusal, Linux 78.
+        assert!(failed_stop(&stop("refused", 0)));
+        assert!(failed_stop(&stop("refused", 78)));
+        let mut summary = Summary::default();
+        summary.add("home", 1, "stop", &stop("refused", 0));
+        summary.add("home", 2, "stop", &stop("signal", 0));
+        assert_eq!(summary.failed_exits, 1);
     }
 
     #[test]

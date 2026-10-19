@@ -121,6 +121,34 @@ pub(crate) fn plist(host: &Host, name: &str, binary: &str) -> String {
     text
 }
 
+/// Whether an installed plist differs from the one this zdrive writes for
+/// `name`: an older zdrive generated it. The binary, the environment and
+/// the log path depend on the installing shell and are not compared.
+pub(crate) fn outdated(host: &Host, name: &str, installed: &str) -> bool {
+    fn normalized(text: &str) -> Vec<&str> {
+        let mut lines = Vec::new();
+        let (mut environment, mut mask) = (false, false);
+        for line in text.lines() {
+            if environment {
+                environment = line != "\t</dict>";
+            } else if line == "\t<key>EnvironmentVariables</key>" {
+                environment = true;
+            } else if mask {
+                lines.push("\t<masked/>");
+                mask = false;
+            } else {
+                lines.push(line);
+                mask = matches!(
+                    line,
+                    "\t<array>" | "\t<key>StandardOutPath</key>" | "\t<key>StandardErrorPath</key>"
+                );
+            }
+        }
+        lines
+    }
+    normalized(installed) != normalized(&plist(host, name, "zdrive"))
+}
+
 /// launchctl's answer for a job that is not loaded: ESRCH (3) on older
 /// releases, 113 ("Could not find specified service") on newer ones.
 fn not_loaded(output: &Output) -> bool {
@@ -242,9 +270,11 @@ pub(crate) fn status(
     name: &str,
     runner: &dyn Runner,
 ) -> Result<ServiceStatus, String> {
+    let installed = std::fs::read_to_string(plist_path(host, name)).ok();
     let mut status = ServiceStatus {
         name: name.to_string(),
         installed: plist_path(host, name).exists(),
+        outdated: installed.is_some_and(|text| outdated(host, name, &text)),
         ..ServiceStatus::default()
     };
     let args = os_args(["print".to_string(), service_target(host, name)]);
@@ -595,6 +625,8 @@ mod tests {
                 last_exit_status: Some(1),
                 runs: Some(3),
                 restarts: None,
+                outdated: false,
+                refusal: None,
             }
         );
 
@@ -621,5 +653,117 @@ mod tests {
 
         let broken = FakeRunner::new(|_, _| exit(1, "", "launchctl exploded"));
         assert!(status_on(&host, "encrypted", &broken).is_err());
+    }
+
+    #[test]
+    fn service_launchd_flags_a_plist_of_an_older_zdrive() {
+        let dir = TestDir::new("service-launchd-outdated");
+        let mut host = host(&dir, Platform::MacOs);
+        let current = plist(&host, "encrypted", "/opt/zdrive");
+        assert!(!outdated(&host, "encrypted", &current));
+        // The installing shell's binary and environment are not compared.
+        host.xdg_environment = vec![("XDG_STATE_HOME".to_string(), "/elsewhere".to_string())];
+        let other_shell = plist(&host, "encrypted", "/Applications/Z & D/zdrive");
+        host.xdg_environment.clear();
+        assert!(other_shell.contains("EnvironmentVariables"));
+        assert!(!outdated(&host, "encrypted", &other_shell));
+        // Expected failing controls: a changed policy, another instance.
+        let throttled = current.replace(
+            "<key>ThrottleInterval</key>\n\t<integer>30</integer>",
+            "<key>ThrottleInterval</key>\n\t<integer>10</integer>",
+        );
+        assert_ne!(throttled, current);
+        assert!(outdated(&host, "encrypted", &throttled));
+        assert!(outdated(&host, "photos", &current));
+
+        let unloaded = FakeRunner::new(|_, _| exit(113, "", "Could not find service"));
+        let path = plist_path(&host, "encrypted");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, &throttled).unwrap();
+        assert!(status_on(&host, "encrypted", &unloaded).unwrap().outdated);
+        std::fs::write(&path, &current).unwrap();
+        assert!(!status_on(&host, "encrypted", &unloaded).unwrap().outdated);
+    }
+
+    #[test]
+    fn service_refusal_is_shown_until_install_or_uninstall_clears_it() {
+        use crate::refusal::{self, Class};
+        let dir = TestDir::new("service-refusal-lifecycle");
+        let host = host(&dir, Platform::MacOs);
+        let def = definition(&dir);
+        def.save(&host.paths).unwrap();
+        let stopped = FakeRunner::new(|_, _| ok("x = {\n\tstate = not running\n}\n"));
+        assert_eq!(
+            status_on(&host, "encrypted", &stopped).unwrap().refusal,
+            None
+        );
+
+        refusal::refuse(
+            Some(&host.paths),
+            "encrypted",
+            Class::Custody,
+            "no passphrase",
+        );
+        let status = status_on(&host, "encrypted", &stopped).unwrap();
+        let record = status.refusal.clone().unwrap().unwrap();
+        assert_eq!(
+            (record.class.as_str(), record.message.as_str()),
+            ("custody", "no passphrase")
+        );
+        assert_eq!(status.advice(), [record.describe("encrypted")]);
+        // Another instance's refusal is not this one's.
+        assert_eq!(status_on(&host, "photos", &stopped).unwrap().refusal, None);
+
+        let lines = install_on(
+            &host,
+            &def,
+            std::path::Path::new("/opt/zdrive"),
+            &FakeRunner::succeeding(),
+        )
+        .unwrap();
+        assert!(
+            lines.contains(&"cleared the last refusal of encrypted".to_string()),
+            "{lines:?}"
+        );
+        assert_eq!(
+            status_on(&host, "encrypted", &stopped).unwrap().refusal,
+            None
+        );
+        let again = install_on(
+            &host,
+            &def,
+            std::path::Path::new("/opt/zdrive"),
+            &FakeRunner::succeeding(),
+        )
+        .unwrap();
+        assert!(
+            !again.iter().any(|line| line.contains("cleared")),
+            "{again:?}"
+        );
+
+        refusal::refuse(
+            Some(&host.paths),
+            "encrypted",
+            Class::Passphrase,
+            "wrong passphrase",
+        );
+        let lines = uninstall_on(&host, "encrypted", false, &FakeRunner::succeeding()).unwrap();
+        assert!(
+            lines.contains(&"cleared the last refusal of encrypted".to_string()),
+            "{lines:?}"
+        );
+        assert_eq!(refusal::read(&host.paths, "encrypted").unwrap(), None);
+
+        // An unreadable record is reported, not taken for "no refusal".
+        let file = refusal::path(&host.paths, "encrypted");
+        refusal::refuse(Some(&host.paths), "encrypted", Class::Store, "x");
+        std::fs::write(&file, b"{").unwrap();
+        let status = status_on(&host, "encrypted", &stopped).unwrap();
+        assert!(matches!(status.refusal, Some(Err(_))));
+        assert!(
+            status.advice()[0].contains("cannot be read"),
+            "{:?}",
+            status.advice()
+        );
     }
 }

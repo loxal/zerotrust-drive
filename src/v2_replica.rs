@@ -52,6 +52,13 @@ pub(crate) fn read_root_bytes(base_path: &Path) -> std::io::Result<Option<Vec<u8
     read_bounded_regular(&path, MAX_ROOT_CIPHERTEXT).map(Some)
 }
 
+/// Whether `key` opens the root record `ciphertext`. Every root is sealed
+/// under the store key, so a failure means a wrong passphrase (or a damaged
+/// root, which needs the operator as much).
+pub(crate) fn root_opens(key: &[u8; 32], ciphertext: &[u8]) -> bool {
+    decrypt_bytes_owned(key, ciphertext.to_vec(), ROOT_AAD).is_ok()
+}
+
 /// Authenticates a root record and returns the generation it names.
 pub(crate) fn decode_root(key: &[u8; 32], ciphertext: &[u8]) -> std::io::Result<ObjectRef> {
     if ciphertext.len() as u64 > MAX_ROOT_CIPHERTEXT {

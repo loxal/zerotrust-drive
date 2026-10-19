@@ -20,7 +20,7 @@ mod cli;
 mod histogram;
 mod metrics;
 mod report;
-mod system;
+pub(crate) mod system;
 mod tar;
 mod writer;
 

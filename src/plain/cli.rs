@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use super::{CycleReport, DEFAULT_STABLE_AGE, PlainOptions};
 use crate::RunOptions;
+use crate::refusal::{self, Class, Failure};
 use crate::remote::cli as remote_cli;
 use crate::remote::config::{Paths, RemoteConfig, RemoteMode, RemoteName};
 use crate::remote::gdrive::GoogleDrive;
@@ -59,7 +60,8 @@ pub(crate) fn run(args: SyncArgs) -> i32 {
             );
             1
         }
-        Err(message) => {
+        Err(failure) if failure.class.is_some() && refusal::armed() => refusal::exit(failure),
+        Err(Failure { message, .. }) => {
             eprintln!("zerotrust-drive: error: {message}");
             if args.run.service {
                 let _ = service::notify::status(&one_line(&format!("error: {message}")));
@@ -70,9 +72,10 @@ pub(crate) fn run(args: SyncArgs) -> i32 {
 }
 
 /// Per-item errors of the last cycle, or why syncing could not run.
-fn sync(args: &SyncArgs) -> Result<usize, String> {
+fn sync(args: &SyncArgs) -> Result<usize, Failure> {
     let paths = Paths::from_env().map_err(|error| error.to_string())?;
-    let name = RemoteName::parse(&args.remote).map_err(|error| error.to_string())?;
+    let name = RemoteName::parse(&args.remote)
+        .map_err(|error| Failure::refused(Class::Remote, error.to_string()))?;
     let (drive, options, config) = open(&paths, &name, &args.dir)?;
     remote_cli::note(&format!(
         "plain sync: {} <-> {} (Google can read these files)",
@@ -83,7 +86,7 @@ fn sync(args: &SyncArgs) -> Result<usize, String> {
     if !args.watch {
         let result = super::sync_once(&drive, &options);
         record(&result);
-        let report = result?;
+        let report = result.map_err(Failure::from)?;
         print_report(&report);
         return Ok(report.errors.len());
     }
@@ -123,21 +126,31 @@ fn sync(args: &SyncArgs) -> Result<usize, String> {
 }
 
 /// The Drive client of plain remote `name` and the options syncing `dir`
-/// with it.
+/// with it. Configuration problems are classed: they persist until the
+/// operator acts.
 fn open(
     paths: &Paths,
     name: &RemoteName,
     dir: &Path,
-) -> Result<(GoogleDrive, PlainOptions, RemoteConfig), String> {
-    let config = RemoteConfig::load(paths, name).map_err(|error| error.to_string())?;
+) -> Result<(GoogleDrive, PlainOptions, RemoteConfig), Failure> {
+    let config = RemoteConfig::load(paths, name)
+        .map_err(|error| Failure::refused(Class::Remote, error.to_string()))?;
     if config.mode != RemoteMode::Plain {
-        return Err(format!(
-            "remote {name} is an encrypted remote; mount it with `zdrive --remote {name} --encrypted-dir DIR --decrypted-dir DIR`"
+        return Err(Failure::refused(
+            Class::Remote,
+            format!(
+                "remote {name} is an encrypted remote; mount it with `zdrive --remote {name} --encrypted-dir DIR --decrypted-dir DIR`"
+            ),
         ));
     }
     let local_dir = local_folder(dir, paths)?;
-    let client = oauth::client_for(&config.issuer()).map_err(|error| error.to_string())?;
-    let drive = remote_cli::open_drive(client, paths, &config, name, None)?;
+    let client = oauth::client_for(&config.issuer())
+        .map_err(|error| Failure::refused(Class::Remote, error.to_string()))?;
+    let drive =
+        remote_cli::open_drive(client, paths, &config, name, None).map_err(|error| Failure {
+            class: refusal::remote_class(&error).or(Some(Class::Remote)),
+            message: error.to_string(),
+        })?;
     let options = options(paths, name, &config, local_dir);
     Ok((drive, options, config))
 }
@@ -149,7 +162,7 @@ pub(crate) fn initial_sync(
     name: &RemoteName,
     dir: &Path,
 ) -> Result<Vec<String>, String> {
-    let (drive, options, _) = open(paths, name, dir)?;
+    let (drive, options, _) = open(paths, name, dir).map_err(|failure| failure.message)?;
     let result = super::sync_once(&drive, &options);
     record(&result);
     let report = result?;

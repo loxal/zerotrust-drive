@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use super::local::{self, Scan, Stat, Trash};
 use super::state::{self, Entry, State};
 use super::{CycleReport, PlainOptions, check_marker};
+use crate::refusal::{Class, Failure};
 use crate::remote::RemoteError;
 use crate::remote::gdrive::{DriveFile, GoogleDrive};
 
@@ -386,14 +387,15 @@ pub(crate) fn sync_once(
 /// capped backoff (offline tolerant), never exit the loop.
 ///
 /// Only opening the instance (lock, state binding) and a refused Drive
-/// folder before any cycle succeeded return early with `Err`.
+/// folder before any cycle succeeded return early with `Err`; the refused
+/// folder is classed, because it stays refused until the operator acts.
 pub(crate) fn watch(
     drive: &GoogleDrive,
     options: &PlainOptions,
     interval: Duration,
     stop: &dyn Fn() -> bool,
     on_cycle: &mut dyn FnMut(&Result<CycleReport, String>),
-) -> Result<(), String> {
+) -> Result<(), Failure> {
     let mut session = Session::open(options)?;
     let mut failures = 0u32;
     let mut synced = false;
@@ -402,7 +404,7 @@ pub(crate) fn watch(
         if !synced && let Err(Fatal::Refused(message)) = &result {
             let message = message.clone();
             on_cycle(&Err(message.clone()));
-            return Err(message);
+            return Err(Failure::refused(Class::DriveFolder, message));
         }
         synced |= result.is_ok();
         let result = result.map_err(Fatal::message);
@@ -429,7 +431,7 @@ pub(crate) fn watch_until_signalled(
     options: &PlainOptions,
     interval: Duration,
     on_cycle: &mut dyn FnMut(&Result<CycleReport, String>),
-) -> Result<(), String> {
+) -> Result<(), Failure> {
     crate::shutdown::stoppable();
     watch(
         drive,

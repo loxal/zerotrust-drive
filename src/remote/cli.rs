@@ -709,7 +709,8 @@ pub(crate) fn store_command(args: StoreArgs, action: Action) -> Result<Summary, 
         terminal.as_mut(),
         false,
     )?;
-    let drive = open_drive(client, &paths, &config, &name, Some(&passphrase))?;
+    let drive = open_drive(client, &paths, &config, &name, Some(&passphrase))
+        .map_err(|error| error.to_string())?;
     let remote = Remote {
         drive: &drive,
         folder_id: &config.folder_id,
@@ -742,10 +743,8 @@ pub(crate) fn open_drive(
     config: &RemoteConfig,
     name: &RemoteName,
     passphrase: Option<&str>,
-) -> Result<GoogleDrive, String> {
-    let refresh_token = config
-        .refresh_token(paths, name, passphrase)
-        .map_err(|error| error.to_string())?;
+) -> Result<GoogleDrive, RemoteError> {
+    let refresh_token = config.refresh_token(paths, name, passphrase)?;
     Ok(GoogleDrive::new(Box::new(RefreshTokenSource::new(
         client,
         refresh_token,

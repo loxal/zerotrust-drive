@@ -1714,6 +1714,27 @@ pub struct ZeroTrustFs {
     transfer_limit: Option<u32>,
 }
 
+/// A refusal when `key` does not open the v2 root of `base_path`. An absent
+/// or unreadable root is left to the checks that follow, which report it.
+fn wrong_v2_passphrase(base_path: &Path, key: &[u8; 32]) -> Option<crate::refusal::Failure> {
+    let root = v2::replica::read_root_bytes(base_path).ok()??;
+    (!v2::replica::root_opens(key, &root)).then(|| {
+        crate::refusal::Failure::refused(
+            crate::refusal::Class::Passphrase,
+            format!(
+                "wrong passphrase: it does not open the v2 root of {}",
+                shown_path(base_path).display()
+            ),
+        )
+    })
+}
+
+/// `path` as an operator can find it: the drive runs relative to its store,
+/// so a refusal would otherwise name `.`.
+fn shown_path(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
 impl ZeroTrustFs {
     /// Compatibility constructor used by the v1 maintenance/test paths. It
     /// still auto-detects and mounts an existing v2 store, but creates v1 when
@@ -1820,6 +1841,11 @@ impl ZeroTrustFs {
             eprintln!("zerotrust-drive: error: cannot derive encryption key: {e}");
             std::process::exit(1);
         });
+        // A wrong passphrase stays wrong: a service refuses instead of
+        // restarting.
+        if root_exists && let Some(failure) = wrong_v2_passphrase(&base_path, &key) {
+            crate::refusal::exit(failure);
+        }
 
         let will_use_v2 = root_exists
             || write_recovery_exists
@@ -1985,13 +2011,13 @@ impl ZeroTrustFs {
             );
             let json = match decrypt_index_owned(&key, ciphertext) {
                 Ok(j) => j,
-                Err(_) => {
-                    eprintln!(
-                        "zerotrust-drive: error: wrong passphrase — failed to decrypt {}",
-                        index_path.display()
-                    );
-                    std::process::exit(1);
-                }
+                Err(_) => crate::refusal::exit(crate::refusal::Failure::refused(
+                    crate::refusal::Class::Passphrase,
+                    format!(
+                        "wrong passphrase: failed to decrypt {}",
+                        shown_path(&index_path).display()
+                    ),
+                )),
             };
             serde_json::from_slice(&json).unwrap_or_else(|e| {
                 eprintln!(
@@ -7593,6 +7619,31 @@ mod tests {
         ztfs.flush_state().unwrap();
         ztfs.release_inode(ino).unwrap();
         drop(ztfs);
+    }
+
+    #[test]
+    fn a_wrong_passphrase_is_refused_before_the_v2_root_is_used() {
+        let v2 = committed_format_fixture("v2");
+        let kdf = crate::crypto::load_kdf_with_fingerprint(&v2)
+            .unwrap()
+            .unwrap()
+            .0;
+        let right = crate::crypto::try_derive_key(FORMAT_FIXTURE_PASSPHRASE, &kdf).unwrap();
+        // The valid control: the right key opens the committed root.
+        assert_eq!(wrong_v2_passphrase(&v2, &right), None);
+        let wrong = crate::crypto::try_derive_key("not-the-passphrase", &kdf).unwrap();
+        let failure = wrong_v2_passphrase(&v2, &wrong).unwrap();
+        assert_eq!(failure.class, Some(crate::refusal::Class::Passphrase));
+        assert_eq!(
+            failure.message,
+            format!(
+                "wrong passphrase: it does not open the v2 root of {}",
+                std::fs::canonicalize(&v2).unwrap().display()
+            )
+        );
+        // No root (a v1 or new store) is not this check's business.
+        let empty = crate::remote::TestDir::new("wrong-passphrase-no-root");
+        assert_eq!(wrong_v2_passphrase(empty.path(), &wrong), None);
     }
 
     #[test]

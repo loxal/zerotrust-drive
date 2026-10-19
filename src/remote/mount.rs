@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 use crate::crypto::RecoveryFingerprint;
 use crate::fs::{FsInner, StoreFormat};
 use crate::prompt::TerminalReader;
+use crate::refusal::{self, Class, Failure};
 use crate::telemetry::{self, Field, Level};
 
 use super::RemoteError;
@@ -105,7 +106,9 @@ pub(crate) struct Prepared {
 }
 
 /// Brings the store in the anchored directory `base` up to the remote head
-/// before it is mounted. The caller holds the drive-operation lock.
+/// before it is mounted. The caller holds the drive-operation lock. A
+/// failure that persists until the operator acts is classed, so a service
+/// stops instead of restarting.
 pub(crate) fn prepare(
     remote: &str,
     canonical: &Path,
@@ -114,21 +117,29 @@ pub(crate) fn prepare(
     passphrase: Option<String>,
     passphrase_file: Option<&Path>,
     terminal: Option<&mut TerminalReader>,
-) -> Result<Prepared, String> {
+) -> Result<Prepared, Failure> {
+    let refused =
+        |class: Class| move |error: RemoteError| Failure::refused(class, error.to_string());
     let paths = Paths::from_env().map_err(|error| error.to_string())?;
-    let name = RemoteName::parse(remote).map_err(|error| error.to_string())?;
-    let config = RemoteConfig::load(&paths, &name).map_err(|error| error.to_string())?;
+    let name = RemoteName::parse(remote).map_err(refused(Class::Remote))?;
+    let config = RemoteConfig::load(&paths, &name).map_err(refused(Class::Remote))?;
     if config.mode != RemoteMode::Encrypted {
-        return Err(format!(
-            "remote {name} stores plain files and cannot back an encrypted mount; sync it with `zdrive sync --remote {name} --dir DIR`"
+        return Err(Failure::refused(
+            Class::Remote,
+            format!(
+                "remote {name} stores plain files and cannot back an encrypted mount; sync it with `zdrive sync --remote {name} --dir DIR`"
+            ),
         ));
     }
-    let client = oauth::client_for(&config.issuer()).map_err(|error| error.to_string())?;
+    let client = oauth::client_for(&config.issuer()).map_err(refused(Class::Remote))?;
     let display = canonical.display().to_string();
     let kind = cli::inspect_store(base, &display)?;
     if kind == StoreKind::V1 {
-        return Err(format!(
-            "{display} is a v1 store; automatic remote sync needs v2: run `zdrive --migrate-v2 --encrypted-dir {display}` first"
+        return Err(Failure::refused(
+            Class::Store,
+            format!(
+                "{display} is a v1 store; automatic remote sync needs v2: run `zdrive --migrate-v2 --encrypted-dir {display}` first"
+            ),
         ));
     }
     // A new store may be created below, so its passphrase is confirmed.
@@ -137,8 +148,16 @@ pub(crate) fn prepare(
         passphrase_file,
         terminal,
         kind == StoreKind::Absent,
-    )?;
-    let mut drive = cli::open_drive(client, &paths, &config, &name, Some(&passphrase))?;
+    )
+    .map_err(|error| Failure::refused(Class::Custody, error))?;
+    // Every way a credential fails to open is a configuration problem.
+    let mut drive =
+        cli::open_drive(client, &paths, &config, &name, Some(&passphrase)).map_err(|error| {
+            Failure {
+                class: refusal::remote_class(&error).or(Some(Class::Remote)),
+                message: error.to_string(),
+            }
+        })?;
     let policy = drive.retry_policy();
     drive.set_retry_policy(policy.bounded(STARTUP_ATTEMPTS, STARTUP_RETRY_CAP));
     let state_dir = cli::replica_state(&paths, &name, canonical)?;
@@ -176,9 +195,12 @@ pub(crate) fn prepare(
                     "the remote holds no store yet; the first upload creates it",
                 ),
                 Ok(_) | Err(RemoteError::NotFound(_)) => {
-                    return Err(format!(
-                        "the Drive folder of remote {name} ({}) no longer exists; choose another with `zdrive remote auth --remote {name}`",
-                        config.folder_hint
+                    return Err(Failure::refused(
+                        Class::DriveFolder,
+                        format!(
+                            "the Drive folder of remote {name} ({}) no longer exists; choose another with `zdrive remote auth --remote {name}`",
+                            config.folder_hint
+                        ),
                     ));
                 }
                 Err(RemoteError::Network(error)) if kind == StoreKind::V2 => {
@@ -263,14 +285,17 @@ fn record_final_push(outcome: &Outcome, uploaded: bool, timed_out: bool, elapsed
     );
 }
 
-fn refusal(name: &RemoteName, error: &RemoteError) -> String {
+fn refusal(name: &RemoteName, error: &RemoteError) -> Failure {
     let advice = match error {
         RemoteError::Diverged(_) => {
             "; mount without --remote to read the local files, then resolve it with `zdrive remote status`"
         }
         _ => "",
     };
-    format!("remote {name}: {error}; the drive was not mounted{advice}")
+    Failure::remote(
+        error,
+        format!("remote {name}: {error}; the drive was not mounted{advice}"),
+    )
 }
 
 /// Why the mount must stay read-only: another replica renewed its lease

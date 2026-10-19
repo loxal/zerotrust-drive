@@ -10,6 +10,7 @@ mod macos_integration_tests;
 mod migrate;
 mod plain;
 mod prompt;
+mod refusal;
 mod rekey;
 mod remote;
 mod service;
@@ -36,6 +37,7 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsE
 
 use clap::{Parser, Subcommand};
 use fuser::{Config, MountOption};
+use refusal::Failure;
 
 const DEMO_PASSPHRASE: &str = "zerotrust-demo-passphrase";
 
@@ -227,6 +229,15 @@ pub(crate) fn start_telemetry(options: &RunOptions, mode: &'static str, remote_k
         });
     if let Err(error) = started {
         eprintln!("zerotrust-drive: note: telemetry is off for this run: {error}");
+    }
+}
+
+/// Arms refusals when this process runs as service instance `--telemetry-instance`.
+fn arm_refusals(options: &RunOptions) {
+    if options.service
+        && let Some(name) = &options.telemetry_instance
+    {
+        refusal::arm(name);
     }
 }
 
@@ -763,7 +774,7 @@ impl DriveOperationLock {
     }
 }
 
-fn exit_with_error(message: impl std::fmt::Display) -> ! {
+pub(crate) fn exit_with_error(message: impl std::fmt::Display) -> ! {
     eprintln!("zerotrust-drive: error: {message}");
     if let Some(note) = service_status(&message.to_string()) {
         let _ = service::notify::status(&note);
@@ -800,11 +811,13 @@ fn main() {
             exit_process(setup::run(args))
         }
         Some(Command::Sync(args)) => {
+            arm_refusals(&args.run);
             start_telemetry(&args.run, "plain", "google-drive");
             exit_process(plain::cli::run(args))
         }
         None => {}
     }
+    arm_refusals(&cli.run);
     let gc_requested_early = cli.gc_v2
         || cli.gc_v2_quarantine.is_some()
         || cli.gc_v2_restore.is_some()
@@ -819,7 +832,8 @@ fn main() {
     // actually serves. Migration and GC never mount.
     let mounts = !(cli.migrate_format || cli.migrate_v2 || gc_requested_early);
     let backend = if mounts {
-        fskit::select(cli.fuse_backend).unwrap_or_else(|e| exit_with_error(e))
+        fskit::select(cli.fuse_backend)
+            .unwrap_or_else(|e| refusal::exit(Failure::refused(refusal::Class::Backend, e)))
     } else {
         fskit::Backend::Kernel
     };
@@ -854,7 +868,7 @@ fn main() {
             let legacy = expand_home_from_env(Path::new(LEGACY_ENCRYPTED_DIR))
                 .unwrap_or_else(|e| exit_with_error(e));
             default_encrypted_dir(&paths.default_store(), &legacy)
-                .unwrap_or_else(|e| exit_with_error(e))
+                .unwrap_or_else(|e| refusal::exit(Failure::refused(refusal::Class::Store, e)))
         }
     };
     cli.passphrase_file = cli
@@ -869,7 +883,7 @@ fn main() {
         // Catch direct nesting before creating either directory. Canonical
         // validation below repeats the check to cover symlinks and `..`.
         ensure_disjoint_paths(&expanded_base, &expanded_mountpoint)
-            .unwrap_or_else(|e| exit_with_error(e));
+            .unwrap_or_else(|e| refusal::exit(Failure::refused(refusal::Class::MountPoint, e)));
     }
     let display_base_path = if gc_requested {
         std::fs::canonicalize(&expanded_base).unwrap_or_else(|error| {
@@ -889,7 +903,7 @@ fn main() {
             create_and_canonicalize(&expanded_mountpoint, "decrypted mount directory")
                 .unwrap_or_else(|e| exit_with_error(e));
         ensure_disjoint_paths(&display_base_path, &canonical_mountpoint)
-            .unwrap_or_else(|e| exit_with_error(e));
+            .unwrap_or_else(|e| refusal::exit(Failure::refused(refusal::Class::MountPoint, e)));
         canonical_mountpoint
     };
 
@@ -918,12 +932,15 @@ fn main() {
     if cli.run.service
         && cli.passphrase.is_none()
         && prompt::stored_passphrase(cli.passphrase_file.as_deref())
-            .unwrap_or_else(|e| exit_with_error(e))
+            .unwrap_or_else(|e| refusal::exit(Failure::refused(refusal::Class::Custody, e)))
             .is_none()
     {
-        exit_with_error(format!(
-            "--service never prompts: provide the passphrase through ZEROTRUST_PASSPHRASE, $CREDENTIALS_DIRECTORY/{} or --passphrase-file",
-            service::custody::CREDENTIAL_NAME
+        refusal::exit(Failure::refused(
+            refusal::Class::Custody,
+            format!(
+                "--service never prompts: provide the passphrase through ZEROTRUST_PASSPHRASE, $CREDENTIALS_DIRECTORY/{} or --passphrase-file",
+                service::custody::CREDENTIAL_NAME
+            ),
         ));
     }
     let prepared_remote = cli.remote.take().map(|remote| {
@@ -936,16 +953,19 @@ fn main() {
             cli.passphrase_file.as_deref(),
             terminal.as_mut(),
         )
-        .unwrap_or_else(|e| exit_with_error(e))
+        .unwrap_or_else(|failure| refusal::exit(failure))
     });
 
     // An interrupted first pull leaves objects without a head. Mounting,
     // migration and GC would all take it for a new or broken store.
     if remote::sync::bootstrap_pending(&base_path).unwrap_or_else(|e| exit_with_error(e)) {
-        exit_with_error(format!(
-            "an interrupted first pull left {} incomplete; finish it with `zdrive remote pull --remote NAME --encrypted-dir {}`",
-            display_base_path.display(),
-            display_base_path.display()
+        refusal::exit(Failure::refused(
+            refusal::Class::Store,
+            format!(
+                "an interrupted first pull left {} incomplete; finish it with `zdrive remote pull --remote NAME --encrypted-dir {}`",
+                display_base_path.display(),
+                display_base_path.display()
+            ),
         ));
     }
 
@@ -994,6 +1014,12 @@ fn main() {
     }
     let using_insecure_passphrase = insecure_new_store_passphrase(&passphrase);
     if using_insecure_passphrase && !index_exists && !root_exists && !cli.allow_default_passphrase {
+        if refusal::armed() {
+            refusal::exit(Failure::refused(
+                refusal::Class::Passphrase,
+                "refusing to create a new drive with an empty or built-in demo passphrase",
+            ));
+        }
         eprintln!(
             "zerotrust-drive: error: refusing to create a new drive with an empty or built-in demo passphrase"
         );

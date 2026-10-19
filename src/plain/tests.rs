@@ -750,7 +750,11 @@ fn watch_stops_at_once_on_a_refused_folder() {
         &mut |_| calls.set(calls.get() + 1),
     );
     let error = result.unwrap_err();
-    assert!(error.contains("not marked for plain sync"), "{error}");
+    assert!(
+        error.message.contains("not marked for plain sync"),
+        "{error}"
+    );
+    assert_eq!(error.class, Some(crate::refusal::Class::DriveFolder));
     assert_eq!(calls.get(), 1);
 }
 
