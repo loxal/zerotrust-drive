@@ -166,11 +166,22 @@ pub(crate) fn stored_passphrase(
     passphrase_file: Option<&Path>,
 ) -> Result<Option<(String, PassphraseSource)>, String> {
     let credentials = std::env::var_os("CREDENTIALS_DIRECTORY").map(PathBuf::from);
-    resolve_stored(
-        std::env::var("ZEROTRUST_PASSPHRASE").ok(),
-        credentials.as_deref(),
-        passphrase_file,
-    )
+    let from_env = std::env::var("ZEROTRUST_PASSPHRASE").ok();
+    if let Some(notice) = overridden_file_notice(from_env.is_some(), passphrase_file) {
+        eprintln!("{notice}");
+    }
+    resolve_stored(from_env, credentials.as_deref(), passphrase_file)
+}
+
+/// An explicit `--passphrase-file` that the environment overrides would
+/// otherwise be ignored silently, and a different secret only shows up later
+/// as an authentication failure.
+fn overridden_file_notice(env_set: bool, passphrase_file: Option<&Path>) -> Option<String> {
+    let path = passphrase_file.filter(|_| env_set)?;
+    Some(format!(
+        "zerotrust-drive: note: ZEROTRUST_PASSPHRASE is set and takes precedence; --passphrase-file {} is not read",
+        path.display()
+    ))
 }
 
 fn resolve_stored(
@@ -497,6 +508,13 @@ mod tests {
             resolve_stored(Some("env".to_string()), Some(&credentials), Some(&file)),
             Ok(Some(("env".to_string(), PassphraseSource::Environment)))
         );
+        assert!(
+            overridden_file_notice(true, Some(&file))
+                .is_some_and(|notice| notice.contains("takes precedence")
+                    && notice.contains(&file.display().to_string()))
+        );
+        assert_eq!(overridden_file_notice(true, None), None);
+        assert_eq!(overridden_file_notice(false, Some(&file)), None);
         // A relative credentials directory is not one systemd provides.
         assert_eq!(
             resolve_stored(None, Some(Path::new("credentials")), None),

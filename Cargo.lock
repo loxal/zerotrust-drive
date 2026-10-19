@@ -1056,7 +1056,7 @@ checksum = "e13084392c5e4bc371903e2935a5eaeed24905a7511356b883835e18a78f6879"
 
 [[package]]
 name = "zerotrust-drive"
-version = "0.18.0"
+version = "0.19.0"
 dependencies = [
  "argon2",
  "blake2",
