@@ -62,7 +62,8 @@ root as transaction evidence; the first generation is published with atomic no-r
    [release](https://github.com/loxal/zerotrust-drive/releases), see
    [Linux installation](#linux-installation). On macOS, install
    [macFUSE](https://macfuse.github.io/) and the release's `zdrive-macos-aarch64` binary as
-   `zdrive` on your `PATH`.
+   `zdrive` on your `PATH`; with macFUSE 5 no kernel extension is needed (see
+   [Prerequisites](#prerequisites)).
 2. Run the guided setup with your Google account:
 
        zdrive setup --account you@gmail.com
@@ -342,7 +343,9 @@ named remote:
   `drive.file` scope: zdrive sees only the files and folders it created itself, from any computer
   that uses this client, and never the rest of your Drive. It creates the folder "ZeroTrust Drive"
   in My Drive (`--folder-name NAME` chooses another name) or joins the one an earlier
-  installation created; when several such folders exist it refuses and lists their ids.
+  installation created. Before joining, it prints that folder's name, id, creation time, owner
+  and the number of items at its top level; when several such folders exist it refuses and lists
+  up to ten of them with the same details.
   `--folder-path A/B` places the remote at a nested path below My Drive instead, joining the
   folders an earlier installation created on that path. Folders you created yourself stay
   invisible to this client, so zdrive creates its own folder beside one of the same name.
@@ -426,6 +429,24 @@ Keep the store out of synced folders, then mount it with `--remote`:
 material), DIVERGED or FORKED, and exits with status 1 for the last three. A push resumes
 interrupted uploads, including a resumable upload session that a killed process had begun.
 
+#### Removing a remote
+
+    zdrive remote remove gdrive            # forget the remote on this computer
+    zdrive remote remove gdrive --revoke   # also end the Google sign-in
+
+`remote remove` deletes only this computer's records of the remote: its configuration, its sealed
+Google credential and its sync state (or, for a plain remote, its index and lock). The local
+store or folder, a plain folder's local trash and everything on Drive stay; the summary prints the
+Drive folder's address so you can move it to the Drive bin yourself. It refuses while a service
+definition uses the remote, naming each one, and while a sync or mount holds the replica. It asks
+before removing on a terminal and needs `--yes` otherwise.
+
+`--revoke` first revokes the Google grant. Google ends the whole grant of the bundled client,
+which signs out **every** zdrive install of that Google account, on every computer; the
+confirmation names the other remotes on this computer that share the account. An already revoked
+grant counts as done; when the revocation fails, nothing is removed. An encrypted remote needs the
+store passphrase to unseal its credential.
+
 #### Remote layout
 
 Inside the chosen Drive folder:
@@ -478,8 +499,10 @@ also uploads the store's local evidence files, which `zdrive` does not replicate
 replica does not need them. In four of seven W3 runs, counting an earlier series, it still
 lacked one or two files of the store when observation ended after 10-20 minutes; each one
 identified was an evidence file. A fresh pull of W1 onto an empty directory took 30 s (median);
-of W2, 38 s, which is bounded by one file and directory sync per installed object. Requests were
-not counted. The harness is
+of W2, 38 s, which was bounded by one file and directory sync per installed object. Since 0.19.0 a
+pull fsyncs each object as it is written and makes them all durable with one directory barrier
+before the new root is installed; in interleaved release-build runs of the same 2,000-file pull on
+this Mac, four rounds each, the median fell from 35.4 s to 6.0 s. Requests were not counted. The harness is
 `src/remote/bench_tests.rs`; it needs a configured remote and runs only when asked.
 
 #### Limits
@@ -508,7 +531,10 @@ every file**, and the files are readable in the Drive web interface. It needs no
     zdrive sync --remote plain --dir ~/zdrive --watch  # keep syncing, every 15 s (--interval SECS)
 
 Setup signs in, creates or joins the marked Drive folder, runs the first sync and installs
-[auto-start](#auto-start), which runs `zdrive sync --watch`. The first SIGINT or SIGTERM finishes
+[auto-start](#auto-start), which runs `zdrive sync --watch`. Joining brings that folder's files to
+this computer, so a plain folder found in My Drive is described first and joined only after a
+yes on the terminal or with `--yes`; without either, nothing is saved. A folder named with
+`--folder-id` or `--folder-path` is joined without asking. The first SIGINT or SIGTERM finishes
 the current cycle and runs a final one; a second stops at once.
 
 Each cycle first applies Drive's change feed, then uploads what changed locally:
@@ -576,6 +602,17 @@ in sync).
   failure) starts the drive at boot. Boot start needs lingering for your user; zdrive enables it
   when polkit allows, and otherwise prints the exact `sudo loginctl enable-linger <user>` to run.
   Logs: `journalctl --user -u zerotrust-drive@<name>`.
+
+A failure that cannot heal by itself stops the service instead of restarting it forever: a wrong
+passphrase, a missing remote or service definition, a refused or binned Drive folder, a revoked
+Google sign-in or an invalid mount point. The drive records the cause under
+`~/.local/state/zerotrust-drive/services/<name>.refusal.json` and exits with status 78
+(`EX_CONFIG`) on Linux, which the unit excludes with `RestartPreventExitStatus=78`, or 0 on macOS,
+where the LaunchAgent restarts only after an unsuccessful exit. `zdrive service status <name>` and
+`zdrive doctor` show the cause with the exact fix; `zdrive service install --name <name>` clears it
+and starts the service again. Network outages, a busy mount point and I/O errors stay transient and
+are restarted as before. Since 0.19.0; `zdrive doctor` flags an auto-start entry an older zdrive
+generated, and `zdrive service install --name <name>` rewrites it.
 
 An unattended encrypted drive needs its passphrase without a terminal. On Linux with systemd 256 or
 newer, zdrive encrypts it with `systemd-creds --user`, bound to the machine's TPM or host key,
@@ -684,9 +721,23 @@ A FUSE implementation is required. Install the one for your OS:
 - **Linux** - FUSE 3 (the `fuse3` package; the `.deb` below installs it for you)
 - **Windows** - not supported (would require [WinFSP](https://winfsp.dev/) and a different FUSE crate)
 
-[Plain mode](#plain-mode) needs no FUSE. `zdrive doctor` reports whether FUSE is ready. On macOS,
-macFUSE's kernel extension loads at the first mount, which macOS must allow under System Settings >
-Privacy & Security; on Apple silicon, kernel extensions must first be enabled in recoveryOS.
+[Plain mode](#plain-mode) needs no FUSE. `zdrive doctor` reports whether FUSE is ready, which
+macFUSE version is installed, and which backend a mount will use.
+
+On macOS, macFUSE offers two backends, chosen with `--fuse-backend auto|kext|fskit` on a mount,
+`zdrive setup` and `zdrive service install`:
+
+- `kext`: macFUSE's kernel extension, which loads at the first mount once macOS allows it under
+  System Settings > Privacy & Security; on Apple silicon, kernel extensions must first be enabled
+  in recoveryOS.
+- `fskit` (since 0.19.0): macFUSE 5's FSKit module (macOS 15.4 or newer), which runs in user
+  space and needs no kernel extension. Enable it under System Settings > General > Login Items & Extensions > File System
+  Extensions. On macFUSE before 5.5.0, a killed drive leaves its FSKit volume hung; `zdrive
+  doctor` warns about this and names the process to end.
+- `auto` (the default) uses the kernel extension when it is loaded and otherwise the FSKit module
+  when macOS lists it as enabled. A service stores the backend only when it is not `auto`.
+
+Linux refuses the macOS backends.
 
 #### Linux installation
 
