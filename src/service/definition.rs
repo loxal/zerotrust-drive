@@ -8,6 +8,7 @@ use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::fskit::BackendArg;
 use crate::remote::config::{Paths, RemoteName};
 use crate::remote::{ensure_private_dir, read_private_file, write_private_file};
 
@@ -45,6 +46,8 @@ pub(crate) enum Instance {
         encrypted_dir: PathBuf,
         mount_dir: PathBuf,
         custody: Custody,
+        /// macOS: how the drive is mounted; `auto` decides at every start.
+        fuse_backend: BackendArg,
     },
     /// Keep the plain folder `local_dir` in sync with `remote`.
     Plain { remote: String, local_dir: PathBuf },
@@ -75,6 +78,10 @@ struct DefinitionFile {
     custody: String,
     passphrase_file: Option<PathBuf>,
     final_push_wait_secs: u64,
+    /// Written only when not `auto`, so definitions without it, including
+    /// those of zdrive 0.18, keep their meaning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    fuse_backend: Option<String>,
 }
 
 pub(crate) fn services_dir(paths: &Paths) -> PathBuf {
@@ -188,6 +195,7 @@ impl Definition {
                 encrypted_dir,
                 mount_dir,
                 custody,
+                fuse_backend: _,
             } => {
                 if let Some(remote) = remote {
                     validate_remote(remote)?;
@@ -253,11 +261,18 @@ impl Definition {
                         ));
                     }
                 };
+                let fuse_backend = match file.fuse_backend.as_deref() {
+                    None => BackendArg::Auto,
+                    Some(text) => BackendArg::parse(text).ok_or_else(|| {
+                        format!("fuse_backend {text:?} is not \"auto\", \"kext\" or \"fskit\"")
+                    })?,
+                };
                 Instance::Encrypted {
                     remote: file.remote,
                     encrypted_dir,
                     mount_dir,
                     custody,
+                    fuse_backend,
                 }
             }
             MODE_PLAIN => {
@@ -268,6 +283,9 @@ impl Definition {
                 }
                 if file.passphrase_file.is_some() {
                     return Err("passphrase_file is valid only in encrypted mode".to_string());
+                }
+                if file.fuse_backend.is_some() {
+                    return Err("fuse_backend is valid only in encrypted mode".to_string());
                 }
                 if file.custody != CUSTODY_NONE {
                     return Err(format!(
@@ -308,6 +326,7 @@ impl Definition {
             custody: CUSTODY_NONE.to_string(),
             passphrase_file: None,
             final_push_wait_secs: self.final_push_wait_secs,
+            fuse_backend: None,
         };
         match &self.instance {
             Instance::Encrypted {
@@ -315,11 +334,15 @@ impl Definition {
                 encrypted_dir,
                 mount_dir,
                 custody,
+                fuse_backend,
             } => {
                 file.mode = MODE_ENCRYPTED.to_string();
                 file.remote = remote.clone();
                 file.encrypted_dir = Some(encrypted_dir.clone());
                 file.mount_dir = Some(mount_dir.clone());
+                if *fuse_backend != BackendArg::Auto {
+                    file.fuse_backend = Some(fuse_backend.as_str().to_string());
+                }
                 match custody {
                     Custody::SystemdCreds => file.custody = CUSTODY_SYSTEMD_CREDS.to_string(),
                     Custody::File(path) => {
@@ -401,6 +424,7 @@ mod tests {
                 encrypted_dir: PathBuf::from("/abs/store"),
                 mount_dir: PathBuf::from("/abs/mount"),
                 custody,
+                fuse_backend: BackendArg::Auto,
             },
             final_push_wait_secs: 60,
         }
@@ -445,6 +469,7 @@ mod tests {
                     encrypted_dir: PathBuf::from("/abs/store"),
                     mount_dir: PathBuf::from("/abs/mount"),
                     custody: Custody::File(PathBuf::from("/abs/secret")),
+                    fuse_backend: BackendArg::Fskit,
                 },
                 final_push_wait_secs: 0,
             },
@@ -481,6 +506,34 @@ mod tests {
             serde_json::from_slice::<serde_json::Value>(&json(&[])).unwrap()
         );
         assert!(text.ends_with("}\n"));
+    }
+
+    #[test]
+    fn service_definition_stores_only_a_chosen_fuse_backend() {
+        use serde_json::json as j;
+        // A 0.18 definition has no fuse_backend and means auto, which is
+        // never written, so 0.18 can still read what auto writes.
+        let text = encrypted(Custody::SystemdCreds).to_json().unwrap();
+        assert!(!text.contains("fuse_backend"), "{text}");
+        let pinned = |backend| {
+            let mut def = encrypted(Custody::SystemdCreds);
+            if let Instance::Encrypted { fuse_backend, .. } = &mut def.instance {
+                *fuse_backend = backend;
+            }
+            def
+        };
+        for backend in [BackendArg::Kext, BackendArg::Fskit] {
+            let text = pinned(backend).to_json().unwrap();
+            let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(value["fuse_backend"], j!(backend.as_str()));
+            assert_eq!(Definition::parse(text.as_bytes()).unwrap(), pinned(backend));
+        }
+        assert_eq!(
+            Definition::parse(&json(&[("fuse_backend", j!("auto"))])).unwrap(),
+            encrypted(Custody::SystemdCreds)
+        );
+        assert!(refusal(&[("fuse_backend", j!("kernel"))]).contains("is not \"auto\""));
+        assert!(refusal(&[("fuse_backend", j!(1))]).contains("invalid type"));
     }
 
     #[test]
@@ -552,6 +605,7 @@ mod tests {
         assert!(error(&[("custody", j!("file"))]).contains("must be \"none\""));
         assert!(error(&[("passphrase_file", j!("/abs/p"))]).contains("only in encrypted"));
         assert!(error(&[("mount_dir", j!("/abs/m"))]).contains("only in encrypted"));
+        assert!(error(&[("fuse_backend", j!("fskit"))]).contains("only in encrypted"));
         assert!(error(&[("local_dir", j!("folder"))]).contains("absolute"));
     }
 

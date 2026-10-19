@@ -376,6 +376,7 @@ mod tests {
                 encrypted_dir: PathBuf::from("/abs/store"),
                 mount_dir: PathBuf::from("/abs/mount"),
                 custody: Custody::File(secret),
+                fuse_backend: crate::fskit::BackendArg::Auto,
             },
             final_push_wait_secs: 60,
         }

@@ -123,7 +123,10 @@ fn records_round_trip_through_private_jsonl_files() {
     assert_eq!(start["mode"], "mount");
     assert_eq!(start["level"], "standard");
     assert_eq!(start["pid"], std::process::id());
-    assert!(["macfuse", "fusermount3", "none"].contains(&start["fuse"].as_str().unwrap()));
+    assert!(
+        ["macfuse", "macfuse-fskit", "fusermount3", "none"]
+            .contains(&start["fuse"].as_str().unwrap())
+    );
 
     let event = &records[1];
     assert_eq!(event["name"], "remote.online");

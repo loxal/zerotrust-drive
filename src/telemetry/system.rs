@@ -99,6 +99,9 @@ pub(crate) fn kernel_release() -> String {
 
 /// Which FUSE implementation this host provides.
 pub(crate) fn fuse_flavour() -> &'static str {
+    if crate::fskit::active() {
+        return "macfuse-fskit";
+    }
     if Path::new("/Library/Filesystems/macfuse.fs").exists() {
         return "macfuse";
     }
@@ -259,7 +262,7 @@ mod tests {
     #[test]
     fn process_facts_are_available() {
         assert!(!kernel_release().is_empty());
-        assert!(["macfuse", "fusermount3", "none"].contains(&fuse_flavour()));
+        assert!(["macfuse", "macfuse-fskit", "fusermount3", "none"].contains(&fuse_flavour()));
         let usage = usage().expect("getrusage");
         assert!(usage.max_rss_bytes > 1024 * 1024, "{usage:?}");
         assert!(open_fds().expect("fd listing") >= 3);

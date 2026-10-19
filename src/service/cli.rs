@@ -13,6 +13,7 @@ use super::definition::{
     validate_name,
 };
 use super::{Host, Platform, Runner, SystemRunner, current_binary, systemd};
+use crate::fskit::BackendArg;
 use crate::prompt::{SecretReader, TerminalReader};
 
 #[derive(Subcommand, Debug)]
@@ -107,6 +108,12 @@ pub(crate) struct InstallArgs {
     #[arg(long, value_name = "SECS")]
     pub(crate) final_push_wait: Option<u64>,
 
+    /// macOS, encrypted mode: mount through macFUSE's kernel extension
+    /// (kext) or its FSKit module (fskit) instead of deciding at every
+    /// start (auto)
+    #[arg(long, value_enum, value_name = "BACKEND")]
+    pub(crate) fuse_backend: Option<BackendArg>,
+
     /// Store the passphrase again even if the custody already holds one,
     /// for example after a passphrase rotation
     #[arg(long)]
@@ -121,6 +128,7 @@ impl InstallArgs {
             || self.mount_dir.is_some()
             || self.local_dir.is_some()
             || self.final_push_wait.is_some()
+            || self.fuse_backend.is_some()
     }
 
     fn defines_custody(&self) -> bool {
@@ -252,11 +260,14 @@ fn definition_from_flags(
                 .mount_dir
                 .as_deref()
                 .ok_or("encrypted mode needs --mount-dir")?;
+            let fuse_backend = args.fuse_backend.unwrap_or_default();
+            crate::fskit::check_platform(fuse_backend, host.platform == Platform::MacOs)?;
             Instance::Encrypted {
                 remote: args.remote.clone(),
                 encrypted_dir: resolve_path(encrypted_dir, "encrypted-dir", false)?,
                 mount_dir: resolve_path(mount_dir, "mount-dir", true)?,
                 custody: choose_custody(host, args, probe_dir, runner, lines)?,
+                fuse_backend,
             }
         }
         ModeArg::Plain => {
@@ -266,6 +277,7 @@ fn definition_from_flags(
                 ("custody", args.custody.is_some()),
                 ("passphrase-file", args.passphrase_file.is_some()),
                 ("replace-passphrase", args.replace_passphrase),
+                ("fuse-backend", args.fuse_backend.is_some()),
             ] {
                 only_with(flag, given, "encrypted")?;
             }
@@ -557,6 +569,7 @@ mod tests {
             encrypted_dir,
             mount_dir,
             custody,
+            fuse_backend,
         } = &def.instance
         else {
             panic!("{def:?}");
@@ -566,6 +579,7 @@ mod tests {
         assert_eq!(*encrypted_dir, root.join("store"));
         assert_eq!(*mount_dir, root.join("mount"));
         assert_eq!(*custody, Custody::SystemdCreds);
+        assert_eq!(*fuse_backend, BackendArg::Auto);
         assert_eq!(def.final_push_wait_secs, 60);
         assert_eq!(Definition::load(&host.paths, "enc").unwrap(), def);
         let argv = runner.argv();
@@ -859,6 +873,41 @@ mod tests {
             },
             "a plain instance has no passphrase custody",
         );
+        refuse(
+            InstallArgs {
+                fuse_backend: Some(BackendArg::Fskit),
+                ..plain_args(&dir)
+            },
+            "--fuse-backend is valid only with --mode encrypted",
+        );
+        refuse(
+            InstallArgs {
+                fuse_backend: Some(BackendArg::Kext),
+                ..encrypted_args(&dir)
+            },
+            "--fuse-backend kext applies only to macOS",
+        );
+    }
+
+    #[test]
+    fn service_install_stores_a_chosen_fuse_backend_on_macos() {
+        let dir = TestDir::new("service-cli-fuse-backend");
+        let host = host(&dir, Platform::MacOs);
+        let runner = FakeRunner::succeeding();
+        let args = InstallArgs {
+            fuse_backend: Some(BackendArg::Fskit),
+            ..encrypted_args(&dir)
+        };
+        let (def, _) =
+            prepare_install(&host, &args, inputs(&dir, Some("s3cret"), None), &runner).unwrap();
+        assert!(matches!(
+            def.instance,
+            Instance::Encrypted {
+                fuse_backend: BackendArg::Fskit,
+                ..
+            }
+        ));
+        assert_eq!(Definition::load(&host.paths, "enc").unwrap(), def);
     }
 
     fn plain_args(dir: &TestDir) -> InstallArgs {

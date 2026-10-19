@@ -45,6 +45,11 @@ struct Fuse {
     flavour: &'static str,
     ready: bool,
     detail: String,
+    /// macOS: what `--fuse-backend auto` mounts through now, `kext` or
+    /// `fskit`.
+    backend: Option<&'static str>,
+    /// macOS: the installed macFUSE version.
+    version: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -128,6 +133,7 @@ fn gather(runner: &dyn Runner) -> Report {
     if !report.fuse.ready && report.fuse.flavour != "macfuse" {
         report.problems.push(report.fuse.detail.clone());
     }
+    report.notes.extend(fskit_hang_note(&report.fuse));
     if !(desktop && device) {
         report.notes.push(
             "this build has no bundled Google client; sign in with your own: zdrive remote auth --remote NAME --client-file FILE"
@@ -200,7 +206,7 @@ fn host_fuse(runner: &dyn Runner) -> Fuse {
         .filter(service::Output::success)
         .map(|output| output.stdout_text());
     macos_fuse(
-        Path::new("/Library/Filesystems/macfuse.fs"),
+        Path::new(crate::fskit::MACFUSE_BUNDLE),
         Path::new("/dev"),
         modules.as_deref(),
     )
@@ -212,6 +218,8 @@ fn host_fuse(_runner: &dyn Runner) -> Fuse {
         flavour: "none",
         ready: false,
         detail: "zdrive mounts only on Linux and macOS".to_string(),
+        backend: None,
+        version: None,
     }
 }
 
@@ -229,6 +237,8 @@ fn linux_fuse(device: &Path, path_var: Option<OsString>, root: bool) -> Fuse {
             ready: false,
             detail: "fusermount3 is not installed: sudo apt install fuse3 (plain sync mode needs no FUSE)"
                 .to_string(),
+            backend: None,
+            version: None,
         };
     };
     let device_ok = std::fs::metadata(device).is_ok_and(|meta| meta.file_type().is_char_device());
@@ -240,6 +250,8 @@ fn linux_fuse(device: &Path, path_var: Option<OsString>, root: bool) -> Fuse {
                 "{} is missing: load the module with sudo modprobe fuse; a container needs --device /dev/fuse",
                 device.display()
             ),
+            backend: None,
+            version: None,
         };
     }
     let setuid =
@@ -252,43 +264,69 @@ fn linux_fuse(device: &Path, path_var: Option<OsString>, root: bool) -> Fuse {
                 "{} is not setuid root, so only root can mount: reinstall fuse3",
                 helper.display()
             ),
+            backend: None,
+            version: None,
         };
     }
     Fuse {
         flavour: "fusermount3",
         ready: true,
         detail: format!("{} and {}", helper.display(), device.display()),
+        backend: None,
+        version: None,
     }
 }
 
-/// macOS mounts through macFUSE. Its kernel extension loads on the first
-/// mount once macOS allows it, so "not loaded" is advice, not a failure.
+/// macOS mounts through macFUSE's kernel extension or its FSKit module. The
+/// extension loads on the first mount once macOS allows it, so "not loaded"
+/// without FSKit is advice, not a failure. FSKit's own settings file is never
+/// read: it lives in another app's container, which can raise a privacy
+/// prompt, and pluginkit already shows whether the module is in use.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn macos_fuse(bundle: &Path, dev: &Path, fskit_modules: Option<&str>) -> Fuse {
+    use crate::fskit;
     if !bundle.is_dir() {
         return Fuse {
             flavour: "none",
             ready: false,
             detail: "macFUSE is not installed: get it from https://macfuse.github.io (plain sync mode needs no FUSE)"
                 .to_string(),
+            backend: None,
+            version: None,
         };
     }
-    let loaded = std::fs::read_dir(dev).is_ok_and(|entries| {
-        entries
-            .flatten()
-            .any(|entry| entry.file_name().to_string_lossy().starts_with("macfuse"))
-    });
-    let fskit = fskit_modules.is_some_and(|text| text.to_ascii_lowercase().contains("macfuse"));
-    let detail = match (loaded, fskit) {
+    let version = std::fs::read_to_string(bundle.join("Contents/Info.plist"))
+        .ok()
+        .and_then(|plist| fskit::bundle_version(&plist));
+    let loaded = fskit::kext_loaded(dev);
+    let registered = fskit_modules.is_some_and(fskit::registered_in);
+    let backend = fskit::resolve(fskit::BackendArg::Auto, loaded, registered);
+    let detail = match (loaded, registered) {
         (true, _) => "macFUSE kernel extension loaded".to_string(),
-        (false, true) => "macFUSE FSKit module registered; its kernel extension is not loaded".to_string(),
-        (false, false) => "macFUSE is installed but its kernel extension is not loaded: the first mount loads it, which macOS must allow under System Settings > Privacy & Security (on Apple silicon after enabling kernel extensions in recoveryOS)".to_string(),
+        (false, true) => "macFUSE's kernel extension is not loaded; mounts go through its FSKit module".to_string(),
+        (false, false) => "macFUSE is installed but neither backend is usable yet: enable its FSKit module (macOS 15.4 or newer, no kernel extension) under System Settings > General > Login Items & Extensions > File System Extensions, or let the first mount load its kernel extension, which macOS must allow under System Settings > Privacy & Security (on Apple silicon after enabling kernel extensions in recoveryOS)".to_string(),
     };
     Fuse {
         flavour: "macfuse",
-        ready: loaded,
+        ready: loaded || registered,
         detail,
+        backend: Some(backend.as_str()),
+        version: version.map(|(major, minor, patch)| format!("{major}.{minor}.{patch}")),
     }
+}
+
+/// Advice when FSKit mounts with a macFUSE whose volumes hang after their
+/// server is killed (macfuse/macfuse#1201).
+fn fskit_hang_note(fuse: &Fuse) -> Option<String> {
+    let version = crate::fskit::parse_version(fuse.version.as_deref()?)?;
+    (fuse.backend == Some("fskit") && version < crate::fskit::RECOVERING_VERSION).then(|| {
+        let (major, minor, patch) = crate::fskit::RECOVERING_VERSION;
+        format!(
+            "macFUSE {} leaves an FSKit volume hung when zdrive is killed instead of stopped: every access to it blocks until the volume's {} process ends (quit it in Activity Monitor) or you log out; macFUSE {major}.{minor}.{patch} or newer recovers on its own",
+            fuse.version.as_deref().unwrap_or("?"),
+            crate::fskit::MODULE_ID
+        )
+    })
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -405,13 +443,20 @@ impl Report {
             self.version, self.os, self.arch, self.kernel
         );
         out.push_str(&format!(
-            "fuse: {}, {}: {}\n",
+            "fuse: {}{}, {}{}: {}\n",
             self.fuse.flavour,
+            self.fuse
+                .version
+                .as_deref()
+                .map_or_else(String::new, |version| format!(" {version}")),
             if self.fuse.ready {
                 "ready"
             } else {
                 "not ready"
             },
+            self.fuse
+                .backend
+                .map_or_else(String::new, |backend| format!(", auto backend {backend}")),
             self.fuse.detail
         ));
         out.push_str(&format!(
@@ -523,26 +568,78 @@ mod tests {
     }
 
     #[test]
-    fn macos_fuse_distinguishes_missing_from_not_loaded() {
+    fn macos_fuse_reports_each_backend_and_the_one_auto_picks() {
         let dir = TestDir::new("doctor-macos-fuse");
         let bundle = dir.path().join("macfuse.fs");
         let dev = dir.path().join("dev");
         std::fs::create_dir_all(&dev).unwrap();
+        let fskit = "+    io.macfuse.app.fsmodule.macfuse((null))\n";
 
-        let missing = macos_fuse(&bundle, &dev, None);
+        let missing = macos_fuse(&bundle, &dev, Some(fskit));
         assert_eq!((missing.flavour, missing.ready), ("none", false));
+        assert_eq!(missing.backend, None);
 
-        std::fs::create_dir_all(&bundle).unwrap();
-        let idle = macos_fuse(&bundle, &dev, Some("com.apple.fskit.exfat((null))"));
+        std::fs::create_dir_all(bundle.join("Contents")).unwrap();
+        let idle = macos_fuse(&bundle, &dev, Some("     com.apple.fskit.exfat((null))\n"));
         assert_eq!((idle.flavour, idle.ready), ("macfuse", false));
-        assert!(idle.detail.contains("Privacy & Security"));
+        assert_eq!(idle.backend, Some("kext"));
+        assert!(
+            idle.detail.contains("Privacy & Security"),
+            "{}",
+            idle.detail
+        );
+        assert!(
+            idle.detail.contains("File System Extensions"),
+            "{}",
+            idle.detail
+        );
+        assert_eq!(idle.version, None, "no Info.plist");
+        // A module the user set to be ignored does not count.
+        let ignored = "-    io.macfuse.app.fsmodule.macfuse((null))\n";
+        assert!(!macos_fuse(&bundle, &dev, Some(ignored)).ready);
+        // pluginkit failed or was not asked.
+        assert!(!macos_fuse(&bundle, &dev, None).ready);
 
-        let fskit = macos_fuse(&bundle, &dev, Some("io.macfuse.app.fsmodule(5.3.3)"));
-        assert!(!fskit.ready);
-        assert!(fskit.detail.contains("FSKit"));
+        std::fs::write(
+            bundle.join("Contents/Info.plist"),
+            "<dict>\n\t<key>CFBundleShortVersionString</key>\n\t<string>5.4.0</string>\n</dict>",
+        )
+        .unwrap();
+        let through_fskit = macos_fuse(&bundle, &dev, Some(fskit));
+        assert!(through_fskit.ready);
+        assert_eq!(through_fskit.backend, Some("fskit"));
+        assert_eq!(through_fskit.version.as_deref(), Some("5.4.0"));
+        assert!(through_fskit.detail.contains("FSKit module"));
+        let note = fskit_hang_note(&through_fskit).unwrap();
+        assert!(
+            note.contains("macFUSE 5.4.0 leaves an FSKit volume hung"),
+            "{note}"
+        );
+        assert!(
+            note.contains("io.macfuse.app.fsmodule.macfuse process"),
+            "{note}"
+        );
 
         std::fs::write(dev.join("macfuse0"), b"").unwrap();
-        assert!(macos_fuse(&bundle, &dev, None).ready);
+        let kext = macos_fuse(&bundle, &dev, Some(fskit));
+        assert!(kext.ready);
+        assert_eq!(kext.backend, Some("kext"));
+        assert_eq!(
+            fskit_hang_note(&kext),
+            None,
+            "the kernel path does not hang"
+        );
+
+        let current = Fuse {
+            version: Some("5.5.0".to_string()),
+            ..through_fskit
+        };
+        assert_eq!(fskit_hang_note(&current), None);
+        let unknown = Fuse {
+            version: None,
+            ..current
+        };
+        assert_eq!(fskit_hang_note(&unknown), None);
     }
 
     fn paths(dir: &TestDir) -> Paths {
@@ -615,6 +712,8 @@ mod tests {
                 flavour: "fusermount3",
                 ready: true,
                 detail: String::new(),
+                backend: None,
+                version: None,
             },
             bundled_client: Bundled {
                 desktop: true,
@@ -660,6 +759,8 @@ mod tests {
                 flavour: "fusermount3",
                 ready: true,
                 detail: String::new(),
+                backend: None,
+                version: None,
             },
             bundled_client: Bundled {
                 desktop: true,

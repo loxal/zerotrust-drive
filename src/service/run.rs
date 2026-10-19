@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use super::custody::{self, CREDENTIAL_NAME};
 use super::definition::{Custody, Definition, Instance};
 use super::{Host, SystemRunner, display_command, notify, recover};
+use crate::fskit::BackendArg;
 
 /// The arguments the instance runs `zdrive` with. Under systemd-creds
 /// custody the passphrase is the credential file that systemd decrypted
@@ -28,12 +29,16 @@ pub(crate) fn exec_args(def: &Definition, credentials_directory: Option<&Path>) 
             encrypted_dir,
             mount_dir,
             custody,
+            fuse_backend,
         } => {
             if let Some(remote) = remote {
                 push(&["--remote".as_ref(), remote.as_ref()]);
             }
             push(&["--encrypted-dir".as_ref(), encrypted_dir.as_os_str()]);
             push(&["--decrypted-dir".as_ref(), mount_dir.as_os_str()]);
+            if *fuse_backend != BackendArg::Auto {
+                push(&["--fuse-backend".as_ref(), fuse_backend.as_str().as_ref()]);
+            }
             let passphrase_file = match custody {
                 Custody::File(path) => Some(path.clone()),
                 Custody::SystemdCreds => credentials_directory.map(|dir| dir.join(CREDENTIAL_NAME)),
@@ -174,9 +179,22 @@ mod tests {
                 encrypted_dir: PathBuf::from("/abs/store"),
                 mount_dir: PathBuf::from("/abs/mount"),
                 custody,
+                fuse_backend: BackendArg::Auto,
             },
             final_push_wait_secs: 45,
         }
+    }
+
+    #[test]
+    fn service_exec_args_pass_only_a_chosen_fuse_backend() {
+        let mut def = encrypted(None, Custody::File(PathBuf::from("/abs/secret")));
+        assert!(!strings(&exec_args(&def, None)).contains(&"--fuse-backend".to_string()));
+        if let Instance::Encrypted { fuse_backend, .. } = &mut def.instance {
+            *fuse_backend = BackendArg::Fskit;
+        }
+        let args = strings(&exec_args(&def, None));
+        let at = args.iter().position(|arg| arg == "--fuse-backend").unwrap();
+        assert_eq!(args[at + 1], "fskit");
     }
 
     #[test]

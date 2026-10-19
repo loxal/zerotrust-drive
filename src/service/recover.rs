@@ -105,14 +105,21 @@ pub(crate) fn find_entry<'a>(
         .find(|entry| entry.mount_point == mount_point)
 }
 
+/// FSKit replaces the `fsname` with a per-volume `macfuse://<UUID>` source, so
+/// on macOS any FSKit macFUSE volume at the drive's own mount directory counts
+/// as the drive's.
+pub(crate) const FSKIT_SOURCE_PREFIX: &str = "macfuse://";
+
 fn is_ours(entry: &MountEntry, platform: Platform) -> bool {
-    entry.source == FS_NAME
-        && match platform {
-            Platform::Linux => entry.fstype.starts_with("fuse"),
-            Platform::MacOs => {
-                entry.fstype.starts_with("macfuse") || entry.fstype.starts_with("osxfuse")
-            }
+    match platform {
+        Platform::Linux => entry.source == FS_NAME && entry.fstype.starts_with("fuse"),
+        Platform::MacOs => {
+            (entry.source == FS_NAME
+                && (entry.fstype.starts_with("macfuse") || entry.fstype.starts_with("osxfuse")))
+                || (entry.source.starts_with(FSKIT_SOURCE_PREFIX)
+                    && entry.fstype.starts_with("macfuse"))
         }
+    }
 }
 
 fn is_dead(errno: i32, platform: Platform) -> bool {
@@ -138,7 +145,7 @@ pub(crate) fn classify(entry: Option<&MountEntry>, reach: Reach, platform: Platf
 /// The path the mount table shows for `mount_dir`: its canonical parent
 /// joined with its name. Canonicalizing the directory itself would stat the
 /// possibly dead mount. `None` when the parent does not exist.
-fn mount_key(mount_dir: &Path) -> Result<Option<PathBuf>, String> {
+pub(crate) fn mount_key(mount_dir: &Path) -> Result<Option<PathBuf>, String> {
     let (Some(parent), Some(name)) = (mount_dir.parent(), mount_dir.file_name()) else {
         return Err(format!(
             "mount directory {} has no parent",
@@ -208,11 +215,23 @@ pub(crate) fn recover_with(
             "{shown} is mounted by a zerotrust-drive that is already running; stop it first"
         )),
         MountCheck::Unresponsive => Err(format!(
-            "{shown} is a zerotrust-drive mount that does not answer within {} s; stop the zerotrust-drive serving it, or unmount it with `{}`",
+            "{shown} is a zerotrust-drive mount that does not answer within {} s; stop the zerotrust-drive serving it, or {}",
             STAT_TIMEOUT.as_secs(),
             match platform {
-                Platform::Linux => format!("fusermount3 -uz {}", super::shell_path(&key)),
-                Platform::MacOs => format!("umount -f {}", super::shell_path(&key)),
+                Platform::Linux => {
+                    format!(
+                        "unmount it with `fusermount3 -uz {}`",
+                        super::shell_path(&key)
+                    )
+                }
+                // `umount -f` blocks on an FSKit volume whose server was
+                // killed until macFUSE 5.5.0; ending the volume's module
+                // process releases it.
+                Platform::MacOs => format!(
+                    "unmount it with `umount -f {}`; if that hangs too, the volume uses FSKit with macFUSE older than 5.5.0: end its process (`pgrep -lf {}`) or log out, then update macFUSE",
+                    super::shell_path(&key),
+                    crate::fskit::MODULE_ID
+                ),
             }
         )),
         MountCheck::Foreign { fstype, source } => Err(format!(
@@ -270,14 +289,14 @@ fn stat_with_timeout(path: &Path, timeout: Duration) -> Reach {
 }
 
 #[cfg(target_os = "linux")]
-fn mount_table() -> Result<Vec<MountEntry>, String> {
+pub(crate) fn mount_table() -> Result<Vec<MountEntry>, String> {
     std::fs::read_to_string("/proc/self/mountinfo")
         .map(|text| parse_mountinfo(&text))
         .map_err(|error| format!("cannot read /proc/self/mountinfo: {error}"))
 }
 
 #[cfg(target_os = "macos")]
-fn mount_table() -> Result<Vec<MountEntry>, String> {
+pub(crate) fn mount_table() -> Result<Vec<MountEntry>, String> {
     use std::os::unix::ffi::OsStrExt;
     let text = |field: &[libc::c_char]| -> Vec<u8> {
         field
@@ -316,7 +335,7 @@ fn mount_table() -> Result<Vec<MountEntry>, String> {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn mount_table() -> Result<Vec<MountEntry>, String> {
+pub(crate) fn mount_table() -> Result<Vec<MountEntry>, String> {
     Err("stale-mount recovery is supported only on macOS and Linux".to_string())
 }
 
@@ -417,6 +436,29 @@ garbage line without separator
         assert_eq!(classify(Some(&macfuse), Reach::Ok, mac), MountCheck::Live);
         let osxfuse = entry("/Users/alex/Drive", "osxfuse", "zerotrust-drive");
         assert_eq!(classify(Some(&osxfuse), Reach::Ok, mac), MountCheck::Live);
+        let fskit = entry(
+            "/Users/alex/Drive",
+            "macfuse",
+            "macfuse://8DB7589E-2E50-4257-ACC7-E2542742DA6B",
+        );
+        assert_eq!(classify(Some(&fskit), Reach::Ok, mac), MountCheck::Live);
+        assert_eq!(
+            classify(Some(&fskit), Reach::Errno(libc::ENXIO), mac),
+            MountCheck::Stale
+        );
+        assert_eq!(
+            classify(Some(&fskit), Reach::TimedOut, mac),
+            MountCheck::Unresponsive
+        );
+        assert!(matches!(
+            classify(Some(&fskit), Reach::Ok, linux),
+            MountCheck::Foreign { .. }
+        ));
+        let other_macfuse = entry("/Users/alex/Drive", "macfuse", "sshfs@host");
+        assert!(matches!(
+            classify(Some(&other_macfuse), Reach::Ok, mac),
+            MountCheck::Foreign { .. }
+        ));
         assert!(matches!(
             classify(Some(&macfuse), Reach::Ok, linux),
             MountCheck::Foreign { .. }
@@ -510,6 +552,17 @@ garbage line without separator
         assert!(live.contains("already running"), "{live}");
         let hung = run(vec![(Some(ours.clone()), Reach::TimedOut)], &runner).unwrap_err();
         assert!(hung.contains("fusermount3 -uz"), "{hung}");
+        let mac_ours = entry(&key.display().to_string(), "macfuse", FS_NAME);
+        let answers = scripted(vec![(Some(mac_ours), Reach::TimedOut)]);
+        let mac_hung = recover_with(&mount, Platform::MacOs, &runner, &mut |_| {
+            Ok(answers.borrow_mut().pop_front().unwrap())
+        })
+        .unwrap_err();
+        assert!(mac_hung.contains("umount -f"), "{mac_hung}");
+        assert!(
+            mac_hung.contains("pgrep -lf io.macfuse.app.fsmodule.macfuse"),
+            "{mac_hung}"
+        );
         let foreign = entry(&key.display().to_string(), "fuse.sshfs", "alex@host:/");
         let error = run(vec![(Some(foreign), Reach::Ok)], &runner).unwrap_err();
         assert!(

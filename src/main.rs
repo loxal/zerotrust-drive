@@ -4,6 +4,7 @@ mod crypto;
 mod doctor;
 mod fault;
 mod fs;
+mod fskit;
 #[cfg(all(test, target_os = "macos"))]
 mod macos_integration_tests;
 mod migrate;
@@ -165,6 +166,12 @@ struct Cli {
     /// it exits with status 75 (the next start uploads the rest)
     #[arg(long, value_name = "SECONDS", requires = "remote")]
     final_push_wait: Option<u64>,
+
+    /// macOS: mount through macFUSE's kernel extension (kext), its FSKit
+    /// module (fskit: no kernel extension, macOS 15.4 or newer), or the
+    /// kernel extension when it is loaded and FSKit otherwise (auto)
+    #[arg(long, value_enum, value_name = "BACKEND", default_value_t)]
+    fuse_backend: fskit::BackendArg,
 
     #[command(flatten)]
     run: RunOptions,
@@ -808,6 +815,14 @@ fn main() {
         || cli.rekey
         || cli.new_passphrase.is_some()
         || cli.continue_rekey;
+    // Before telemetry starts, so its start record names the backend that
+    // actually serves. Migration and GC never mount.
+    let mounts = !(cli.migrate_format || cli.migrate_v2 || gc_requested_early);
+    let backend = if mounts {
+        fskit::select(cli.fuse_backend).unwrap_or_else(|e| exit_with_error(e))
+    } else {
+        fskit::Backend::Kernel
+    };
     start_telemetry(
         &cli.run,
         if maintenance { "maintenance" } else { "mount" },
@@ -1294,7 +1309,7 @@ fn main() {
             .revalidate()
             .unwrap_or_else(|e| exit_with_error(e));
 
-        let mount_result = serve(ztfs, &mountpoint, false);
+        let mount_result = serve(ztfs, &mountpoint, false, backend);
         if !rekey_worker.is_finished() {
             eprintln!(
                 "zerotrust-drive: unmounted; waiting for the passphrase rotation to finish (Ctrl+C stops it, --continue-rekey resumes it)"
@@ -1363,7 +1378,7 @@ fn main() {
         eprintln!("zerotrust-drive: press Ctrl+C to unmount and flush");
     }
 
-    serve(ztfs, &mountpoint, replicator.is_some())
+    serve(ztfs, &mountpoint, replicator.is_some(), backend)
         .unwrap_or_else(|e| exit_with_error(format!("failed to mount filesystem: {e}")));
     let Some(replicator) = replicator.as_mut() else {
         exit_unless_persisted(&inner);
@@ -1415,11 +1430,41 @@ fn mount_options(remote: bool) -> Vec<MountOption> {
 
 /// Mount and serve until the filesystem is unmounted, by a signal or
 /// externally. `destroy` has flushed pending state when this returns.
-fn serve(filesystem: fs::ZeroTrustFs, mountpoint: &Path, remote: bool) -> std::io::Result<()> {
+fn serve(
+    filesystem: fs::ZeroTrustFs,
+    mountpoint: &Path,
+    remote: bool,
+    backend: fskit::Backend,
+) -> std::io::Result<()> {
+    if backend == fskit::Backend::Fskit {
+        eprintln!("zerotrust-drive: mounting through macFUSE's FSKit module");
+        return fskit::serve(filesystem, mountpoint, volume_name(remote));
+    }
     let mut config = Config::default();
     config.mount_options = mount_options(remote);
+    let started = std::time::Instant::now();
     let session = fuser::Session::new(filesystem, mountpoint, &config)?;
     shutdown::mounted(mountpoint);
+    telemetry::event(
+        telemetry::Level::Standard,
+        "mount.ready",
+        &[
+            (
+                "backend",
+                telemetry::Field::Tag(if cfg!(target_os = "macos") {
+                    "kext"
+                } else {
+                    "kernel"
+                }),
+            ),
+            (
+                "ready_ms",
+                telemetry::Field::U64(
+                    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                ),
+            ),
+        ],
+    );
     // A Type=notify unit stays "activating" until this arrives.
     report_to_service_manager(service::notify::ready());
     report_to_service_manager(service::notify::status(&format!(
@@ -1806,10 +1851,18 @@ mod main_tests {
     fn mount_accepts_every_encrypted_service_command_line() {
         use service::definition::{Custody, Definition, Instance};
         let credentials = Path::new("/run/user/1000/credentials/u.service");
-        for (remote, custody) in [
-            (Some("home"), Custody::SystemdCreds),
-            (Some("home"), Custody::File(PathBuf::from("/abs/pass"))),
-            (None, Custody::File(PathBuf::from("/abs/pass"))),
+        for (remote, custody, backend) in [
+            (Some("home"), Custody::SystemdCreds, fskit::BackendArg::Auto),
+            (
+                Some("home"),
+                Custody::File(PathBuf::from("/abs/pass")),
+                fskit::BackendArg::Fskit,
+            ),
+            (
+                None,
+                Custody::File(PathBuf::from("/abs/pass")),
+                fskit::BackendArg::Kext,
+            ),
         ] {
             let definition = Definition {
                 name: "work".to_string(),
@@ -1818,6 +1871,7 @@ mod main_tests {
                     encrypted_dir: PathBuf::from("/abs/store"),
                     mount_dir: PathBuf::from("/abs/mount"),
                     custody: custody.clone(),
+                    fuse_backend: backend,
                 },
                 final_push_wait_secs: 60,
             };
@@ -1833,6 +1887,7 @@ mod main_tests {
             assert_eq!(cli.encrypted_dir.as_deref(), Some(Path::new("/abs/store")));
             assert_eq!(cli.decrypted_dir, PathBuf::from("/abs/mount"));
             assert!(cli.passphrase_file.is_some());
+            assert_eq!(cli.fuse_backend, backend);
         }
     }
 

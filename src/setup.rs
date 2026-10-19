@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 
 use clap::Args;
 
+use crate::fskit::BackendArg;
 use crate::prompt::{self, PassphraseSource, Prompter, TerminalReader};
 use crate::remote::cli::{self as remote_cli, Action, AuthArgs, RemoteStore, StoreArgs, StoreKind};
 use crate::remote::config::{Paths, RemoteMode, RemoteName};
@@ -71,6 +72,11 @@ pub(crate) struct SetupArgs {
     #[arg(long, value_name = "FILE", conflicts_with = "plain")]
     passphrase_file: Option<PathBuf>,
 
+    /// macOS: mount through macFUSE's kernel extension (kext) or its FSKit
+    /// module (fskit) instead of deciding at every start (auto)
+    #[arg(long, value_enum, value_name = "BACKEND", conflicts_with = "plain")]
+    fuse_backend: Option<BackendArg>,
+
     /// Do not start the drive automatically at login (macOS) or boot (Linux)
     #[arg(long)]
     no_autostart: bool,
@@ -90,6 +96,7 @@ struct Plan {
     dir: PathBuf,
     /// Encrypted store; `None` in plain mode.
     store: Option<PathBuf>,
+    fuse_backend: BackendArg,
     autostart: bool,
     /// Why auto-start was skipped although it was wanted.
     autostart_skipped: Option<String>,
@@ -312,12 +319,15 @@ fn resolve_plan(
             "--account {account:?} is not an email address, for example you@gmail.com"
         ));
     }
+    let fuse_backend = args.fuse_backend.unwrap_or_default();
+    crate::fskit::check_platform(fuse_backend, cfg!(target_os = "macos"))?;
     Ok(Plan {
         name,
         mode,
         account,
         dir,
         store,
+        fuse_backend,
         autostart: !args.no_autostart,
         autostart_skipped: None,
     })
@@ -490,6 +500,7 @@ fn install_args(plan: &Plan, passphrase_file: Option<&Path>) -> service_cli::Ins
             encrypted_dir: Some(store.clone()),
             mount_dir: Some(plan.dir.clone()),
             passphrase_file: passphrase_file.map(Path::to_path_buf),
+            fuse_backend: (plan.fuse_backend != BackendArg::Auto).then_some(plan.fuse_backend),
             ..service_cli::InstallArgs::default()
         },
         None => service_cli::InstallArgs {
@@ -513,11 +524,15 @@ fn manual_start(plan: &Plan) -> Vec<String> {
     match &plan.store {
         Some(store) => {
             let store = store.display();
+            let backend = match plan.fuse_backend {
+                BackendArg::Auto => String::new(),
+                chosen => format!(" --fuse-backend {}", chosen.as_str()),
+            };
             lines.push(format!(
-                "start the drive with `zdrive --remote {name} --encrypted-dir {store} --decrypted-dir {dir}`"
+                "start the drive with `zdrive --remote {name} --encrypted-dir {store} --decrypted-dir {dir}{backend}`"
             ));
             lines.push(format!(
-                "or start it automatically with `zdrive service install --name {name} --mode encrypted --remote {name} --encrypted-dir {store} --mount-dir {dir}`"
+                "or start it automatically with `zdrive service install --name {name} --mode encrypted --remote {name} --encrypted-dir {store} --mount-dir {dir}{backend}`"
             ));
         }
         None => {
@@ -627,6 +642,7 @@ mod tests {
                 store: Some(PathBuf::from(
                     "/home/u/.local/share/zerotrust-drive/drive/store"
                 )),
+                fuse_backend: BackendArg::Auto,
                 autostart: true,
                 autostart_skipped: None,
             }
@@ -758,6 +774,29 @@ mod tests {
         assert_eq!(args.mount_dir, Some(PathBuf::from("/home/u/zdrive")));
         assert_eq!(args.passphrase_file, Some(PathBuf::from("/home/u/pass")));
         assert_eq!(args.custody, None);
+        assert_eq!(args.fuse_backend, None, "auto is decided at every start");
+        let pinned = SetupArgs {
+            fuse_backend: Some(BackendArg::Fskit),
+            ..SetupArgs::default()
+        };
+        let macos = cfg!(target_os = "macos");
+        match resolve_plan(&pinned, &paths(), &expand) {
+            Ok(plan) => {
+                assert!(macos, "only macOS accepts a pinned backend");
+                let args = install_args(&plan, None);
+                assert_eq!(args.fuse_backend, Some(BackendArg::Fskit));
+                let manual = manual_start(&plan).join("\n");
+                assert_eq!(
+                    manual.matches("--fuse-backend fskit`").count(),
+                    2,
+                    "{manual}"
+                );
+            }
+            Err(error) => {
+                assert!(!macos, "{error}");
+                assert!(error.contains("applies only to macOS"), "{error}");
+            }
+        }
         let plain = resolve_plan(
             &SetupArgs {
                 plain: true,

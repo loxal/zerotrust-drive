@@ -1691,10 +1691,27 @@ impl FsInner {
     }
 }
 
+/// The `max_write` and `max_readahead` to negotiate at FUSE init: v2's chunk
+/// and read bounds, each capped by the transport's `limit`. A v1 store keeps
+/// the kernel defaults unless a limit applies.
+fn transfer_bounds(format: StoreFormat, limit: Option<u32>) -> Option<(u32, u32)> {
+    let cap = |size: usize| {
+        let size = u32::try_from(size).unwrap_or(u32::MAX);
+        limit.map_or(size, |limit| size.min(limit))
+    };
+    match (format, limit) {
+        (StoreFormat::V2, _) => Some((cap(v2::CHUNK_SIZE), cap(v2::MAX_FUSE_READ_SIZE))),
+        (StoreFormat::V1, Some(limit)) => Some((limit, limit)),
+        (StoreFormat::V1, None) => None,
+    }
+}
+
 pub struct ZeroTrustFs {
     pub(crate) inner: Arc<FsInner>,
     debounce_thread: Option<thread::JoinHandle<()>>,
     mount_ready_notify: Option<std::sync::mpsc::Sender<()>>,
+    /// Largest READ or WRITE payload the FUSE transport can carry.
+    transfer_limit: Option<u32>,
 }
 
 impl ZeroTrustFs {
@@ -2162,6 +2179,7 @@ impl ZeroTrustFs {
                     inner: Arc::clone(&debounce_inner),
                     debounce_thread: None,
                     mount_ready_notify: None,
+                    transfer_limit: None,
                 };
                 let flush_result = {
                     // Consume the dirty marker only after taking the same gate
@@ -2181,6 +2199,7 @@ impl ZeroTrustFs {
             inner,
             debounce_thread: Some(debounce_thread),
             mount_ready_notify: None,
+            transfer_limit: None,
         };
         if zfs.inner.index_fingerprint.lock().unwrap().is_none() {
             let json = {
@@ -2202,6 +2221,13 @@ impl ZeroTrustFs {
     /// fails before the filesystem is actually available.
     pub(crate) fn notify_when_mounted(&mut self, sender: std::sync::mpsc::Sender<()>) {
         self.mount_ready_notify = Some(sender);
+    }
+
+    /// Bound every FUSE READ and WRITE to `limit` bytes, for a transport that
+    /// cannot carry larger messages (macFUSE's FSKit bridge).
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub(crate) fn limit_transfers(&mut self, limit: u32) {
+        self.transfer_limit = Some(limit);
     }
 
     /// Encrypt and write pre-serialized JSON to _index.age. No locks held.
@@ -3541,21 +3567,21 @@ fn io_to_errno(e: &std::io::Error) -> fuser::Errno {
 impl Filesystem for ZeroTrustFs {
     fn init(&mut self, _req: &Request, config: &mut fuser::KernelConfig) -> std::io::Result<()> {
         let _call = crate::telemetry::FuseCall::begin(crate::telemetry::FuseOp::Init);
-        if self.inner.format == StoreFormat::V2 {
-            config
-                .set_max_write(v2::CHUNK_SIZE as u32)
-                .map_err(|maximum| {
-                    std::io::Error::other(format!(
-                        "kernel rejected bounded v2 write size (maximum {maximum})"
-                    ))
-                })?;
-            if let Err(maximum) = config.set_max_readahead(v2::MAX_FUSE_READ_SIZE as u32) {
+        if let Some((max_write, max_readahead)) =
+            transfer_bounds(self.inner.format, self.transfer_limit)
+        {
+            config.set_max_write(max_write).map_err(|maximum| {
+                std::io::Error::other(format!(
+                    "kernel rejected bounded write size {max_write} (maximum {maximum})"
+                ))
+            })?;
+            if let Err(maximum) = config.set_max_readahead(max_readahead) {
                 // Some kernels advertise a smaller ceiling. Preserve that
                 // stricter bound rather than failing an otherwise valid mount.
                 if maximum != 0 {
                     config.set_max_readahead(maximum).map_err(|rejected| {
                         std::io::Error::other(format!(
-                            "kernel rejected bounded v2 read size (maximum {rejected})"
+                            "kernel rejected bounded read size (maximum {rejected})"
                         ))
                     })?;
                 }
@@ -4414,6 +4440,30 @@ mod tests {
         FORMAT_VERSION, KdfParams, KdfPublicationPhase, SALT_LEN, decrypt_bytes, derive_key,
         encrypt_bytes,
     };
+
+    #[test]
+    fn transfer_bounds_cap_v2_sizes_and_bound_v1_only_under_a_limit() {
+        let chunk = v2::CHUNK_SIZE as u32;
+        let read = v2::MAX_FUSE_READ_SIZE as u32;
+        assert_eq!(transfer_bounds(StoreFormat::V2, None), Some((chunk, read)));
+        assert_eq!(
+            transfer_bounds(StoreFormat::V2, Some(4 << 20)),
+            Some((4 << 20, 4 << 20))
+        );
+        assert_eq!(
+            transfer_bounds(StoreFormat::V2, Some(1 << 20)),
+            Some((1 << 20, 1 << 20))
+        );
+        assert_eq!(
+            transfer_bounds(StoreFormat::V2, Some(64 << 20)),
+            Some((chunk, read))
+        );
+        assert_eq!(transfer_bounds(StoreFormat::V1, None), None);
+        assert_eq!(
+            transfer_bounds(StoreFormat::V1, Some(4 << 20)),
+            Some((4 << 20, 4 << 20))
+        );
+    }
 
     /// Derive a key with a fixed cheap test salt+params. Keeps the
     /// crypto-level unit tests fast and self-contained (no drive dir).

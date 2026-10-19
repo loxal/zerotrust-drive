@@ -16,6 +16,10 @@
 //!   error is reported and the drive keeps serving. Interactively the next
 //!   signal retries; under a service manager, which sends a single stop
 //!   signal (see [`unattended`]), the drive retries every second by itself.
+//! - **Attaching** (an FSKit volume that serves but has not appeared yet):
+//!   the mount is abandoned at once, which ends the session like an unmount.
+//!   There is nothing to unmount yet, and waiting could outlast the service
+//!   manager's single stop signal.
 //! - **Unmounting**: further signals are reported and ignored until the final
 //!   flush completes.
 //! - **Finishing** (the final upload of automatic remote sync, after the local
@@ -37,6 +41,8 @@ const HANDLED_SIGNALS: [libc::c_int; 3] = [libc::SIGINT, libc::SIGTERM, libc::SI
 
 enum Phase {
     Default,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    Attaching(PathBuf, Box<dyn Fn() + Send>),
     Mounted(PathBuf),
     Unmounting,
     Finishing(Box<dyn Fn() + Send>),
@@ -118,6 +124,25 @@ pub(crate) fn install() -> Result<(), String> {
 /// Route later signals to a graceful unmount of `mountpoint`.
 pub(crate) fn mounted(mountpoint: &Path) {
     *phase() = Phase::Mounted(mountpoint.to_path_buf());
+}
+
+/// Route later signals to `abandon` while an FSKit volume at `mountpoint`
+/// serves but has not appeared yet.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn attaching(mountpoint: &Path, abandon: Box<dyn Fn() + Send>) {
+    *phase() = Phase::Attaching(mountpoint.to_path_buf(), abandon);
+}
+
+/// The volume [`attaching`] waited for has appeared: later signals unmount
+/// it. False when a signal abandoned the mount first.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn attached(mountpoint: &Path) -> bool {
+    let mut current = phase();
+    if !matches!(*current, Phase::Attaching(..)) {
+        return false;
+    }
+    *current = Phase::Mounted(mountpoint.to_path_buf());
+    true
 }
 
 /// Restore the default signal behaviour once the FUSE session has ended, and
@@ -220,16 +245,26 @@ fn handle(signal: libc::c_int) {
                 signal_name(signal)
             );
         }
+        Phase::Attaching(..) => {
+            let Phase::Attaching(mountpoint, abandon) =
+                std::mem::replace(&mut *current, Phase::Unmounting)
+            else {
+                return;
+            };
+            drop(current);
+            announce_stop(signal);
+            eprintln!(
+                "zerotrust-drive: {} received before {} appeared; abandoning the mount",
+                signal_name(signal),
+                mountpoint.display()
+            );
+            abandon();
+        }
         Phase::Mounted(mountpoint) => {
             let mountpoint = mountpoint.clone();
             *current = Phase::Unmounting;
             drop(current);
-            let _ = crate::service::notify::stopping();
-            crate::telemetry::event(
-                crate::telemetry::Level::Standard,
-                "signal",
-                &[("signal", crate::telemetry::Field::Tag(signal_name(signal)))],
-            );
+            announce_stop(signal);
             eprintln!(
                 "zerotrust-drive: {} received; unmounting {}",
                 signal_name(signal),
@@ -262,6 +297,16 @@ fn handle(signal: libc::c_int) {
             }
         }
     }
+}
+
+/// Tell the service manager and telemetry that a signal starts the stop.
+fn announce_stop(signal: libc::c_int) {
+    let _ = crate::service::notify::stopping();
+    crate::telemetry::event(
+        crate::telemetry::Level::Standard,
+        "signal",
+        &[("signal", crate::telemetry::Field::Tag(signal_name(signal)))],
+    );
 }
 
 /// Retry a refused unmount every second while the phase stays
