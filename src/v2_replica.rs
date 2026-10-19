@@ -343,9 +343,17 @@ pub(crate) fn read_ciphertext(
     Ok(bytes)
 }
 
+/// Durability checkpoint context of [`install_ciphertext`].
+pub(crate) const INSTALL_CONTEXT: &str = "install replicated v2 object";
+/// Durability checkpoint context of [`sync_installed`].
+pub(crate) const SYNC_INSTALLED_CONTEXT: &str = "sync replicated v2 objects";
+
 /// Installs replicated ciphertext under its object name without replacing
 /// anything. Returns whether a new file was created; an existing object must
-/// already hold the identical digest.
+/// already hold the identical digest. A new file is durable only after
+/// [`sync_installed`], which callers run before publishing a root that
+/// reaches it; until then a crash can leave it torn, which
+/// [`remove_damaged_object`] detects.
 pub(crate) fn install_ciphertext(
     base_path: &Path,
     pin: &V2NamespacePin,
@@ -359,7 +367,13 @@ pub(crate) fn install_ciphertext(
         )));
     }
     let name = object_name(&reference.id);
-    if pin.write_object_file(base_path, &name, ciphertext, "install replicated v2 object")? {
+    if pin.write_object_file(
+        base_path,
+        &name,
+        ciphertext,
+        ObjectDurability::Deferred,
+        INSTALL_CONTEXT,
+    )? {
         return Ok(true);
     }
     read_ciphertext(base_path, pin, reference, MAX_OBJECT_CIPHERTEXT).map_err(|error| {
@@ -368,6 +382,31 @@ pub(crate) fn install_ciphertext(
         ))
     })?;
     Ok(false)
+}
+
+/// Makes every object [`install_ciphertext`] wrote durable, including those
+/// of an interrupted earlier run that this one found intact.
+pub(crate) fn sync_installed(base_path: &Path, pin: &V2NamespacePin) -> std::io::Result<()> {
+    pin.sync_objects(base_path, SYNC_INSTALLED_CONTEXT)
+}
+
+/// Removes the local object file of `reference` when its bytes do not match
+/// the authenticated digest, after handing them to `keep`. Whether it was
+/// removed; an intact object stays.
+pub(crate) fn remove_damaged_object(
+    base_path: &Path,
+    pin: &V2NamespacePin,
+    reference: &ObjectRef,
+    keep: &mut dyn FnMut(&[u8]) -> std::io::Result<()>,
+) -> std::io::Result<bool> {
+    pin.remove_damaged_object_file(
+        base_path,
+        &object_name(&reference.id),
+        &reference.digest,
+        MAX_OBJECT_CIPHERTEXT,
+        keep,
+        "remove damaged replicated v2 object",
+    )
 }
 
 /// Validates every file of `index` that is not byte-identical (root and size)

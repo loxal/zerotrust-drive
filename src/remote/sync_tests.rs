@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::crypto::{KdfParams, load_kdf_with_fingerprint, save_kdf, try_derive_key};
+use crate::fault::{DurabilityCheckpoint, DurabilityEvent, FaultInjectionGuard};
 use crate::fs::{DirChild, DiskIndex, InodeEntry, InodeKind};
 use crate::remote::TestDir;
 use crate::remote::config::test_kdf;
@@ -332,6 +333,79 @@ fn index_json(files: &BTreeMap<String, (Vec<u8>, String)>) -> Vec<u8> {
     .unwrap()
 }
 
+/// Times a first pull of many small files from the fake Drive, the local
+/// install path without network latency. Release build, one run per call:
+///
+/// ```fish
+/// set -x ZDRIVE_PULL_BENCH_FILES 2000
+/// set -x ZDRIVE_BENCH_OUT ~/pull-bench.jsonl
+/// cargo test --release --locked bench_first_pull -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "benchmark; run explicitly with --ignored in a release build"]
+fn bench_first_pull_of_many_small_files() {
+    let count: usize = std::env::var("ZDRIVE_PULL_BENCH_FILES")
+        .map_or(2_000, |value| value.parse().expect("a file count"));
+    let files: Vec<(String, Vec<u8>)> = (0..count)
+        .map(|number| {
+            // 4-64 KiB, unique per file, like the W2 workload.
+            let len = 4096 + (number * 7_919) % (60 * 1024);
+            let mut bytes = content((number % 251) as u8, len);
+            bytes[CANARY.len()..CANARY.len() + 8].copy_from_slice(&(number as u64).to_le_bytes());
+            (format!("f{number:05}.bin"), bytes)
+        })
+        .collect();
+    let named: Vec<(&str, Vec<u8>)> = files
+        .iter()
+        .map(|(name, bytes)| (name.as_str(), bytes.clone()))
+        .collect();
+    let env = Env::new();
+    let origin = Store::create("bench-pull-origin", test_kdf(), &named);
+    env.push(&origin).unwrap();
+    let dir = TestDir::new("bench-pull");
+    let base = dir.path().join("store");
+    std::fs::create_dir_all(&base).unwrap();
+    let remote_kdf = remote_kdf(&env.remote()).unwrap();
+    let mut state = RemoteState::open(&dir.path().join("state"), &env.folder).unwrap();
+    let mut load = [0f64; 3];
+    // SAFETY: getloadavg writes at most three values into the array.
+    unsafe { libc::getloadavg(load.as_mut_ptr(), 3) };
+    let started = std::time::Instant::now();
+    let report = bootstrap(
+        &env.remote(),
+        &base,
+        "replica",
+        &origin.key,
+        &remote_kdf,
+        &mut state,
+    )
+    .unwrap();
+    let elapsed = started.elapsed();
+    assert_eq!(report.outcome, PullOutcome::Bootstrapped);
+    let line = serde_json::json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "files": count,
+        "objects": report.objects,
+        "packs": report.packs,
+        "bytes": report.bytes,
+        "elapsed_ms": elapsed.as_secs_f64() * 1000.0,
+        "per_object_us": elapsed.as_secs_f64() * 1e6 / report.objects.max(1) as f64,
+        "loadavg_1m": load[0],
+        "temp_dir": std::env::temp_dir(),
+    })
+    .to_string();
+    eprintln!("{line}");
+    if let Ok(out) = std::env::var("ZDRIVE_BENCH_OUT") {
+        use std::io::Write as _;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(out)
+            .unwrap();
+        writeln!(file, "{line}").unwrap();
+    }
+}
+
 fn root_records(env: &Env, number: u64) -> usize {
     env.named(".zr")
         .iter()
@@ -566,6 +640,180 @@ fn a_bootstrap_without_an_intact_copy_fails_closed_and_resumes() {
         .unwrap();
     assert_eq!(replica.contents(), origin.contents());
     assert!(!bootstrap_pending(&replica.base).unwrap());
+}
+
+/// The local object files of the store at `base`.
+pub(crate) fn object_files(base: &Path) -> std::collections::BTreeSet<PathBuf> {
+    let objects = v2::selected_object_directory(base)
+        .unwrap()
+        .join(v2::OBJECTS_DIRECTORY);
+    std::fs::read_dir(objects)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect()
+}
+
+/// Leaves the object file at `path` as power loss before its barrier can:
+/// cut short, or at full length but zeroed. Its torn bytes.
+pub(crate) fn tear(path: &Path, cut: bool) -> Vec<u8> {
+    use std::os::unix::fs::FileExt as _;
+    let len = std::fs::metadata(path).unwrap().len();
+    let file = OpenOptions::new().write(true).open(path).unwrap();
+    if cut {
+        file.set_len(len / 2).unwrap();
+    } else {
+        file.write_all_at(&vec![0; len as usize], 0).unwrap();
+    }
+    std::fs::read(path).unwrap()
+}
+
+/// The bytes kept under `state/damaged`, sorted.
+pub(crate) fn damaged_evidence(state: &Path) -> Vec<Vec<u8>> {
+    let dir = state.join("damaged");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut kept: Vec<Vec<u8>> = entries
+        .map(|entry| {
+            use std::os::unix::fs::PermissionsExt as _;
+            let path = entry.unwrap().path();
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "{}", path.display());
+            std::fs::read(path).unwrap()
+        })
+        .collect();
+    kept.sort();
+    kept
+}
+
+/// Every replicated object is installed before the one barrier, and the
+/// barrier precedes the publication `published` names.
+fn assert_one_barrier_before(checkpoints: &[DurabilityCheckpoint], published: &str) {
+    let position = |context: &str| -> Vec<(usize, DurabilityEvent)> {
+        checkpoints
+            .iter()
+            .enumerate()
+            .filter(|(_, checkpoint)| checkpoint.context == context)
+            .map(|(index, checkpoint)| (index, checkpoint.event))
+            .collect()
+    };
+    let installs = position(replica::INSTALL_CONTEXT);
+    assert!(!installs.is_empty(), "{checkpoints:?}");
+    assert!(
+        installs
+            .iter()
+            .all(|(_, event)| *event != DurabilityEvent::DirectorySync),
+        "an install syncs its directory: {checkpoints:?}"
+    );
+    let barriers = position(replica::SYNC_INSTALLED_CONTEXT);
+    assert_eq!(
+        barriers,
+        vec![(barriers[0].0, DurabilityEvent::DirectorySync)],
+        "{checkpoints:?}"
+    );
+    let barrier = barriers[0].0;
+    assert!(installs.iter().all(|(index, _)| *index < barrier));
+    let publication = *position(published)
+        .first()
+        .unwrap_or_else(|| panic!("no {published:?} in {checkpoints:?}"));
+    assert!(barrier < publication.0, "{checkpoints:?}");
+}
+
+#[test]
+fn a_pull_makes_its_objects_durable_with_one_barrier_before_publishing() {
+    let env = Env::new();
+    let mut origin = Store::origin("barrier-origin");
+    env.push(&origin).unwrap();
+
+    let recorder = FaultInjectionGuard::record();
+    let mut replica = env.clone_store("barrier-replica");
+    assert_one_barrier_before(&recorder.checkpoints(), "publish replicated v2 root");
+
+    origin.write("b.txt", content(3, 5_000));
+    origin.write("c.txt", content(4, 90_000));
+    env.push(&origin).unwrap();
+    let recorder = FaultInjectionGuard::record();
+    assert_eq!(
+        env.pull(&mut replica).unwrap().outcome,
+        PullOutcome::Advanced
+    );
+    assert_one_barrier_before(&recorder.checkpoints(), "publish authenticated v2 manifest");
+    drop(recorder);
+    assert_eq!(replica.contents(), origin.contents());
+}
+
+#[test]
+fn torn_objects_of_an_interrupted_pull_are_kept_as_evidence_and_replaced() {
+    let env = Env::new();
+    let mut origin = Store::origin("torn-pull-origin");
+    env.push(&origin).unwrap();
+    let mut replica = env.clone_store("torn-pull-replica");
+    let old = replica.contents();
+    let before = object_files(&replica.base);
+    origin.write("b.txt", content(3, 5_000));
+    origin.write("c.txt", content(4, 90_000));
+    env.push(&origin).unwrap();
+
+    let failing = FaultInjectionGuard::fail_at_matching(
+        DurabilityCheckpoint::new(DurabilityEvent::FileSync, replica::INSTALL_CONTEXT),
+        3,
+    );
+    let error = env.pull(&mut replica).unwrap_err();
+    drop(failing);
+    assert!(error.to_string().contains("injected crash"), "{error}");
+    assert_eq!(replica.contents(), old, "nothing was published");
+    let installed: Vec<_> = object_files(&replica.base)
+        .difference(&before)
+        .cloned()
+        .collect();
+    assert_eq!(installed.len(), 3, "{installed:?}");
+    let mut torn = vec![tear(&installed[0], true), tear(&installed[1], false)];
+    torn.sort();
+
+    assert_eq!(
+        env.pull(&mut replica).unwrap().outcome,
+        PullOutcome::Advanced
+    );
+    assert_eq!(replica.contents(), origin.contents());
+    assert_eq!(
+        damaged_evidence(&replica.dir.path().join("state")),
+        torn,
+        "exactly the torn objects are kept; the intact one is reused"
+    );
+    assert!(env.verify(&replica, true).problems.is_empty());
+}
+
+#[test]
+fn torn_objects_of_an_interrupted_bootstrap_are_replaced_when_it_resumes() {
+    let env = Env::new();
+    let origin = Store::origin("torn-bootstrap-origin");
+    env.push(&origin).unwrap();
+
+    let failing = FaultInjectionGuard::fail_at_matching(
+        DurabilityCheckpoint::new(DurabilityEvent::FileSync, replica::INSTALL_CONTEXT),
+        2,
+    );
+    let (dir, error) = match env.bootstrap_into(TestDir::new("torn-bootstrap"), PASSPHRASE) {
+        Ok(_) => panic!("the bootstrap ignored its injected failure"),
+        Err(failure) => failure,
+    };
+    drop(failing);
+    assert!(error.to_string().contains("injected crash"), "{error}");
+    let base = dir.path().join("store");
+    assert!(bootstrap_pending(&base).unwrap());
+    assert!(replica::read_root_bytes(&base).unwrap().is_none());
+    let installed: Vec<_> = object_files(&base).into_iter().collect();
+    assert_eq!(installed.len(), 2, "{installed:?}");
+    let torn = tear(&installed[1], true);
+
+    let state = dir.path().join("state");
+    let replica = env
+        .bootstrap_into(dir, PASSPHRASE)
+        .map_err(|(_, error)| error)
+        .unwrap();
+    assert_eq!(replica.contents(), origin.contents());
+    assert!(!bootstrap_pending(&replica.base).unwrap());
+    assert_eq!(damaged_evidence(&state), vec![torn]);
 }
 
 #[test]

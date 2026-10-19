@@ -32,6 +32,8 @@ pub(crate) const LOCK_FILE: &str = "lock";
 const HEADERS_DIR: &str = "headers";
 pub(crate) const OUTGOING_DIR: &str = "outgoing";
 const INCOMING_DIR: &str = "incoming";
+/// Damaged local objects a pull replaced, kept as evidence; never cleared.
+const DAMAGED_DIR: &str = "damaged";
 const MAX_STATE_FILE: u64 = 64 * 1024;
 const MAX_CHECKPOINT_FILE: u64 = 16 * 1024;
 /// A full header for `MAX_PACK_OBJECTS` entries.
@@ -275,6 +277,12 @@ impl RemoteState {
 
     pub(crate) fn incoming_dir(&self) -> PathBuf {
         self.dir.join(INCOMING_DIR)
+    }
+
+    /// Where a pull keeps the bytes of a damaged local object it replaced;
+    /// created on first use.
+    pub(crate) fn damaged_dir(&self) -> PathBuf {
+        self.dir.join(DAMAGED_DIR)
     }
 
     /// Cached header of the pack named `name`, if any.

@@ -45,7 +45,7 @@ use super::format::{
 };
 use super::gdrive::{DriveFile, GoogleDrive, UploadCheckpoint};
 use super::state::{KnownLayout, PendingLayout, PendingRoot, RemoteState, SyncedHead};
-use super::{RemoteError, hex, md5_bytes, md5_file, unhex};
+use super::{RemoteError, ensure_private_dir, hex, md5_bytes, md5_file, unhex, write_private_file};
 use crate::telemetry::{self, Field, Level};
 
 /// Present while a bootstrap pull is filling an empty directory. Mounting
@@ -1654,7 +1654,14 @@ fn pull_unrecorded(
         state,
         false,
     )?;
-    let mut fetcher = Fetcher::new(remote, &index, state.incoming_dir(), local.base, local.pin);
+    let mut fetcher = Fetcher::new(
+        remote,
+        &index,
+        state.incoming_dir(),
+        state.damaged_dir(),
+        local.base,
+        local.pin,
+    );
     let mut wanted = Vec::new();
     for (position, pack) in index.packs.iter().enumerate() {
         for entry in &pack.entries {
@@ -1693,6 +1700,9 @@ fn pull_unrecorded(
         Some(head.generation),
         found.generation,
     )?;
+    // Unconditional: an interrupted earlier pull may have installed objects
+    // this one found intact but that no barrier made durable yet.
+    replica::sync_installed(local.base, local.pin)?;
     let mut current = head;
     for info in &generations {
         current = v2::fast_forward_pinned(
@@ -1753,6 +1763,7 @@ struct Fetcher<'a> {
     remote: &'a Remote<'a>,
     index: &'a RemoteIndex,
     incoming: PathBuf,
+    damaged: PathBuf,
     base: &'a Path,
     pin: &'a V2NamespacePin,
     /// Downloaded packs; `None` marks a pack that failed verification.
@@ -1767,6 +1778,7 @@ impl<'a> Fetcher<'a> {
         remote: &'a Remote<'a>,
         index: &'a RemoteIndex,
         incoming: PathBuf,
+        damaged: PathBuf,
         base: &'a Path,
         pin: &'a V2NamespacePin,
     ) -> Self {
@@ -1774,6 +1786,7 @@ impl<'a> Fetcher<'a> {
             remote,
             index,
             incoming,
+            damaged,
             base,
             pin,
             files: HashMap::new(),
@@ -1830,7 +1843,9 @@ impl<'a> Fetcher<'a> {
     }
 
     fn ensure(&mut self, reference: ObjectRef) -> Result<(), RemoteError> {
-        if replica::object_exists(self.base, self.pin, &reference)? {
+        if replica::object_exists(self.base, self.pin, &reference)?
+            && !self.remove_damaged(&reference)?
+        {
             return Ok(());
         }
         let index = self.index;
@@ -1868,6 +1883,35 @@ impl<'a> Fetcher<'a> {
             "no intact remote copy of object {} exists",
             hex(reference.id())
         )))
+    }
+
+    /// Removes a local copy of `reference` whose bytes miss its authenticated
+    /// digest, as a crash between an install and its barrier can leave it,
+    /// after keeping those bytes as evidence. Whether it was removed.
+    fn remove_damaged(&self, reference: &ObjectRef) -> Result<bool, RemoteError> {
+        let name = hex(reference.id());
+        let mut kept = None;
+        let removed =
+            replica::remove_damaged_object(self.base, self.pin, reference, &mut |bytes| {
+                ensure_private_dir(&self.damaged)?;
+                let stamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos();
+                let path = self.damaged.join(format!("{name}.{stamp}.z2"));
+                write_private_file(&path, bytes)?;
+                kept = Some((path, bytes.len()));
+                Ok(())
+            })?;
+        if removed && let Some((path, len)) = kept {
+            telemetry::counter("remote.damaged_objects_replaced", 1);
+            self.remote.note(&format!(
+                "warning: local object {name} was damaged; kept its {len} bytes at {} and \
+                 installing the authenticated copy",
+                path.display()
+            ));
+        }
+        Ok(removed)
     }
 }
 
@@ -1990,7 +2034,14 @@ fn bootstrap_unrecorded(
         state,
         false,
     )?;
-    let mut fetcher = Fetcher::new(remote, &index, state.incoming_dir(), base, &pin);
+    let mut fetcher = Fetcher::new(
+        remote,
+        &index,
+        state.incoming_dir(),
+        state.damaged_dir(),
+        base,
+        &pin,
+    );
     let all: Vec<usize> = (0..index.packs.len()).collect();
     fetcher.prefetch(&all)?;
     let mut walker = ClosureWalker::new(base, key, &pin);
@@ -2009,6 +2060,7 @@ fn bootstrap_unrecorded(
         walker.generation(info, &mut ensure)?;
     }
     drop(walker);
+    replica::sync_installed(base, &pin)?;
     let root = head_bytes(remote, &found)?;
     let head = replica::finish_bootstrap(base, key, &root, &pin)?;
     if head.generation != found.generation {

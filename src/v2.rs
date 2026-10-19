@@ -139,6 +139,18 @@ const OBJECT_AAD_PREFIX: &[u8] = b"zerotrust-drive\0v2\0object\0";
 const ROOT_AAD: &[u8] = b"zerotrust-drive\0v2\0root\0";
 const MANIFEST_AAD: &[u8] = b"zerotrust-drive\0v2\0normal-write-manifest\0";
 
+/// When an immutable object file written through a [`V2NamespacePin`]
+/// becomes durable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ObjectDurability {
+    /// The file and its directory entry are on stable storage on return.
+    Immediate,
+    /// The file is handed to the device with a plain `fsync`; the caller runs
+    /// [`V2NamespacePin::sync_objects`] before publishing anything that
+    /// reaches it, and checks an existing file's digest before trusting it.
+    Deferred,
+}
+
 /// Pins the exact immutable namespace selected for one mounted writer or
 /// recovery transaction. Immutable object publication uses the retained
 /// `objects` descriptor rather than resolving the provider-controlled path for
@@ -263,12 +275,13 @@ impl V2NamespacePin {
         base_path: &Path,
         name: &str,
         bytes: &[u8],
+        durability: ObjectDurability,
         context: &str,
     ) -> std::io::Result<bool> {
         self.verify(base_path)?;
         #[cfg(not(unix))]
         {
-            let _ = (name, bytes, context);
+            let _ = (name, bytes, durability, context);
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
                 "pinned immutable-object publication requires Unix openat semantics",
@@ -288,11 +301,77 @@ impl V2NamespacePin {
                         parent.as_file(),
                         "immutable v2 objects directory",
                     )?;
-                    write_exclusive_verified_file_at(parent.as_file(), exact_name, bytes, context)
+                    write_exclusive_verified_file_at(
+                        parent.as_file(),
+                        exact_name,
+                        bytes,
+                        durability,
+                        context,
+                    )
                 },
             )?;
             self.verify(base_path)?;
             Ok(created)
+        }
+    }
+
+    /// Makes every object written with [`ObjectDurability::Deferred`] durable
+    /// with one flush of the objects directory. On macOS that is an
+    /// `F_FULLFSYNC`, which also drains the device cache holding the data the
+    /// per-file `fsync`s handed over; on Linux it persists the new entries.
+    pub(crate) fn sync_objects(&self, base_path: &Path, context: &str) -> std::io::Result<()> {
+        self.verify(base_path)?;
+        let started = std::time::Instant::now();
+        self.objects.sync_all()?;
+        crate::telemetry::duration("v2.objects_barrier", started.elapsed());
+        fault::checkpoint(DurabilityEvent::DirectorySync, context)?;
+        self.verify(base_path)
+    }
+
+    /// Unlinks the regular object file `name` if its complete bytes do not
+    /// hash to `digest`, after handing those bytes to `keep`; an intact file
+    /// stays. Whether it was removed. Anything other than a bounded regular
+    /// file is refused, never removed.
+    pub(crate) fn remove_damaged_object_file(
+        &self,
+        base_path: &Path,
+        name: &str,
+        digest: &[u8; 32],
+        max_len: u64,
+        keep: &mut dyn FnMut(&[u8]) -> std::io::Result<()>,
+        context: &str,
+    ) -> std::io::Result<bool> {
+        self.verify(base_path)?;
+        #[cfg(not(unix))]
+        {
+            let _ = (name, digest, max_len, keep, context);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "pinned immutable-object removal requires Unix openat semantics",
+            ));
+        }
+        #[cfg(unix)]
+        {
+            let relative = RelativeStorePath::new(&self.objects_relative_path.join(name))?;
+            let entry = self.store_root.entry(relative)?;
+            let removed = self.store_root.coordinate_one(
+                &entry,
+                false,
+                AccessIntent::Delete,
+                |parent, exact_name| {
+                    require_same_directory(
+                        &self.objects,
+                        parent.as_file(),
+                        "immutable v2 objects directory",
+                    )?;
+                    remove_damaged_file_at(parent.as_file(), exact_name, digest, max_len, keep)
+                },
+            )?;
+            if removed {
+                fault::checkpoint(DurabilityEvent::Cleanup, context)?;
+            }
+            self.verify(base_path)?;
+            Ok(removed)
         }
     }
 
@@ -446,6 +525,7 @@ fn write_exclusive_verified_file_at(
     directory: &File,
     name: &OsStr,
     bytes: &[u8],
+    durability: ObjectDurability,
     context: &str,
 ) -> std::io::Result<bool> {
     let mut file = match openat_nofollow(
@@ -468,12 +548,27 @@ fn write_exclusive_verified_file_at(
     file.write_all(bytes)?;
     fault::checkpoint(DurabilityEvent::Write, context)?;
     let synced = std::time::Instant::now();
-    file.sync_all()?;
-    crate::telemetry::duration("v2.fsync", synced.elapsed());
-    fault::checkpoint(DurabilityEvent::FileSync, context)?;
-    drop(file);
-    directory.sync_all()?;
-    fault::checkpoint(DurabilityEvent::DirectorySync, context)?;
+    match durability {
+        ObjectDurability::Immediate => {
+            file.sync_all()?;
+            crate::telemetry::duration("v2.fsync", synced.elapsed());
+            fault::checkpoint(DurabilityEvent::FileSync, context)?;
+            drop(file);
+            directory.sync_all()?;
+            fault::checkpoint(DurabilityEvent::DirectorySync, context)?;
+        }
+        ObjectDurability::Deferred => {
+            // A plain fsync even on macOS, where `sync_all` would also drain
+            // the device cache; `sync_objects` does that once per batch.
+            // SAFETY: the descriptor is owned by `file` and stays open.
+            if unsafe { libc::fsync(file.as_raw_fd()) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            crate::telemetry::duration("v2.deferred_fsync", synced.elapsed());
+            fault::checkpoint(DurabilityEvent::FileSync, context)?;
+            drop(file);
+        }
+    }
     #[cfg(test)]
     namespace_test_hook::checkpoint("before pinned v2 object name verification");
     let mut verified = openat_nofollow(directory, name, libc::O_RDONLY, 0).map_err(|error| {
@@ -512,6 +607,53 @@ fn write_exclusive_verified_file_at(
         return Err(namespace_changed(format!(
             "new immutable v2 object {name:?} changed length while being verified"
         )));
+    }
+    Ok(true)
+}
+
+/// Reads the regular file `name` without following a symlink and, when its
+/// bytes do not hash to `digest`, hands them to `keep` and unlinks it after
+/// checking that the name still refers to the file that was read.
+#[cfg(unix)]
+fn remove_damaged_file_at(
+    directory: &File,
+    name: &OsStr,
+    digest: &[u8; 32],
+    max_len: u64,
+    keep: &mut dyn FnMut(&[u8]) -> std::io::Result<()>,
+) -> std::io::Result<bool> {
+    let file = openat_nofollow(directory, name, libc::O_RDONLY | libc::O_NONBLOCK, 0)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() > max_len {
+        return Err(io_invalid(format!(
+            "immutable v2 object {name:?} is not a bounded regular file; preserving it"
+        )));
+    }
+    let mut bytes = Vec::new();
+    (&file)
+        .take(max_len.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 != metadata.len() {
+        return Err(namespace_changed(format!(
+            "immutable v2 object {name:?} changed size while being checked"
+        )));
+    }
+    if digest_bytes(&bytes) == *digest {
+        return Ok(false);
+    }
+    keep(&bytes)?;
+    let current =
+        openat_nofollow(directory, name, libc::O_RDONLY | libc::O_NONBLOCK, 0)?.metadata()?;
+    if (current.dev(), current.ino()) != (metadata.dev(), metadata.ino()) {
+        return Err(namespace_changed(format!(
+            "immutable v2 object {name:?} was replaced while being checked"
+        )));
+    }
+    let c_name = c_name(name, "pinned v2 entry name")?;
+    // SAFETY: the descriptor is owned by the caller and the name is a single
+    // NUL-free path component.
+    if unsafe { libc::unlinkat(directory.as_raw_fd(), c_name.as_ptr(), 0) } != 0 {
+        return Err(std::io::Error::last_os_error());
     }
     Ok(true)
 }
@@ -1153,9 +1295,13 @@ fn write_object_with_pin(
         };
         let name = object_name(&reference.id);
         let result = match namespace_pin {
-            Some(pin) => {
-                pin.write_object_file(base_path, &name, &ciphertext, "publish immutable v2 object")
-            }
+            Some(pin) => pin.write_object_file(
+                base_path,
+                &name,
+                &ciphertext,
+                ObjectDurability::Immediate,
+                "publish immutable v2 object",
+            ),
             None => {
                 let path = object_path(base_path, &reference)?;
                 match write_new_file(&path, &ciphertext, "publish immutable v2 object") {
@@ -4693,6 +4839,7 @@ mod tests {
                     &directory,
                     &object_name(&reference.id),
                     b"must not replace immutable ciphertext",
+                    ObjectDurability::Immediate,
                     "publish immutable v2 object",
                 )
                 .unwrap()
@@ -4741,6 +4888,151 @@ mod tests {
             fs::remove_dir_all(comparison).unwrap();
             fs::remove_dir_all(directory).unwrap();
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deferred_objects_become_durable_at_one_objects_barrier() {
+        let directory = test_directory("deferred-object-barrier");
+        fs::create_dir_all(&directory).unwrap();
+        ensure_layout(&directory).unwrap();
+        let pin = V2NamespacePin::capture(&directory).unwrap();
+        let objects = selected_object_directory(&directory)
+            .unwrap()
+            .join(OBJECTS_DIRECTORY);
+
+        let recorder = FaultInjectionGuard::record();
+        for (id, bytes) in [(1u8, b"first deferred"), (2, b"other deferred")] {
+            assert!(
+                pin.write_object_file(
+                    &directory,
+                    &object_name(&[id; 16]),
+                    bytes,
+                    ObjectDurability::Deferred,
+                    "deferred install",
+                )
+                .unwrap()
+            );
+        }
+        pin.sync_objects(&directory, "deferred barrier").unwrap();
+        let observed: Vec<_> = recorder
+            .checkpoints()
+            .into_iter()
+            .map(|checkpoint| (checkpoint.event, checkpoint.context))
+            .collect();
+        drop(recorder);
+
+        let install = |event| (event, "deferred install".to_string());
+        assert_eq!(
+            observed,
+            vec![
+                install(DurabilityEvent::Write),
+                install(DurabilityEvent::FileSync),
+                install(DurabilityEvent::Write),
+                install(DurabilityEvent::FileSync),
+                (
+                    DurabilityEvent::DirectorySync,
+                    "deferred barrier".to_string()
+                ),
+            ],
+            "a deferred install leaves the directory sync to the one barrier"
+        );
+        assert_eq!(
+            fs::read(objects.join(object_name(&[1; 16]))).unwrap(),
+            b"first deferred"
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_a_damaged_bounded_regular_object_file_is_removed_after_keeping_its_bytes() {
+        let directory = test_directory("remove-damaged-object");
+        fs::create_dir_all(&directory).unwrap();
+        ensure_layout(&directory).unwrap();
+        let pin = V2NamespacePin::capture(&directory).unwrap();
+        let objects = selected_object_directory(&directory)
+            .unwrap()
+            .join(OBJECTS_DIRECTORY);
+        let intact = b"authenticated replicated ciphertext".to_vec();
+        let digest = digest_bytes(&intact);
+        let name = object_name(&[9; 16]);
+        let path = objects.join(&name);
+        assert!(
+            pin.write_object_file(
+                &directory,
+                &name,
+                &intact,
+                ObjectDurability::Deferred,
+                "install",
+            )
+            .unwrap()
+        );
+        let mut kept: Vec<Vec<u8>> = Vec::new();
+        let remove = |name: &str, max_len: u64, kept: &mut Vec<Vec<u8>>| {
+            pin.remove_damaged_object_file(
+                &directory,
+                name,
+                &digest,
+                max_len,
+                &mut |bytes| {
+                    kept.push(bytes.to_vec());
+                    Ok(())
+                },
+                "remove damaged",
+            )
+        };
+
+        let recorder = FaultInjectionGuard::record();
+        assert!(!remove(&name, 1 << 20, &mut kept).unwrap());
+        assert!(recorder.checkpoints().is_empty(), "an intact object stays");
+        assert_eq!(fs::read(&path).unwrap(), intact);
+        assert!(kept.is_empty());
+
+        let torn = fs::OpenOptions::new().write(true).open(&path).unwrap();
+        torn.set_len(7).unwrap();
+        drop(torn);
+        assert!(remove(&name, 1 << 20, &mut kept).unwrap());
+        assert_eq!(recorder.events(), vec![DurabilityEvent::Cleanup]);
+        drop(recorder);
+        assert!(!path.exists());
+        assert_eq!(kept, vec![intact[..7].to_vec()]);
+
+        fs::write(&path, vec![0u8; intact.len()]).unwrap();
+        let error = pin
+            .remove_damaged_object_file(
+                &directory,
+                &name,
+                &digest,
+                1 << 20,
+                &mut |_| Err(std::io::Error::other("evidence store is full")),
+                "remove damaged",
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("evidence store is full"));
+        assert!(path.exists(), "nothing is removed without its evidence");
+
+        let error = remove(&name, 3, &mut kept).unwrap_err();
+        assert!(error.to_string().contains("preserving it"), "{error}");
+        assert!(path.exists(), "an oversize file is refused, not removed");
+
+        let link = object_name(&[10; 16]);
+        std::os::unix::fs::symlink(&path, objects.join(&link)).unwrap();
+        remove(&link, 1 << 20, &mut kept).unwrap_err();
+        assert!(
+            fs::symlink_metadata(objects.join(&link))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+
+        let nested = object_name(&[11; 16]);
+        fs::create_dir(objects.join(&nested)).unwrap();
+        let error = remove(&nested, 1 << 20, &mut kept).unwrap_err();
+        assert!(error.to_string().contains("preserving it"), "{error}");
+        assert!(objects.join(&nested).is_dir());
+        assert_eq!(kept.len(), 1, "a refused entry is never handed over");
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[cfg(unix)]
