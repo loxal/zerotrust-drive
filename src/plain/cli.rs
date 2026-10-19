@@ -204,6 +204,19 @@ pub(crate) fn local_folder(dir: &Path, paths: &Paths) -> Result<PathBuf, String>
     Ok(canonical)
 }
 
+/// The sync index of a plain remote; its lock file sits next to it.
+pub(crate) fn state_file(paths: &Paths, name: &RemoteName) -> PathBuf {
+    paths
+        .state
+        .join("plain")
+        .join(format!("{}.json", name.as_str()))
+}
+
+/// Where files deleted on Drive land locally, kept 30 days.
+pub(crate) fn trash_dir(paths: &Paths, name: &RemoteName) -> PathBuf {
+    paths.data.join(name.as_str()).join("trash")
+}
+
 pub(crate) fn options(
     paths: &Paths,
     name: &RemoteName,
@@ -213,11 +226,8 @@ pub(crate) fn options(
     PlainOptions {
         local_dir,
         folder_id: config.folder_id.clone(),
-        state_file: paths
-            .state
-            .join("plain")
-            .join(format!("{}.json", name.as_str())),
-        trash_dir: paths.data.join(name.as_str()).join("trash"),
+        state_file: state_file(paths, name),
+        trash_dir: trash_dir(paths, name),
         host: short_host_name(),
         stable_age: DEFAULT_STABLE_AGE,
     }

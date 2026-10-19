@@ -25,6 +25,7 @@ use crate::prompt::SecretReader;
 pub(crate) const AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 pub(crate) const TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 pub(crate) const DEVICE_CODE_URL: &str = "https://oauth2.googleapis.com/device/code";
+pub(crate) const REVOKE_URL: &str = "https://oauth2.googleapis.com/revoke";
 const DEVICE_GRANT: &str = "urn:ietf:params:oauth:grant-type:device_code";
 /// How long the loopback flow waits for the browser consent.
 pub(crate) const CONSENT_TIMEOUT: Duration = Duration::from_secs(600);
@@ -541,6 +542,35 @@ fn token_request(
         return parse_token(&bytes, what);
     }
     Err(rejection(what, status, &error_code(&bytes)))
+}
+
+/// What a revocation request found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Revocation {
+    Revoked,
+    /// Google no longer knew the grant: revoked or expired before.
+    AlreadyInvalid,
+}
+
+/// Revokes a refresh token and with it the whole grant, so every access
+/// token minted from it stops working as well. Google ties a grant to the
+/// account and the OAuth project, not to one computer.
+pub(crate) fn revoke(
+    agent: &ureq::Agent,
+    url: &str,
+    refresh_token: &str,
+) -> Result<Revocation, RemoteError> {
+    const WHAT: &str = "revoking the Google sign-in";
+    let (status, bytes) = post_form(agent, url, &[("token", refresh_token)], WHAT)?;
+    let error = error_code(&bytes);
+    match status {
+        200 => Ok(Revocation::Revoked),
+        400 if error == "invalid_token" => Ok(Revocation::AlreadyInvalid),
+        408 | 429 | 500..=599 => Err(RemoteError::Network(format!("{WHAT}: HTTP {status}"))),
+        _ => Err(RemoteError::Protocol(format!(
+            "{WHAT}: HTTP {status} {error}"
+        ))),
+    }
 }
 
 /// A completed consent: the long-lived refresh token to keep in the vault.
@@ -1423,6 +1453,56 @@ mod tests {
         let refresh = fake.token_forms().pop().unwrap();
         assert_eq!(refresh["grant_type"], "refresh_token");
         assert_eq!(refresh["client_id"], test_client().id);
+    }
+
+    #[test]
+    fn revoking_ends_the_grant_once_and_reports_a_repeat() {
+        let fake = FakeDrive::start();
+        let url = format!("{}/revoke", fake.base_url());
+        assert_eq!(
+            revoke(&http_agent(), &url, fake::REFRESH_TOKEN).unwrap(),
+            Revocation::Revoked
+        );
+        assert!(fake.refresh_revoked());
+        // The revoked grant mints no more access tokens.
+        let source = RefreshTokenSource::new(
+            test_client(),
+            fake::REFRESH_TOKEN.to_string(),
+            &endpoints(&fake),
+        );
+        let drive =
+            GoogleDrive::with_endpoint(fake.base_url(), Box::new(source), FakeDrive::fast_policy());
+        assert!(matches!(drive.about(), Err(RemoteError::Auth(_))));
+        assert_eq!(
+            revoke(&http_agent(), &url, fake::REFRESH_TOKEN).unwrap(),
+            Revocation::AlreadyInvalid
+        );
+        assert_eq!(
+            revoke(&http_agent(), &url, "never-issued").unwrap(),
+            Revocation::AlreadyInvalid
+        );
+    }
+
+    #[test]
+    fn a_revocation_that_did_not_happen_is_an_error() {
+        let fake = FakeDrive::start();
+        let url = format!("{}/revoke", fake.base_url());
+        fake.fault(Op::Revoke, Fault::Status(503, "backendError"));
+        assert!(matches!(
+            revoke(&http_agent(), &url, fake::REFRESH_TOKEN),
+            Err(RemoteError::Network(_))
+        ));
+        fake.fault(Op::Revoke, Fault::Drop);
+        assert!(matches!(
+            revoke(&http_agent(), &url, fake::REFRESH_TOKEN),
+            Err(RemoteError::Network(_))
+        ));
+        fake.fault(Op::Revoke, Fault::Status(401, "unauthorized_client"));
+        assert!(matches!(
+            revoke(&http_agent(), &url, fake::REFRESH_TOKEN),
+            Err(RemoteError::Protocol(_))
+        ));
+        assert!(!fake.refresh_revoked());
     }
 
     #[test]

@@ -45,6 +45,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 pub(crate) use engine::{sync_once, watch_until_signalled};
+pub(crate) use state::{lock_existing, lock_path};
 
 use crate::remote::gdrive::{
     DriveFile, GoogleDrive, MARKER_KEY, MY_DRIVE, PLAIN_MARKER, STORE_MARKER,

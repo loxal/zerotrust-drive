@@ -344,6 +344,12 @@ pub(crate) fn open(options: &PlainOptions) -> Result<(State, File), String> {
 
 const LOCK_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// Takes an existing instance lock as a sync would; `remote remove` holds
+/// it while it deletes.
+pub(crate) fn lock_existing(path: &Path) -> Result<File, String> {
+    lock_exclusive(path)
+}
+
 fn lock_exclusive(path: &Path) -> Result<File, String> {
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};

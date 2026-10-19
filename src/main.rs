@@ -1945,6 +1945,26 @@ mod main_tests {
     }
 
     #[test]
+    fn remote_remove_takes_a_name_and_optional_revoke() {
+        let parse =
+            |args: &[&str]| Cli::try_parse_from(["zdrive", "remote", "remove"].iter().chain(args));
+        let cli = parse(&["home", "--revoke", "--yes", "--passphrase-file", "/abs/p"]).unwrap();
+        let Some(Command::Remote(remote::cli::RemoteCommand::Remove(args))) = cli.command else {
+            panic!("not a remote remove command");
+        };
+        assert_eq!(args.name, "home");
+        assert!(args.revoke && args.yes);
+        assert_eq!(args.passphrase_file, Some(PathBuf::from("/abs/p")));
+        let Some(Command::Remote(remote::cli::RemoteCommand::Remove(args))) =
+            parse(&["home"]).unwrap().command
+        else {
+            panic!("not a remote remove command");
+        };
+        assert!(!args.revoke && !args.yes && args.passphrase_file.is_none());
+        assert!(parse(&[]).is_err());
+    }
+
+    #[test]
     fn sync_interval_requires_watch_and_stays_in_range() {
         let parse = |extra: &[&str]| {
             Cli::try_parse_from(

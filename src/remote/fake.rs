@@ -55,6 +55,8 @@ pub(crate) enum Op {
     UpdateSession,
     ChangesStart,
     Changes,
+    /// OAuth token revocation.
+    Revoke,
 }
 
 /// One scripted failure, consumed by the next request of its [`Op`].
@@ -127,6 +129,8 @@ struct State {
     hold: Option<Hold>,
     held: usize,
     tokens: HashSet<String>,
+    /// [`REFRESH_TOKEN`]'s grant was revoked.
+    refresh_revoked: bool,
     counts: HashMap<Op, usize>,
     next_id: u64,
     quota_limit: Option<u64>,
@@ -609,6 +613,10 @@ impl FakeDrive {
         self.lock().tokens.clear();
     }
 
+    pub(crate) fn refresh_revoked(&self) -> bool {
+        self.lock().refresh_revoked
+    }
+
     pub(crate) fn set_quota(&self, limit: Option<u64>) {
         self.lock().quota_limit = limit;
     }
@@ -936,6 +944,7 @@ fn classify(request: &Request) -> Option<(Op, Option<String>)> {
     match request.method.as_str() {
         "POST" if path == "/token" => Some((Op::Token, None)),
         "POST" if path == "/device/code" => Some((Op::DeviceCode, None)),
+        "POST" if path == "/revoke" => Some((Op::Revoke, None)),
         "GET" if path == "/drive/v3/about" => Some((Op::About, None)),
         "GET" if path == "/drive/v3/files/generateIds" => Some((Op::GenerateIds, None)),
         "GET" if path == "/drive/v3/files" => Some((Op::List, None)),
@@ -993,7 +1002,7 @@ fn serve(mut stream: TcpStream, state: &Mutex<State>, base: &str) {
     };
     let mut guard = state.lock().unwrap_or_else(|poison| poison.into_inner());
     *guard.counts.entry(op).or_default() += 1;
-    if !matches!(op, Op::Token | Op::DeviceCode) {
+    if !matches!(op, Op::Token | Op::DeviceCode | Op::Revoke) {
         let authorized = request
             .headers
             .get("authorization")
@@ -1009,7 +1018,7 @@ fn serve(mut stream: TcpStream, state: &Mutex<State>, base: &str) {
             return;
         }
     }
-    if guard.offline && !matches!(op, Op::Token | Op::DeviceCode) {
+    if guard.offline && !matches!(op, Op::Token | Op::DeviceCode | Op::Revoke) {
         drop(guard);
         write_reply(
             &mut stream,
@@ -1270,6 +1279,7 @@ fn handle(
             let valid = match grant {
                 Some("refresh_token") => {
                     form.get("refresh_token").map(String::as_str) == Some(REFRESH_TOKEN)
+                        && !state.refresh_revoked
                 }
                 Some("authorization_code") => {
                     form.get("code").map(String::as_str) == Some(AUTH_CODE)
@@ -1314,6 +1324,22 @@ fn handle(
                 body["refresh_token"] = json!(REFRESH_TOKEN);
             }
             Reply::json(200, &body)
+        }
+        Op::Revoke => {
+            let form = parse_pairs(&String::from_utf8_lossy(&request.body));
+            if form.get("token").map(String::as_str) == Some(REFRESH_TOKEN)
+                && !state.refresh_revoked
+            {
+                // Google ends the whole grant, access tokens included.
+                state.refresh_revoked = true;
+                state.tokens.clear();
+                Reply::json(200, &json!({}))
+            } else {
+                Reply::json(
+                    400,
+                    &json!({ "error": "invalid_token", "error_description": "Token expired or revoked" }),
+                )
+            }
         }
         Op::DeviceCode => {
             let form = parse_pairs(&String::from_utf8_lossy(&request.body));

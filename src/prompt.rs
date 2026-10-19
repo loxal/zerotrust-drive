@@ -57,6 +57,23 @@ impl Prompter for TerminalReader {
     }
 }
 
+/// A yes/no question whose default is no; `unchanged` says what an
+/// unreadable or unexpected answer leaves as it was.
+pub(crate) fn ask_yes_no(
+    prompter: &mut dyn Prompter,
+    question: &str,
+    unchanged: &str,
+) -> Result<bool, String> {
+    let answer = prompter
+        .read_visible(&format!("zerotrust-drive: {question} [y/N] "))
+        .map_err(|error| format!("cannot read the answer: {error}; {unchanged}"))?;
+    match answer.trim().to_ascii_lowercase().as_str() {
+        "y" | "yes" => Ok(true),
+        "" | "n" | "no" => Ok(false),
+        other => Err(format!("unexpected answer {other:?}; {unchanged}")),
+    }
+}
+
 /// The terminal settings to restore if a signal arrives mid-prompt.
 static SAVED_TERMINAL: Mutex<Option<(RawFd, libc::termios)>> = Mutex::new(None);
 

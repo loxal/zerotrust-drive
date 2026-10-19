@@ -28,9 +28,9 @@ use super::{RemoteError, ensure_private_dir, read_private_file, unhex, write_pri
 const STATE_FORMAT: &str = "zerotrust-drive-remote-state";
 const STATE_VERSION: u32 = 1;
 const STATE_FILE: &str = "state.json";
-const LOCK_FILE: &str = "lock";
+pub(crate) const LOCK_FILE: &str = "lock";
 const HEADERS_DIR: &str = "headers";
-const OUTGOING_DIR: &str = "outgoing";
+pub(crate) const OUTGOING_DIR: &str = "outgoing";
 const INCOMING_DIR: &str = "incoming";
 const MAX_STATE_FILE: u64 = 64 * 1024;
 const MAX_CHECKPOINT_FILE: u64 = 16 * 1024;
@@ -401,7 +401,7 @@ fn remove_if_present(path: &Path) -> std::io::Result<()> {
 }
 
 /// Removes a cache directory this module owns, refusing to follow a symlink.
-fn remove_tree(path: &Path) -> Result<(), RemoteError> {
+pub(crate) fn remove_tree(path: &Path) -> Result<(), RemoteError> {
     match std::fs::symlink_metadata(path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error.into()),
@@ -420,6 +420,12 @@ fn remove_tree(path: &Path) -> Result<(), RemoteError> {
 /// holder keeps it for a whole sync, far longer than these retries.
 const LOCK_ATTEMPTS: u32 = 20;
 const LOCK_RETRY_PAUSE: std::time::Duration = std::time::Duration::from_millis(5);
+
+/// Locks a replica's existing lock file as a sync would, without waiting
+/// for a holder; `remote remove` holds it while it deletes.
+pub(crate) fn lock_existing(path: &Path) -> Result<File, RemoteError> {
+    lock_exclusive(path)
+}
 
 fn lock_exclusive(path: &Path) -> Result<File, RemoteError> {
     lock_exclusive_with(path, LOCK_ATTEMPTS, &mut |_| {

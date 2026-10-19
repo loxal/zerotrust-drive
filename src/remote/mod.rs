@@ -19,6 +19,7 @@ pub(crate) mod gdrive;
 pub(crate) mod lease;
 pub(crate) mod mount;
 pub(crate) mod oauth;
+pub(crate) mod remove;
 pub(crate) mod state;
 pub(crate) mod sync;
 

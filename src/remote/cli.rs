@@ -40,6 +40,10 @@ pub(crate) enum RemoteCommand {
     Status(StoreArgs),
     /// Audit the remote copy against the local replica
     Verify(VerifyArgs),
+    /// Forget a remote on this computer: delete its configuration,
+    /// credential and sync state. Local stores, plain folders and
+    /// everything on Drive stay
+    Remove(super::remove::RemoveArgs),
 }
 
 #[derive(Args, Debug, Default)]
@@ -174,6 +178,10 @@ pub(crate) fn run(command: RemoteCommand) -> i32 {
         RemoteCommand::Verify(args) => {
             store_command(args.store, Action::Verify { full: args.full })
         }
+        RemoteCommand::Remove(args) => super::remove::remove(args).map(|lines| Summary {
+            lines,
+            healthy: true,
+        }),
     };
     match outcome {
         Ok(summary) => {
