@@ -29,9 +29,10 @@ pub(crate) const CONFIG_FORMAT: &str = "zerotrust-drive-remote-config";
 pub(crate) const CONFIG_VERSION: u32 = 2;
 const CONFIG_VERSION_V1: u32 = 1;
 pub(crate) const PROVIDER_GOOGLE_DRIVE: &str = "google-drive";
-/// Full Drive access, for bring-your-own clients.
+/// Full Drive access: for bring-your-own clients, and for a mirror of My
+/// Drive through the bundled desktop client.
 pub(crate) const SCOPE_DRIVE: &str = "https://www.googleapis.com/auth/drive";
-/// Only files this app created: the scope of the bundled clients.
+/// Only files this app created: the scope of the bundled clients elsewhere.
 pub(crate) const SCOPE_DRIVE_FILE: &str = "https://www.googleapis.com/auth/drive.file";
 const MAX_CONFIG_FILE: u64 = 64 << 10;
 const TOKEN_AAD_DOMAIN: &[u8] = b"zerotrust-drive token vault v1\0";
@@ -291,6 +292,20 @@ impl Issuer {
             scope: SCOPE_DRIVE_FILE.to_string(),
         }
     }
+
+    /// The bundled desktop client with full Drive access, which only a
+    /// mirror of My Drive asks for. Google's device flow cannot grant it.
+    pub(crate) fn bundled_full() -> Self {
+        Self {
+            client: ClientKind::BundledDesktop,
+            client_file: None,
+            scope: SCOPE_DRIVE.to_string(),
+        }
+    }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 fn is_default<T: Default + PartialEq>(value: &T) -> bool {
@@ -324,6 +339,11 @@ pub(crate) struct RemoteConfig {
     pub(crate) scope: String,
     #[serde(default, skip_serializing_if = "is_default")]
     pub(crate) mode: RemoteMode,
+    /// A plain remote that mirrors all of My Drive (`folder_id` is its real
+    /// id) rather than one folder zdrive created. Written only when true,
+    /// so a zdrive before 0.19 refuses a mirror instead of misreading it.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub(crate) mirror: bool,
     /// The refresh token sealed under the store passphrase (encrypted mode).
     /// Plain remotes keep theirs in [`Paths::remote_token`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -371,6 +391,18 @@ impl RemoteConfig {
         )
     }
 
+    /// A plain mirror of all of My Drive, whose real id is `folder_id`.
+    pub(crate) fn mirror(
+        name: &RemoteName,
+        account: &str,
+        folder_id: &str,
+        issuer: &Issuer,
+    ) -> Self {
+        let mut config = Self::plain(name, account, folder_id, "My Drive", issuer);
+        config.mirror = true;
+        config
+    }
+
     fn build(
         name: &RemoteName,
         account: &str,
@@ -392,6 +424,7 @@ impl RemoteConfig {
             client_file: issuer.client_file.clone(),
             scope: issuer.scope.clone(),
             mode,
+            mirror: false,
             token,
         };
         config.version = config.required_version();
@@ -455,11 +488,22 @@ impl RemoteConfig {
             (_, None) => {}
         }
         match self.scope.as_str() {
-            SCOPE_DRIVE if self.client.bundled() => {
+            // Only a mirror asks for it, and only the desktop client can be
+            // granted it.
+            SCOPE_DRIVE
+                if self.client.bundled()
+                    && !(self.mirror && self.client == ClientKind::BundledDesktop) =>
+            {
                 return Err("asks for full Drive access with a bundled client".to_string());
             }
             SCOPE_DRIVE | SCOPE_DRIVE_FILE => {}
             other => return Err(format!("uses unsupported scope {other:?}")),
+        }
+        if self.mirror && self.mode != RemoteMode::Plain {
+            return Err("is a mirror of My Drive but not a plain remote".to_string());
+        }
+        if self.mirror && self.scope != SCOPE_DRIVE {
+            return Err("is a mirror of My Drive without full Drive access".to_string());
         }
         match (self.mode, &self.token) {
             (RemoteMode::Encrypted, None) => {
@@ -911,6 +955,58 @@ mod tests {
         let mut unsealed = bundled.clone();
         unsealed.token = None;
         cases.push((unsealed, "no sealed credential"));
+        for (config, expected) in cases {
+            let refused = config.save(&paths).unwrap_err().to_string();
+            assert!(refused.contains(expected), "{expected}: {refused}");
+        }
+    }
+
+    #[test]
+    fn only_a_mirror_holds_full_access_through_the_bundled_desktop_client() {
+        let root = TestDir::new("config-mirror");
+        let paths = paths(root.path());
+        let name = RemoteName::parse("mirror").unwrap();
+        let mirror = RemoteConfig::mirror(
+            &name,
+            "tester@example.com",
+            "0AFakeMyDriveRootFolder",
+            &Issuer::bundled_full(),
+        );
+        mirror.save(&paths).unwrap();
+        let written = json_of(&paths.remote_config(&name));
+        assert_eq!(written["version"], 2);
+        assert_eq!(written["mirror"], true);
+        assert_eq!(written["mode"], "plain");
+        assert_eq!(written["client"], "bundled-desktop");
+        assert!(written.get("scope").is_none(), "full scope is the default");
+        let loaded = RemoteConfig::load(&paths, &name).unwrap();
+        assert!(loaded.mirror);
+        assert_eq!(loaded.issuer(), Issuer::bundled_full());
+        assert_eq!(loaded.folder_hint, "My Drive");
+
+        // Every other remote is written without the key, as before.
+        let plain = RemoteConfig::plain(
+            &name,
+            "tester@example.com",
+            "0AbCdEfGhIjKlMnOp",
+            "ZeroTrust Drive (plain)",
+            &Issuer::bundled(ClientKind::BundledDesktop),
+        );
+        plain.save(&paths).unwrap();
+        assert!(json_of(&paths.remote_config(&name)).get("mirror").is_none());
+
+        let mut cases: Vec<(RemoteConfig, &str)> = Vec::new();
+        let mut device = mirror.clone();
+        device.client = ClientKind::BundledDevice;
+        cases.push((device, "full Drive access with a bundled client"));
+        let mut narrow = mirror.clone();
+        narrow.scope = SCOPE_DRIVE_FILE.to_string();
+        cases.push((narrow, "without full Drive access"));
+        let token = SealedToken::seal(&name, "vault passphrase", "1//x", test_kdf()).unwrap();
+        let mut encrypted = mirror.clone();
+        encrypted.mode = RemoteMode::Encrypted;
+        encrypted.token = Some(token);
+        cases.push((encrypted, "not a plain remote"));
         for (config, expected) in cases {
             let refused = config.save(&paths).unwrap_err().to_string();
             assert!(refused.contains(expected), "{expected}: {refused}");

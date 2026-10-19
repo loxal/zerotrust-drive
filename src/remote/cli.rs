@@ -62,6 +62,15 @@ pub(crate) struct AuthArgs {
     #[arg(long)]
     pub(crate) plain: bool,
 
+    /// Mirror all of My Drive as plain files, as Drive for desktop's
+    /// "Mirror files" does: zdrive gets full access to read, change and
+    /// delete every file in your Drive. Implies --plain
+    #[arg(
+        long,
+        conflicts_with_all = ["folder_name", "folder_id", "folder_path", "device_code", "passphrase", "passphrase_file"]
+    )]
+    pub(crate) mirror: bool,
+
     /// Name of the Drive folder zdrive creates in My Drive when none of its
     /// folders exists yet [default: "ZeroTrust Drive", or "ZeroTrust Drive
     /// (plain)" with --plain]
@@ -266,6 +275,9 @@ pub(crate) struct ClientChoice<'a> {
     pub(crate) bundled: (bool, bool),
     /// The 0.17 default client file, when it exists.
     pub(crate) default_client_file: Option<PathBuf>,
+    /// A mirror of My Drive: full Drive access, which Google grants only
+    /// through a browser consent, never the device flow.
+    pub(crate) full_scope: bool,
 }
 
 /// Picks the OAuth client and the consent flow. A configured remote that
@@ -283,6 +295,28 @@ pub(crate) fn choose_client(choice: ClientChoice<'_>) -> Result<(Issuer, Flow), 
             .filter(|issuer| issuer.client == ClientKind::Byo)
             .and_then(|issuer| issuer.client_file.clone())
     });
+    if choice.full_scope {
+        if choice.device_code {
+            return Err(
+                "a mirror needs full Drive access, which Google's device sign-in cannot grant; sign in through a browser (--no-browser on a host without one)"
+                    .to_string(),
+            );
+        }
+        // Without a local browser the redirected address is pasted back.
+        let flow = if choice.headless {
+            Flow::Paste
+        } else {
+            browser
+        };
+        return match (byo_file, choice.bundled.0, choice.default_client_file) {
+            (Some(file), _, _) => Ok((Issuer::byo(&file), flow)),
+            (None, true, _) => Ok((Issuer::bundled_full(), flow)),
+            (None, false, Some(file)) => Ok((Issuer::byo(&file), flow)),
+            (None, false, None) => {
+                Err(oauth::missing_bundled_client(ClientKind::BundledDesktop).to_string())
+            }
+        };
+    }
     if let Some(file) = byo_file {
         if choice.device_code {
             return Err(
@@ -317,6 +351,8 @@ enum FolderChoice {
     Marked { marker: &'static str, name: String },
     /// `path` below the folder `parent`.
     Path { parent: String, path: String },
+    /// My Drive itself, for a mirror.
+    MyDrive,
 }
 
 /// What the Drive folder of a freshly authorized encrypted remote holds.
@@ -339,8 +375,12 @@ pub(crate) struct Authorized {
 /// One `remote auth` run.
 fn auth(args: AuthArgs) -> Result<Vec<String>, String> {
     let name = args.remote.clone();
+    let mirror = args.mirror;
     let mut authorized = authorize(args)?;
     match authorized.store {
+        None if mirror => authorized.lines.push(format!(
+            "mirror My Drive into an empty local folder with `zdrive sync --remote {name} --dir DIR`, or let `zdrive setup --mirror` do it"
+        )),
         None => authorized.lines.push(format!(
             "sync a local folder with `zdrive sync --remote {name} --dir DIR`"
         )),
@@ -366,11 +406,22 @@ pub(crate) fn authorize(args: AuthArgs) -> Result<Authorized, String> {
         Err(RemoteError::NotFound(_)) => None,
         Err(error) => return Err(error.to_string()),
     };
-    let mode = if args.plain {
+    // A mirror stays one when it is authorized again.
+    let mirror = args.mirror || existing.as_ref().is_some_and(|config| config.mirror);
+    let mode = if args.plain || mirror {
         RemoteMode::Plain
     } else {
         RemoteMode::Encrypted
     };
+    if let Some(config) = &existing
+        && config.mode == RemoteMode::Plain
+        && !config.mirror
+        && args.mirror
+    {
+        return Err(format!(
+            "remote {name} syncs one Drive folder; choose another remote name for a mirror of My Drive"
+        ));
+    }
     if let Some(config) = &existing
         && config.mode != mode
     {
@@ -398,6 +449,7 @@ pub(crate) fn authorize(args: AuthArgs) -> Result<Authorized, String> {
         headless: oauth::prefers_device_flow(|name| std::env::var_os(name)),
         bundled: oauth::bundled_available(),
         default_client_file: std::fs::canonicalize(&default_client_file).ok(),
+        full_scope: mirror,
     })?;
     let client = oauth::client_for(&issuer).map_err(|error| error.to_string())?;
     let marker = match mode {
@@ -405,6 +457,7 @@ pub(crate) fn authorize(args: AuthArgs) -> Result<Authorized, String> {
         RemoteMode::Plain => gdrive::PLAIN_MARKER,
     };
     let folder_choice = match (args.folder_id, args.folder_path, &existing) {
+        _ if mirror => FolderChoice::MyDrive,
         (None, None, Some(config)) => FolderChoice::Path {
             parent: config.folder_id.clone(),
             path: String::new(),
@@ -440,6 +493,15 @@ pub(crate) fn authorize(args: AuthArgs) -> Result<Authorized, String> {
             terminal.as_mut(),
             true,
         )?),
+        RemoteMode::Plain if mirror => {
+            note(
+                "mirror mode: zdrive asks Google for access to all of your Drive and keeps every file of My Drive as an ordinary file on this computer",
+            );
+            note(
+                "Google shows that \"ZeroTrust Drive\" has not been verified yet; choose Advanced, then Go to ZeroTrust Drive",
+            );
+            None
+        }
         RemoteMode::Plain => {
             note("plain mode: files are stored unencrypted, and Google can read every one of them");
             None
@@ -466,9 +528,11 @@ pub(crate) fn authorize(args: AuthArgs) -> Result<Authorized, String> {
         ),
         Flow::Browser | Flow::Paste => {
             let consent = if flow == Flow::Paste {
-                let reader = terminal.as_mut().ok_or(
-                    "pasting the redirected address needs a terminal; run from one, or sign in with --device-code",
-                )?;
+                let reader = terminal.as_mut().ok_or(if issuer.scope == SCOPE_DRIVE {
+                    "pasting the redirected address needs a terminal; run from one"
+                } else {
+                    "pasting the redirected address needs a terminal; run from one, or sign in with --device-code"
+                })?;
                 Consent::Paste(reader)
             } else {
                 Consent::Loopback {
@@ -533,7 +597,7 @@ pub(crate) fn authorize(args: AuthArgs) -> Result<Authorized, String> {
         &drive,
         mode,
         folder_choice,
-        issuer.client.bundled(),
+        issuer.client.bundled() && issuer.scope != SCOPE_DRIVE,
         &mut confirm_join,
     )?;
     if let Some(config) = &existing
@@ -554,7 +618,11 @@ pub(crate) fn authorize(args: AuthArgs) -> Result<Authorized, String> {
         None => {
             config::save_plain_token(&paths, &name, &refresh_token)
                 .map_err(|error| error.to_string())?;
-            RemoteConfig::plain(&name, &account.email, &folder.id, &hint, &issuer)
+            if mirror {
+                RemoteConfig::mirror(&name, &account.email, &folder.id, &issuer)
+            } else {
+                RemoteConfig::plain(&name, &account.email, &folder.id, &hint, &issuer)
+            }
         }
     };
     config.save(&paths).map_err(|error| error.to_string())?;
@@ -563,7 +631,11 @@ pub(crate) fn authorize(args: AuthArgs) -> Result<Authorized, String> {
         format!(
             "remote {name}: authorized for {} ({}, {})",
             account.email,
-            mode.as_str(),
+            if mirror {
+                "plain mirror of My Drive"
+            } else {
+                mode.as_str()
+            },
             access_label(&issuer)
         ),
         format!("folder: {hint} (id {})", folder.id),
@@ -605,6 +677,16 @@ fn choose_folder(
     confirm_join: &mut dyn FnMut() -> Result<(), String>,
 ) -> Result<(gdrive::DriveFile, String), String> {
     let (folder, hint) = match choice {
+        FolderChoice::MyDrive => {
+            // Its real id, which Drive reports as the parent of every item
+            // in it; under drive.file it stays hidden, so this also proves
+            // that full access was granted. Nothing to describe or mark.
+            let root = drive.get(gdrive::MY_DRIVE).map_err(|error| match error {
+                RemoteError::NotFound(_) => "Google did not grant access to all of your Drive, which a mirror needs; sign in again and allow it".to_string(),
+                error => error.to_string(),
+            })?;
+            return Ok((root, "My Drive".to_string()));
+        }
         FolderChoice::Marked {
             marker,
             name: folder_name,

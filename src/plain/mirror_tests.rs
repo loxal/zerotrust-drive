@@ -312,3 +312,33 @@ fn a_mirror_downloads_in_parallel_and_leaves_no_staged_files() {
     assert_eq!(replica.sync(&env.drive).downloaded, 11);
     assert_eq!(replica.tree().len(), 24);
 }
+
+#[test]
+fn my_drive_size_counts_what_a_mirror_downloads() {
+    let env = Env::mirror();
+    let fake = &env.fake;
+    let folder = fake.insert(ROOT_ID, "Docs", Some(FOLDER_MIME), b"");
+    fake.insert(&folder, "a.txt", None, b"12345");
+    fake.insert(ROOT_ID, "b.bin", None, b"123");
+    fake.insert(
+        &folder,
+        "Plan",
+        Some("application/vnd.google-apps.document"),
+        b"",
+    );
+    let store = fake.insert(ROOT_ID, "Store", Some(FOLDER_MIME), b"");
+    fake.insert(&store, "zdrive-remote.json", None, b"{}");
+    fake.insert(&store, "pack.zpk", None, b"ciphertext");
+    let shared = fake.insert(ROOT_ID, "Shared", Some(FOLDER_MIME), b"");
+    fake.insert(&shared, "theirs.txt", None, b"theirs");
+    fake.detach(&shared);
+    let size = super::my_drive_size(&env.drive, ROOT_REAL_ID).expect("size");
+    assert_eq!(
+        size,
+        super::MyDriveSize {
+            files: 2,
+            bytes: 8,
+            without_content: 1,
+        }
+    );
+}

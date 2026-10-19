@@ -85,7 +85,12 @@ fn sync(args: &SyncArgs) -> Result<usize, Failure> {
     let (drive, mut options, config) = open(&paths, &name, &args.dir)?;
     options.allow_deletions = args.allow_deletions;
     remote_cli::note(&format!(
-        "plain sync: {} <-> {} (Google can read these files)",
+        "{}: {} <-> {} (Google can read these files)",
+        if config.mirror {
+            "mirror"
+        } else {
+            "plain sync"
+        },
         options.local_dir.display(),
         config.folder_hint
     ));
@@ -204,6 +209,15 @@ pub(crate) fn initial_sync(
     Ok(lines)
 }
 
+/// The size of the My Drive that mirror remote `name` syncs.
+pub(crate) fn mirror_size(paths: &Paths, name: &RemoteName) -> Result<super::MyDriveSize, String> {
+    let config = RemoteConfig::load(paths, name).map_err(|error| error.to_string())?;
+    let client = oauth::client_for(&config.issuer()).map_err(|error| error.to_string())?;
+    let drive = remote_cli::open_drive(client, paths, &config, name, None)
+        .map_err(|error| error.to_string())?;
+    super::my_drive_size(&drive, &config.folder_id).map_err(|error| error.to_string())
+}
+
 /// The canonical local folder, refused when it overlaps zdrive's own
 /// configuration, state or data, which would sync credentials or the
 /// local trash.
@@ -257,7 +271,7 @@ pub(crate) fn options(
         trash_dir: trash_dir(paths, name),
         host: short_host_name(),
         stable_age: DEFAULT_STABLE_AGE,
-        mirror: false,
+        mirror: config.mirror,
         allow_deletions: None,
         progress: Some(show_progress),
     }
@@ -583,6 +597,21 @@ mod tests {
             PathBuf::from("/d/zerotrust-drive/photos/trash")
         );
         assert_eq!(options.folder_id, "folder-id");
+        assert!(!options.mirror && options.allow_deletions.is_none());
+        let mirror = RemoteConfig::mirror(
+            &name,
+            "you@example.com",
+            "0AMyDriveRoot",
+            &crate::remote::config::Issuer::bundled_full(),
+        );
+        let mirrored = super::options(
+            &paths,
+            &name,
+            &mirror,
+            PathBuf::from("/home/you/GoogleDrive"),
+        );
+        assert!(mirrored.mirror);
+        assert_eq!(mirrored.folder_id, "0AMyDriveRoot");
         assert_eq!(options.stable_age, DEFAULT_STABLE_AGE);
     }
 

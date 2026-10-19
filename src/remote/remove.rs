@@ -242,7 +242,12 @@ impl Found {
 
     fn describe(&self, paths: &Paths, name: &RemoteName, revoke: bool) -> Vec<String> {
         let mut lines = Vec::new();
+        let mirror = matches!(&self.config, Config::Valid(config) if config.mirror);
         match &self.config {
+            Config::Valid(config) if config.mirror => lines.push(format!(
+                "remote {name}: plain mirror of the My Drive of {}",
+                config.account
+            )),
             Config::Valid(config) => {
                 lines.push(format!(
                     "remote {name}: {} Google Drive folder {:?} of {}, https://drive.google.com/drive/folders/{}",
@@ -271,8 +276,12 @@ impl Found {
             ));
         }
         lines.push(
-            "it keeps every local store and plain folder, and everything on Google Drive; move the Drive folder to the Drive bin yourself once you no longer need it"
-                .to_string(),
+            if mirror {
+                "it keeps the local mirror folder and everything on Google Drive; the folder simply stops syncing"
+            } else {
+                "it keeps every local store and plain folder, and everything on Google Drive; move the Drive folder to the Drive bin yourself once you no longer need it"
+            }
+            .to_string(),
         );
         if let Some(trash) = &self.plain_trash {
             lines.push(format!(
@@ -494,9 +503,12 @@ fn remove_with(
             return Err(format!("{error}{rest}"));
         }
     }
-    lines.push(format!(
-        "removed remote {name} from this computer; its Drive folder is unchanged"
-    ));
+    let mirror = matches!(&found.config, Config::Valid(config) if config.mirror);
+    lines.push(if mirror {
+        format!("removed remote {name} from this computer; My Drive is unchanged")
+    } else {
+        format!("removed remote {name} from this computer; its Drive folder is unchanged")
+    });
     Ok(lines)
 }
 

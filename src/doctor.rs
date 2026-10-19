@@ -403,7 +403,12 @@ fn remotes(paths: &Paths) -> Vec<Remote> {
                         RemoteMode::Plain => paths.remote_token(&parsed).is_file(),
                     },
                     name,
-                    mode: Some(config.mode.as_str()),
+                    // A mirror is a plain remote that syncs all of My Drive.
+                    mode: Some(if config.mirror {
+                        "mirror"
+                    } else {
+                        config.mode.as_str()
+                    }),
                     client: Some(client_name(config.client)),
                     scope: Some(config.scope),
                     error: None,

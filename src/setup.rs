@@ -20,6 +20,10 @@ use crate::telemetry;
 /// The shortest passphrase setup accepts for a new drive.
 pub(crate) const MIN_NEW_PASSPHRASE_CHARS: usize = 12;
 const DEFAULT_DIR: &str = "~/zdrive";
+/// Where a mirror of My Drive appears unless --dir says otherwise.
+const DEFAULT_MIRROR_DIR: &str = "~/GoogleDrive";
+/// Free space a mirror leaves after its first download.
+const MIRROR_RESERVE: u64 = 1 << 30;
 
 #[derive(Args, Debug, Default)]
 pub(crate) struct SetupArgs {
@@ -36,6 +40,15 @@ pub(crate) struct SetupArgs {
     /// encrypts every file on this computer before upload
     #[arg(long)]
     plain: bool,
+
+    /// Mirror all of My Drive into the folder as ordinary files, as Drive
+    /// for desktop's "Mirror files" does [folder default: ~/GoogleDrive].
+    /// Google can read them, and zdrive gets full access to your Drive
+    #[arg(
+        long,
+        conflicts_with_all = ["store", "passphrase_file", "fuse_backend", "folder_name", "device_code"]
+    )]
+    mirror: bool,
 
     /// Where the drive appears: the mount point (encrypted) or the synced
     /// folder (plain) [default: ~/zdrive]
@@ -92,6 +105,8 @@ pub(crate) struct SetupArgs {
 struct Plan {
     name: RemoteName,
     mode: RemoteMode,
+    /// A plain mirror of all of My Drive.
+    mirror: bool,
     account: Option<String>,
     /// Mount point (encrypted) or synced folder (plain).
     dir: PathBuf,
@@ -176,16 +191,24 @@ fn setup(args: SetupArgs) -> Result<Vec<String>, String> {
     if let Some(store) = &plan.store {
         create_private_dir(store)?;
     }
+    let existed = paths.remote_config(&plan.name).exists();
     if plan.mode == RemoteMode::Plain {
         // Refused before signing in rather than after.
         crate::plain::cli::local_folder(&plan.dir, &paths)?;
     }
-    let existed = paths.remote_config(&plan.name).exists();
+    check_other_instances(&paths, &plan)?;
+    if plan.mirror && !existed && !empty_dir(&plan.dir)? {
+        return Err(format!(
+            "{} is not empty: a mirror starts in an empty folder, so that nothing in it is uploaded into My Drive by mistake; empty it or choose another --dir",
+            plan.dir.display()
+        ));
+    }
 
     let authorized = remote_cli::authorize(AuthArgs {
         remote: plan.name.as_str().to_string(),
         account: plan.account.clone(),
         plain: plan.mode == RemoteMode::Plain,
+        mirror: plan.mirror,
         folder_name: args.folder_name.clone(),
         client_file: args.client_file.clone(),
         device_code: args.device_code,
@@ -235,7 +258,37 @@ fn setup(args: SetupArgs) -> Result<Vec<String>, String> {
             lines.extend(summary.lines);
         }
     }
-    if plan.mode == RemoteMode::Plain {
+    if plan.mirror {
+        let size = crate::plain::cli::mirror_size(&paths, &plan.name)?;
+        let free = crate::plain::free_space(&plan.dir).ok();
+        let wanted = |terminal: Option<&mut TerminalReader>| -> Result<bool, String> {
+            match terminal {
+                None => Ok(true),
+                Some(terminal) => {
+                    prompt::ask_yes_no(terminal, "download it now?", "nothing was downloaded")
+                }
+            }
+        };
+        remote_cli::note(&mirror_summary(&size, free, &plan.dir));
+        if free.is_some_and(|free| free < size.bytes.saturating_add(MIRROR_RESERVE)) {
+            if !existed {
+                forget_remote(&paths, &plan.name);
+            }
+            return Err(format!(
+                "{} has too little free space for the mirror: free space there, or choose another --dir",
+                plan.dir.display()
+            ));
+        }
+        if !args.yes && !wanted(terminal.as_mut())? {
+            if !existed {
+                forget_remote(&paths, &plan.name);
+            }
+            return Err("setup cancelled; nothing was downloaded".to_string());
+        }
+    }
+    // A mirror's first sync can take hours: with auto-start the service
+    // runs it in the background and reports its progress.
+    if plan.mode == RemoteMode::Plain && !(plan.mirror && plan.autostart) {
         let synced =
             crate::plain::cli::initial_sync(&paths, &plan.name, &plan.dir).map_err(|error| {
                 let mut message = format!(
@@ -261,6 +314,19 @@ fn setup(args: SetupArgs) -> Result<Vec<String>, String> {
             given,
             &service::SystemRunner,
         )?);
+        if plan.mirror {
+            lines.push(format!(
+                "the first download runs in the background; follow it with `zdrive service status {}`{}",
+                plan.name,
+                match service::Platform::current()? {
+                    service::Platform::Linux => format!(
+                        " or `journalctl --user -u zerotrust-drive@{} -f`",
+                        plan.name
+                    ),
+                    service::Platform::MacOs => String::new(),
+                }
+            ));
+        }
     } else {
         lines.extend(manual_start(&plan));
     }
@@ -274,13 +340,14 @@ fn resolve_plan(
     paths: &Paths,
     expand: &dyn Fn(&Path) -> Result<PathBuf, String>,
 ) -> Result<Plan, String> {
-    let mode = if args.plain {
+    let mode = if args.plain || args.mirror {
         RemoteMode::Plain
     } else {
         RemoteMode::Encrypted
     };
     let name = args.name.clone().unwrap_or_else(|| {
         match mode {
+            _ if args.mirror => "mirror",
             RemoteMode::Encrypted => "drive",
             RemoteMode::Plain => "plain",
         }
@@ -291,10 +358,15 @@ fn resolve_plan(
         let path = expand(path)?;
         std::path::absolute(&path).map_err(|error| format!("--{flag} {}: {error}", path.display()))
     };
+    let default_dir = if args.mirror {
+        DEFAULT_MIRROR_DIR
+    } else {
+        DEFAULT_DIR
+    };
     let dir = absolute(
         args.dir
             .as_deref()
-            .unwrap_or_else(|| Path::new(DEFAULT_DIR)),
+            .unwrap_or_else(|| Path::new(default_dir)),
         "dir",
     )?;
     let store = match mode {
@@ -326,6 +398,7 @@ fn resolve_plan(
     Ok(Plan {
         name,
         mode,
+        mirror: args.mirror,
         account,
         dir,
         store,
@@ -341,6 +414,10 @@ fn describe(plan: &Plan, platform: service::Platform) -> Vec<String> {
     lines.push(match plan.mode {
         RemoteMode::Encrypted => {
             "  storage:   encrypted on this computer; Google Drive receives only ciphertext"
+                .to_string()
+        }
+        RemoteMode::Plain if plan.mirror => {
+            "  storage:   MIRROR of all of My Drive as ordinary files; zdrive gets full access to read, change and delete every file in your Drive, and Google can read every file"
                 .to_string()
         }
         RemoteMode::Plain => {
@@ -584,6 +661,89 @@ fn forget_remote(paths: &Paths, name: &RemoteName) {
     if let Err(error) = std::fs::remove_file(&path) {
         remote_cli::note(&format!("could not remove {}: {error}", path.display()));
     }
+    // A plain remote's credential has a file of its own. It is deleted, not
+    // revoked: Google would end the grant of every zdrive install.
+    let token = paths.remote_token(name);
+    match std::fs::remove_file(&token) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+            remote_cli::note(&format!("could not remove {}: {error}", token.display()));
+        }
+        _ => {}
+    }
+}
+
+/// What the mirror is about to download, and the space it has.
+fn mirror_summary(size: &crate::plain::MyDriveSize, free: Option<u64>, dir: &Path) -> String {
+    let mut line = format!(
+        "My Drive holds {} file(s), {}, to download into {}",
+        size.files,
+        remote_cli::size(size.bytes),
+        dir.display()
+    );
+    if let Some(free) = free {
+        line.push_str(&format!(" ({} free there)", remote_cli::size(free)));
+    }
+    if size.without_content > 0 {
+        line.push_str(&format!(
+            "; {} Google Doc(s), shortcut(s) and other item(s) without a file stay on Drive only",
+            size.without_content
+        ));
+    }
+    line
+}
+
+/// Whether `dir` holds nothing (zdrive's own `.zdrive-*` files aside).
+fn empty_dir(dir: &Path) -> Result<bool, String> {
+    let entries = std::fs::read_dir(dir).map_err(|error| format!("{}: {error}", dir.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("{}: {error}", dir.display()))?;
+        let name = entry.file_name();
+        if !name
+            .to_str()
+            .is_some_and(|name| name.starts_with(crate::plain::OWN_PREFIX))
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Refuses a folder, mount point or store that overlaps one of another
+/// auto-start instance: two drives would sync one place.
+fn check_other_instances(paths: &Paths, plan: &Plan) -> Result<(), String> {
+    use crate::service::definition::{Definition, Instance, names};
+    let mine: Vec<&Path> = std::iter::once(plan.dir.as_path())
+        .chain(plan.store.as_deref())
+        .collect();
+    for name in names(paths) {
+        if name == plan.name.as_str() {
+            continue;
+        }
+        let Ok(definition) = Definition::load(paths, &name) else {
+            continue;
+        };
+        let theirs: Vec<&Path> = match &definition.instance {
+            Instance::Encrypted {
+                encrypted_dir,
+                mount_dir,
+                ..
+            } => vec![encrypted_dir.as_path(), mount_dir.as_path()],
+            Instance::Plain { local_dir, .. } => vec![local_dir.as_path()],
+        };
+        for path in &mine {
+            if let Some(other) = theirs
+                .iter()
+                .find(|other| path.starts_with(other) || other.starts_with(path))
+            {
+                return Err(format!(
+                    "{} overlaps {} of the auto-start instance {name}; choose another --dir",
+                    path.display(),
+                    other.display()
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -639,6 +799,7 @@ mod tests {
             Plan {
                 name: name("drive"),
                 mode: RemoteMode::Encrypted,
+                mirror: false,
                 account: None,
                 dir: PathBuf::from("/home/u/zdrive"),
                 store: Some(PathBuf::from(
@@ -665,6 +826,117 @@ mod tests {
         assert_eq!(plan.store, None);
         assert_eq!(plan.account.as_deref(), Some("you@example.com"));
         assert!(!plan.autostart);
+    }
+
+    #[test]
+    fn a_mirror_is_plain_named_mirror_and_lives_in_google_drive() {
+        let args = SetupArgs {
+            mirror: true,
+            ..SetupArgs::default()
+        };
+        let plan = resolve_plan(&args, &paths(), &expand).unwrap();
+        assert_eq!(
+            (plan.name.as_str(), plan.mode, plan.mirror),
+            ("mirror", RemoteMode::Plain, true)
+        );
+        assert_eq!(plan.dir, PathBuf::from("/home/u/GoogleDrive"));
+        assert_eq!(plan.store, None);
+        let lines = describe(&plan, service::Platform::Linux);
+        assert!(
+            lines[1].contains("MIRROR of all of My Drive") && lines[1].contains("full access"),
+            "{lines:?}"
+        );
+        let parse = |extra: &[&str]| {
+            let mut arguments = vec!["zerotrust-drive", "setup", "--mirror"];
+            arguments.extend_from_slice(extra);
+            <crate::Cli as clap::Parser>::try_parse_from(arguments)
+        };
+        assert!(parse(&[]).is_ok());
+        for refused in [
+            &["--store", "/s"][..],
+            &["--device-code"],
+            &["--folder-name", "x"],
+        ] {
+            assert!(parse(refused).is_err(), "{refused:?}");
+        }
+    }
+
+    #[test]
+    fn a_mirror_summary_names_the_download_and_what_stays_on_drive() {
+        let size = crate::plain::MyDriveSize {
+            files: 3,
+            bytes: 3 << 30,
+            without_content: 2,
+        };
+        let line = mirror_summary(&size, Some(10 << 30), Path::new("/home/u/GoogleDrive"));
+        assert!(line.starts_with("My Drive holds 3 file(s), "), "{line}");
+        assert!(
+            line.contains("into /home/u/GoogleDrive (") && line.contains(" free there)"),
+            "{line}"
+        );
+        assert!(line.contains("2 Google Doc(s)"), "{line}");
+        let bare = mirror_summary(&crate::plain::MyDriveSize::default(), None, Path::new("/d"));
+        assert!(
+            !bare.contains("free") && !bare.contains("Google Doc"),
+            "{bare}"
+        );
+    }
+
+    #[test]
+    fn a_mirror_starts_empty_and_overlaps_no_other_instance() {
+        let root = crate::remote::TestDir::new("setup-mirror");
+        let base = root.path().canonicalize().unwrap();
+        let dir = base.join("GoogleDrive");
+        std::fs::create_dir(&dir).unwrap();
+        assert!(empty_dir(&dir).unwrap());
+        std::fs::write(dir.join(".zdrive-root-id"), b"id").unwrap();
+        assert!(empty_dir(&dir).unwrap(), "zdrive's own files do not count");
+        std::fs::write(dir.join("photo.jpg"), b"jpg").unwrap();
+        assert!(!empty_dir(&dir).unwrap());
+
+        let paths = Paths {
+            config: base.join("config"),
+            state: base.join("state"),
+            data: base.join("data"),
+        };
+        let definition = crate::service::definition::Definition {
+            name: "plain".to_string(),
+            instance: crate::service::definition::Instance::Plain {
+                remote: "plain".to_string(),
+                local_dir: dir.join("Work"),
+            },
+            final_push_wait_secs: 60,
+        };
+        definition.save(&paths).unwrap();
+        let mut plan = resolve_plan(
+            &SetupArgs {
+                mirror: true,
+                dir: Some(dir.clone()),
+                ..SetupArgs::default()
+            },
+            &paths,
+            &expand,
+        )
+        .unwrap();
+        let error = check_other_instances(&paths, &plan).unwrap_err();
+        assert!(
+            error.contains("of the auto-start instance plain"),
+            "{error}"
+        );
+        plan.dir = base.join("Elsewhere");
+        check_other_instances(&paths, &plan).unwrap();
+        // Setup run again for the same instance is no overlap.
+        plan.dir = dir.join("Work");
+        plan.name = name("plain");
+        check_other_instances(&paths, &plan).unwrap();
+
+        // A declined mirror leaves neither its configuration nor its token.
+        let remotes = paths.config.join("remotes");
+        std::fs::create_dir_all(&remotes).unwrap();
+        std::fs::write(remotes.join("mirror.json"), b"{}").unwrap();
+        std::fs::write(remotes.join("mirror.token"), b"t").unwrap();
+        forget_remote(&paths, &name("mirror"));
+        assert!(!remotes.join("mirror.json").exists() && !remotes.join("mirror.token").exists());
     }
 
     #[test]

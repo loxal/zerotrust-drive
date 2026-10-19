@@ -57,13 +57,16 @@ mod state;
 #[cfg(test)]
 mod tests;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Duration;
 
 pub(crate) use engine::{sync_once, watch_until_signalled};
+pub(crate) use local::{OWN_PREFIX, free_bytes as free_space};
 pub(crate) use state::{lock_existing, lock_path};
 
+use crate::remote::RemoteError;
+use crate::remote::format::MARKER_NAME;
 use crate::remote::gdrive::{
     DriveFile, GoogleDrive, MARKER_KEY, MY_DRIVE, PLAIN_MARKER, STORE_MARKER,
 };
@@ -152,6 +155,88 @@ pub(crate) struct CycleReport {
     /// Time spent reading the Drive changes.
     pub remote: Duration,
     pub total: Duration,
+}
+
+/// What a mirror of My Drive brings to this computer, as setup shows it
+/// before the first download.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct MyDriveSize {
+    /// Files with content below My Drive, and their bytes.
+    pub files: u64,
+    pub bytes: u64,
+    /// Google Docs, shortcuts and other items without a file, which stay
+    /// on Drive only.
+    pub without_content: u64,
+}
+
+/// Sizes the My Drive whose real id is `root` with one flat listing,
+/// leaving out what a mirror leaves out: zdrive's own folders and items
+/// outside My Drive.
+pub(crate) fn my_drive_size(drive: &GoogleDrive, root: &str) -> Result<MyDriveSize, RemoteError> {
+    const GOOGLE_APPS: &str = "application/vnd.google-apps.";
+    let items = drive.list_everything()?;
+    let by_id: HashMap<&str, &DriveFile> =
+        items.iter().map(|item| (item.id.as_str(), item)).collect();
+    let stores: HashSet<&str> = items
+        .iter()
+        .filter(|item| item.name == MARKER_NAME && !item.is_folder())
+        .filter_map(|item| item.parents.first().map(String::as_str))
+        .collect();
+    let mut inside: HashMap<&str, bool> = HashMap::new();
+    let mut size = MyDriveSize::default();
+    for item in &items {
+        if item.is_folder() || !in_my_drive(item, root, &by_id, &stores, &mut inside) {
+            continue;
+        }
+        if item.mime_type.starts_with(GOOGLE_APPS) || item.md5().is_none() {
+            size.without_content += 1;
+        } else {
+            size.files += 1;
+            size.bytes += item.size().unwrap_or(0);
+        }
+    }
+    Ok(size)
+}
+
+/// Whether `item`'s first parents lead to `root` without passing one of
+/// zdrive's own folders; folder results are remembered in `inside`.
+fn in_my_drive<'a>(
+    item: &'a DriveFile,
+    root: &str,
+    by_id: &HashMap<&'a str, &'a DriveFile>,
+    stores: &HashSet<&str>,
+    inside: &mut HashMap<&'a str, bool>,
+) -> bool {
+    const MAX_DEPTH: usize = 256;
+    let mut chain: Vec<&'a str> = Vec::new();
+    let mut current = item;
+    let result = loop {
+        let Some(parent) = current.parents.first().map(String::as_str) else {
+            break false;
+        };
+        if parent == root {
+            break true;
+        }
+        if let Some(&known) = inside.get(parent) {
+            break known;
+        }
+        let Some(&folder) = by_id.get(parent) else {
+            break false;
+        };
+        let own = matches!(
+            folder.app_properties.get(MARKER_KEY).map(String::as_str),
+            Some(STORE_MARKER | PLAIN_MARKER)
+        );
+        if own || stores.contains(parent) || chain.len() >= MAX_DEPTH {
+            break false;
+        }
+        chain.push(folder.id.as_str());
+        current = folder;
+    };
+    for id in chain {
+        inside.insert(id, result);
+    }
+    result
 }
 
 #[derive(Clone, Debug)]

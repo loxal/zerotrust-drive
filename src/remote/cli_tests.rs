@@ -314,6 +314,7 @@ fn choice<'a>() -> ClientChoice<'a> {
         headless: false,
         bundled: (true, true),
         default_client_file: None,
+        full_scope: false,
     }
 }
 
@@ -435,6 +436,110 @@ fn client_choice_without_bundled_clients_falls_back_or_names_the_fix() {
     })
     .unwrap_err();
     assert!(error.contains("--client-file"), "{error}");
+}
+
+#[test]
+fn a_mirror_signs_in_with_full_access_and_never_through_the_device_flow() {
+    let full = Issuer::bundled_full();
+    let mirror = || ClientChoice {
+        full_scope: true,
+        ..choice()
+    };
+    assert_eq!(
+        choose_client(mirror()).unwrap(),
+        (full.clone(), Flow::Browser)
+    );
+    // Over SSH or without a display the redirect is pasted back.
+    assert_eq!(
+        choose_client(ClientChoice {
+            headless: true,
+            ..mirror()
+        })
+        .unwrap(),
+        (full.clone(), Flow::Paste)
+    );
+    assert_eq!(
+        choose_client(ClientChoice {
+            no_browser: true,
+            ..mirror()
+        })
+        .unwrap(),
+        (full.clone(), Flow::Paste)
+    );
+    // Re-authorizing a mirror keeps full access.
+    assert_eq!(
+        choose_client(ClientChoice {
+            existing: Some(&full),
+            ..mirror()
+        })
+        .unwrap(),
+        (full.clone(), Flow::Browser)
+    );
+    let error = choose_client(ClientChoice {
+        device_code: true,
+        ..mirror()
+    })
+    .unwrap_err();
+    assert!(error.contains("device sign-in cannot grant"), "{error}");
+    // An own client keeps working; without any client the fix is named.
+    let own = PathBuf::from("/c/client.json");
+    assert_eq!(
+        choose_client(ClientChoice {
+            client_file: Some(own.clone()),
+            ..mirror()
+        })
+        .unwrap(),
+        (Issuer::byo(&own), Flow::Browser)
+    );
+    let error = choose_client(ClientChoice {
+        bundled: (false, true),
+        ..mirror()
+    })
+    .unwrap_err();
+    assert!(error.contains("--client-file"), "{error}");
+    let parsed = parse(&[
+        "remote",
+        "auth",
+        "--remote",
+        "m",
+        "--mirror",
+        "--device-code",
+    ]);
+    assert!(parsed.is_err(), "--mirror conflicts with --device-code");
+}
+
+#[test]
+fn a_mirror_binds_my_drive_by_its_real_id() {
+    use crate::remote::fake::{FakeDrive, ROOT_REAL_ID};
+
+    let fake = FakeDrive::start();
+    let drive = fake.client();
+    let (root, hint) = choose_folder(
+        &drive,
+        RemoteMode::Plain,
+        FolderChoice::MyDrive,
+        false,
+        &mut || panic!("a mirror joins no folder"),
+    )
+    .unwrap();
+    assert_eq!(
+        (root.id.as_str(), hint.as_str()),
+        (ROOT_REAL_ID, "My Drive")
+    );
+    // Under drive.file My Drive stays hidden: the grant was too narrow.
+    fake.hide_my_drive_root(true);
+    let error = choose_folder(
+        &drive,
+        RemoteMode::Plain,
+        FolderChoice::MyDrive,
+        false,
+        &mut || Ok(()),
+    )
+    .unwrap_err();
+    assert!(
+        error.contains("did not grant access to all of your Drive"),
+        "{error}"
+    );
 }
 
 #[test]
