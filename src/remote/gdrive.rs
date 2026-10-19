@@ -38,6 +38,13 @@ pub(crate) const PLAIN_MARKER: &str = "plain-v1";
 const FILE_FIELDS: &str =
     "id,name,size,md5Checksum,mimeType,parents,appProperties,trashed,modifiedTime,version";
 const LIST_FIELDS: &str = "nextPageToken,files(id,name,size,md5Checksum,mimeType,parents,appProperties,modifiedTime,version)";
+/// Marked folders also report who owns them and since when, so a join or
+/// a refusal can tell them apart.
+const MARKED_FIELDS: &str = "nextPageToken,files(id,name,mimeType,parents,appProperties,modifiedTime,version,createdTime,owners(displayName,emailAddress,me))";
+/// Items counted at a folder's top level before reporting "more than".
+pub(crate) const ITEM_COUNT_CAP: usize = 1000;
+/// Marked folders described in full when several refuse a join.
+const DESCRIBED_FOLDERS: usize = 10;
 const CHANGE_FIELDS: &str = "nextPageToken,newStartPageToken,changes(changeType,fileId,removed,file(id,name,size,md5Checksum,mimeType,parents,appProperties,trashed,modifiedTime,version))";
 /// Longest page token accepted from the changes feed.
 const MAX_PAGE_TOKEN: usize = 1024;
@@ -174,6 +181,34 @@ pub(crate) struct DriveFile {
     /// Drive's monotonically increasing version of this file.
     #[serde(default)]
     pub(crate) version: Option<String>,
+    /// RFC 3339 creation time; only marked-folder lookups request it.
+    #[serde(default)]
+    pub(crate) created_time: Option<String>,
+    /// Only marked-folder lookups request this; Drive reports no owner for
+    /// items in a shared drive.
+    #[serde(default)]
+    pub(crate) owners: Vec<Owner>,
+}
+
+/// An owner of a Drive item.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct Owner {
+    #[serde(default)]
+    pub(crate) display_name: Option<String>,
+    #[serde(default)]
+    pub(crate) email_address: Option<String>,
+    /// The signed-in account owns the item.
+    #[serde(default)]
+    pub(crate) me: bool,
+}
+
+/// The items at a folder's top level, counted up to [`ITEM_COUNT_CAP`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ItemCount {
+    pub(crate) items: usize,
+    /// The folder holds more than `items`.
+    pub(crate) more: bool,
 }
 
 impl DriveFile {
@@ -191,6 +226,8 @@ impl DriveFile {
             trashed: false,
             modified_time: None,
             version: None,
+            created_time: None,
+            owners: Vec::new(),
         }
     }
 
@@ -596,6 +633,18 @@ fn parse_json<T: DeserializeOwned>(op: &str, mut response: Response<Body>) -> St
     }
 }
 
+/// `2026-10-18T09:41:07.123Z` as `on 2026-10-18 09:41 UTC`; anything else
+/// verbatim (debug-escaped).
+fn utc_minute(time: &str) -> String {
+    let parts = (time.get(..10), time.get(10..11), time.get(11..16));
+    match parts {
+        (Some(date), Some("T"), Some(minute)) if time.ends_with('Z') && time.is_ascii() => {
+            format!("on {date} {minute} UTC")
+        }
+        _ => format!("at {time:?}"),
+    }
+}
+
 fn require_id(id: &str) -> Result<(), RemoteError> {
     if valid_file_id(id) {
         Ok(())
@@ -871,7 +920,7 @@ impl GoogleDrive {
         if folders_only {
             query.push_str(&format!(" and mimeType = '{FOLDER_MIME}'"));
         }
-        self.query_all("list folder", &query)
+        self.query_all("list folder", &query, LIST_FIELDS)
     }
 
     /// Every non-trashed folder anywhere in the Drive that carries the app
@@ -890,7 +939,7 @@ impl GoogleDrive {
         let query = format!(
             "appProperties has {{ key='{MARKER_KEY}' and value='{marker}' }} and mimeType = '{FOLDER_MIME}' and trashed = false"
         );
-        self.query_all("find marked folders", &query)
+        self.query_all("find marked folders", &query, MARKED_FIELDS)
     }
 
     /// The single folder marked `marker`, or a new one named `name` in My
@@ -912,17 +961,94 @@ impl GoogleDrive {
             }
             1 => Ok((found.remove(0), false)),
             _ => {
-                let ids: Vec<&str> = found.iter().map(|folder| folder.id.as_str()).collect();
+                let mut details: Vec<String> = found
+                    .iter()
+                    .take(DESCRIBED_FOLDERS)
+                    .map(|folder| self.describe_folder(folder))
+                    .collect();
+                if found.len() > DESCRIBED_FOLDERS {
+                    details.push(format!("and {} more", found.len() - DESCRIBED_FOLDERS));
+                }
                 Err(RemoteError::Conflict(format!(
-                    "{} Drive folders are marked as zerotrust-drive {marker} folders (ids {}); move all but one to the bin, or choose one with --folder-id",
+                    "{} Drive folders are marked as zerotrust-drive {marker} folders:\n  {}\nmove all but one to the bin, or choose one with --folder-id",
                     found.len(),
-                    ids.join(", ")
+                    details.join("\n  ")
                 )))
             }
         }
     }
 
-    fn query_all(&self, op: &'static str, query: &str) -> Result<Vec<DriveFile>, RemoteError> {
+    /// The items at the top level of `parent`, from one bounded listing.
+    pub(crate) fn count_items(&self, parent: &str) -> Result<ItemCount, RemoteError> {
+        require_id(parent)?;
+        let url = self.url("/drive/v3/files");
+        let query = format!("'{parent}' in parents and trashed = false");
+        let page: FileList = self.run_json("count folder items", false, |agent, bearer| {
+            agent
+                .get(&url)
+                .header("Authorization", bearer)
+                .query("q", &query)
+                .query("fields", "nextPageToken,files(id,name)")
+                .query("pageSize", ITEM_COUNT_CAP.to_string())
+                .query("supportsAllDrives", "true")
+                .query("includeItemsFromAllDrives", "true")
+                .call()
+        })?;
+        Ok(ItemCount {
+            items: page.files.len(),
+            more: page.next_page_token.is_some_and(|token| !token.is_empty()),
+        })
+    }
+
+    /// One line that tells an existing folder apart from its namesakes:
+    /// name, id, creation time, owner and top-level item count. A failed
+    /// count is reported, not fatal.
+    pub(crate) fn describe_folder(&self, folder: &DriveFile) -> String {
+        let created = folder
+            .created_time
+            .as_deref()
+            .map(utc_minute)
+            .unwrap_or_else(|| "at an unknown time".to_string());
+        let owner = match folder.owners.first() {
+            Some(owner) => {
+                let who = owner
+                    .email_address
+                    .as_deref()
+                    .or(owner.display_name.as_deref())
+                    .filter(|who| !who.is_empty());
+                match (owner.me, who) {
+                    (true, Some(who)) => format!("owned by you ({who:?})"),
+                    (true, None) => "owned by you".to_string(),
+                    (false, Some(who)) => format!("owned by {who:?}"),
+                    (false, None) => "owner not reported".to_string(),
+                }
+            }
+            None => "owner not reported".to_string(),
+        };
+        let items = match self.count_items(&folder.id) {
+            Ok(ItemCount { items: 0, .. }) => "empty".to_string(),
+            Ok(ItemCount {
+                items: 1,
+                more: false,
+            }) => "1 item at its top level".to_string(),
+            Ok(ItemCount { items, more: false }) => format!("{items} items at its top level"),
+            Ok(ItemCount { items, more: true }) => {
+                format!("more than {items} items at its top level")
+            }
+            Err(error) => format!("item count unavailable ({error})"),
+        };
+        format!(
+            "{:?} (id {}), created {created}, {owner}, {items}",
+            folder.name, folder.id
+        )
+    }
+
+    fn query_all(
+        &self,
+        op: &'static str,
+        query: &str,
+        fields: &str,
+    ) -> Result<Vec<DriveFile>, RemoteError> {
         let url = self.url("/drive/v3/files");
         let mut files = Vec::new();
         let mut page_token: Option<String> = None;
@@ -932,7 +1058,7 @@ impl GoogleDrive {
                     .get(&url)
                     .header("Authorization", bearer)
                     .query("q", query)
-                    .query("fields", LIST_FIELDS)
+                    .query("fields", fields)
                     .query("pageSize", "1000")
                     .query("supportsAllDrives", "true")
                     .query("includeItemsFromAllDrives", "true");
@@ -2085,12 +2211,96 @@ mod tests {
         assert!(matches!(error, RemoteError::Conflict(_)), "{error}");
         assert!(error.to_string().contains(&created.id), "{error}");
         assert!(error.to_string().contains(&second), "{error}");
+        // Each one is described, so the user can tell which to keep.
+        assert!(error.to_string().contains("\"Other\""), "{error}");
+        assert_eq!(
+            error.to_string().matches("owned by you").count(),
+            2,
+            "{error}"
+        );
+        assert_eq!(error.to_string().matches(", empty").count(), 2, "{error}");
 
         // Markers never reach the query unescaped.
         assert!(matches!(
             drive.find_marked_folders("x' or name contains '"),
             Err(RemoteError::Protocol(_))
         ));
+    }
+
+    #[test]
+    fn a_found_folder_is_described_by_creation_owner_and_items() {
+        let fake = FakeDrive::start();
+        let drive = fake.client();
+        let (created, _) = drive
+            .find_or_create_marked_folder(PLAIN_MARKER, "Sync \u{1b}[31m")
+            .unwrap();
+        let (found, fresh) = drive
+            .find_or_create_marked_folder(PLAIN_MARKER, "Sync")
+            .unwrap();
+        assert!(!fresh);
+        // The lookup reports what real Drive reports for the owner.
+        assert_eq!(found.owners.len(), 1);
+        assert!(found.owners[0].me, "{found:?}");
+        assert!(found.created_time.is_some(), "{found:?}");
+        let described = drive.describe_folder(&found);
+        assert!(described.contains(&created.id), "{described}");
+        assert!(described.contains("created on 2026-01-01 "), "{described}");
+        assert!(
+            described.contains(" UTC, owned by you (\"tester@example.com\")"),
+            "{described}"
+        );
+        assert!(described.ends_with(", empty"), "{described}");
+        // Control characters in a Drive name never reach the terminal.
+        assert!(!described.contains('\u{1b}'), "{described}");
+
+        for name in ["a", "b", "c"] {
+            fake.insert(&created.id, name, None, b"x");
+        }
+        assert_eq!(
+            drive.count_items(&created.id).unwrap(),
+            ItemCount {
+                items: 3,
+                more: false
+            }
+        );
+        assert!(
+            drive
+                .describe_folder(&found)
+                .ends_with(", 3 items at its top level")
+        );
+        let binned = fake.insert(&created.id, "binned", None, b"x");
+        fake.trash_foreign(&binned, true);
+        assert_eq!(drive.count_items(&created.id).unwrap().items, 3);
+        fake.set_page_size(2);
+        assert_eq!(
+            drive.count_items(&created.id).unwrap(),
+            ItemCount {
+                items: 2,
+                more: true
+            }
+        );
+        assert!(
+            drive
+                .describe_folder(&found)
+                .ends_with(", more than 2 items at its top level")
+        );
+
+        // A folder without owner or creation time still gets a line, and a
+        // failed count does not hide the folder.
+        let bare = DriveFile {
+            created_time: Some("yesterday".to_string()),
+            owners: Vec::new(),
+            ..found.clone()
+        };
+        fake.set_offline(true);
+        let described = drive.describe_folder(&bare);
+        fake.set_offline(false);
+        assert!(
+            described.contains("created at \"yesterday\""),
+            "{described}"
+        );
+        assert!(described.contains("owner not reported"), "{described}");
+        assert!(described.contains("item count unavailable"), "{described}");
     }
 
     #[test]

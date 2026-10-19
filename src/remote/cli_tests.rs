@@ -461,10 +461,12 @@ fn plain_remotes_always_end_in_a_marked_folder() {
     };
 
     // The default folder is created marked in My Drive and joined again.
-    let (first, hint) = choose_folder(&drive, RemoteMode::Plain, default(), true).unwrap();
+    let (first, hint) =
+        choose_folder(&drive, RemoteMode::Plain, default(), true, &mut || Ok(())).unwrap();
     assert_eq!(hint, "ZeroTrust Drive (plain)");
     assert_eq!(marker(&first.id).as_deref(), Some(PLAIN_MARKER));
-    let (again, _) = choose_folder(&drive, RemoteMode::Plain, default(), true).unwrap();
+    let (again, _) =
+        choose_folder(&drive, RemoteMode::Plain, default(), true, &mut || Ok(())).unwrap();
     assert_eq!(again.id, first.id);
 
     // An explicit path creates and marks exactly its last component, even
@@ -474,6 +476,7 @@ fn plain_remotes_always_end_in_a_marked_folder() {
         RemoteMode::Plain,
         path(ROOT_ID, "/Work/Sync/"),
         false,
+        &mut || Ok(()),
     )
     .unwrap();
     assert_eq!(nested.name, "Sync");
@@ -481,32 +484,150 @@ fn plain_remotes_always_end_in_a_marked_folder() {
     let work = fake.file(&nested.parents[0]).unwrap();
     assert_eq!(work.name, "Work");
     assert!(work.app_properties.is_empty(), "{work:?}");
-    let (rejoined, _) =
-        choose_folder(&drive, RemoteMode::Plain, path(ROOT_ID, "Work/Sync"), false).unwrap();
+    let (rejoined, _) = choose_folder(
+        &drive,
+        RemoteMode::Plain,
+        path(ROOT_ID, "Work/Sync"),
+        false,
+        &mut || Ok(()),
+    )
+    .unwrap();
     assert_eq!(rejoined.id, nested.id);
-    let (top, _) = choose_folder(&drive, RemoteMode::Plain, path(ROOT_ID, "Top"), false).unwrap();
+    let (top, _) = choose_folder(
+        &drive,
+        RemoteMode::Plain,
+        path(ROOT_ID, "Top"),
+        false,
+        &mut || Ok(()),
+    )
+    .unwrap();
     assert_eq!(top.name, "Top");
     assert_ne!(top.id, first.id);
     assert_eq!(marker(&top.id).as_deref(), Some(PLAIN_MARKER));
 
     // A configured remote re-authorizes onto its own marked folder.
-    let (same, _) = choose_folder(&drive, RemoteMode::Plain, path(&first.id, ""), false).unwrap();
+    let (same, _) = choose_folder(
+        &drive,
+        RemoteMode::Plain,
+        path(&first.id, ""),
+        false,
+        &mut || Ok(()),
+    )
+    .unwrap();
     assert_eq!(same.id, first.id);
 
     // A folder zdrive did not mark is never adopted, by path or by id, and
     // stays unmarked.
     let foreign = fake.insert(ROOT_ID, "Mine", Some(FOLDER_MIME), b"");
-    let error = choose_folder(&drive, RemoteMode::Plain, path(ROOT_ID, "Mine"), false).unwrap_err();
+    let error = choose_folder(
+        &drive,
+        RemoteMode::Plain,
+        path(ROOT_ID, "Mine"),
+        false,
+        &mut || Ok(()),
+    )
+    .unwrap_err();
     assert!(error.contains(&foreign), "{error}");
-    let error = choose_folder(&drive, RemoteMode::Plain, path(&foreign, ""), false).unwrap_err();
+    let error = choose_folder(
+        &drive,
+        RemoteMode::Plain,
+        path(&foreign, ""),
+        false,
+        &mut || Ok(()),
+    )
+    .unwrap_err();
     assert!(error.contains("not marked for plain sync"), "{error}");
     assert!(error.contains("--folder-path"), "{error}");
     assert_eq!(marker(&foreign), None);
 
     // Encrypted path folders stay unmarked, as before.
-    let (vault, _) =
-        choose_folder(&drive, RemoteMode::Encrypted, path(ROOT_ID, "Vault"), false).unwrap();
+    let (vault, _) = choose_folder(
+        &drive,
+        RemoteMode::Encrypted,
+        path(ROOT_ID, "Vault"),
+        false,
+        &mut || Ok(()),
+    )
+    .unwrap();
     assert_eq!(marker(&vault.id), None);
+}
+
+#[test]
+fn a_found_plain_folder_is_joined_only_after_confirmation() {
+    use crate::remote::fake::FakeDrive;
+    use crate::remote::gdrive::{PLAIN_MARKER, STORE_MARKER};
+
+    let fake = FakeDrive::start();
+    let drive = fake.client();
+    let marked = |marker| FolderChoice::Marked {
+        marker,
+        name: "ZeroTrust Drive".to_string(),
+    };
+    let mut asked = 0;
+    let never = &mut || -> Result<(), String> { panic!("nothing to confirm") };
+
+    // Creating a folder, and joining an encrypted one, asks nothing: the
+    // passphrase proves an encrypted join.
+    let (plain, _) =
+        choose_folder(&drive, RemoteMode::Plain, marked(PLAIN_MARKER), true, never).unwrap();
+    let (vault, _) = choose_folder(
+        &drive,
+        RemoteMode::Encrypted,
+        marked(STORE_MARKER),
+        true,
+        never,
+    )
+    .unwrap();
+    let (again, _) = choose_folder(
+        &drive,
+        RemoteMode::Encrypted,
+        marked(STORE_MARKER),
+        true,
+        never,
+    )
+    .unwrap();
+    assert_eq!(again.id, vault.id);
+
+    // Joining the plain folder zdrive found asks once; a refusal wins.
+    let error = choose_folder(
+        &drive,
+        RemoteMode::Plain,
+        marked(PLAIN_MARKER),
+        true,
+        &mut || {
+            asked += 1;
+            Err(DECLINED_JOIN.to_string())
+        },
+    )
+    .unwrap_err();
+    assert_eq!(error, DECLINED_JOIN);
+    assert_eq!(asked, 1);
+    let (joined, _) = choose_folder(
+        &drive,
+        RemoteMode::Plain,
+        marked(PLAIN_MARKER),
+        true,
+        &mut || {
+            asked += 1;
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!((joined.id.as_str(), asked), (plain.id.as_str(), 2));
+
+    // A folder the user names, or the one a remote already uses, is joined
+    // without asking.
+    let by_id = FolderChoice::Path {
+        parent: plain.id.clone(),
+        path: String::new(),
+    };
+    assert_eq!(
+        choose_folder(&drive, RemoteMode::Plain, by_id, true, never)
+            .unwrap()
+            .0
+            .id,
+        plain.id
+    );
 }
 
 #[test]
@@ -521,8 +642,9 @@ fn bundled_folder_paths_work_although_drive_file_hides_my_drive() {
         parent: parent.to_string(),
         path: path.to_string(),
     };
-    let choose =
-        |mode, parent: &str, folder: &str| choose_folder(&drive, mode, path(parent, folder), true);
+    let choose = |mode, parent: &str, folder: &str| {
+        choose_folder(&drive, mode, path(parent, folder), true, &mut || Ok(()))
+    };
 
     let (vault, hint) = choose(RemoteMode::Encrypted, MY_DRIVE, "zdrive-tests/enc").unwrap();
     assert_eq!(hint, "My Drive/zdrive-tests/enc");

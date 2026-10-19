@@ -103,6 +103,11 @@ pub(crate) struct AuthArgs {
     /// Private file (mode 0600) holding the store passphrase
     #[arg(long, value_name = "FILE")]
     pub(crate) passphrase_file: Option<PathBuf>,
+
+    /// Join an existing plain Drive folder that zdrive found without
+    /// asking; required without a terminal
+    #[arg(long)]
+    pub(crate) yes: bool,
 }
 
 #[derive(Args, Debug)]
@@ -506,7 +511,31 @@ pub(crate) fn authorize(args: AuthArgs) -> Result<Authorized, String> {
             config.account, account.email
         ));
     }
-    let (folder, hint) = choose_folder(&drive, mode, folder_choice, issuer.client.bundled())?;
+    let yes = args.yes;
+    let mut confirm_join = || {
+        if yes {
+            return Ok(());
+        }
+        let terminal = terminal.as_mut().ok_or(
+            "joining an existing plain Drive folder syncs its files into this computer; confirm on a terminal, or pass --yes",
+        )?;
+        if crate::prompt::ask_yes_no(
+            terminal,
+            "join this folder and sync its files with this computer?",
+            "nothing was saved",
+        )? {
+            Ok(())
+        } else {
+            Err(DECLINED_JOIN.to_string())
+        }
+    };
+    let (folder, hint) = choose_folder(
+        &drive,
+        mode,
+        folder_choice,
+        issuer.client.bundled(),
+        &mut confirm_join,
+    )?;
     if let Some(config) = &existing
         && config.folder_id != folder.id
     {
@@ -561,13 +590,19 @@ pub(crate) fn authorize(args: AuthArgs) -> Result<Authorized, String> {
     })
 }
 
+const DECLINED_JOIN: &str = "not joining that folder; nothing was saved. Move it to the Drive bin to start a new one, or name another with `zdrive remote auth --remote NAME --plain --folder-path PATH`";
+
 /// Resolves the Drive folder of a remote being authorized; a plain remote
-/// always ends in a folder carrying the plain sync marker.
+/// always ends in a folder carrying the plain sync marker. An existing
+/// folder is described before it is joined; a plain one that zdrive found
+/// by its marker, rather than by a path the user named, is joined only
+/// after `confirm_join` agrees.
 fn choose_folder(
     drive: &GoogleDrive,
     mode: RemoteMode,
     choice: FolderChoice,
     bundled: bool,
+    confirm_join: &mut dyn FnMut() -> Result<(), String>,
 ) -> Result<(gdrive::DriveFile, String), String> {
     let (folder, hint) = match choice {
         FolderChoice::Marked {
@@ -584,11 +619,20 @@ fn choose_folder(
                     &folder_name,
                 ))?,
             };
-            note(&if created {
-                format!("created the Drive folder \"{}\" in My Drive", folder.name)
+            if created {
+                note(&format!(
+                    "created the Drive folder \"{}\" in My Drive",
+                    folder.name
+                ));
             } else {
-                format!("joining the existing Drive folder \"{}\"", folder.name)
-            });
+                note(&format!(
+                    "joining the existing Drive folder {}",
+                    drive.describe_folder(&folder)
+                ));
+                if mode == RemoteMode::Plain {
+                    confirm_join()?;
+                }
+            }
             let hint = folder.name.clone();
             (folder, hint)
         }
@@ -606,12 +650,16 @@ fn choose_folder(
                     let container = drive
                         .resolve_folder_path(&parent, prefix, true)
                         .map_err(|error| error.to_string())?;
-                    plain_folder(crate::plain::find_or_create_child_folder(
-                        drive,
-                        &container.id,
-                        last,
-                    ))?
-                    .0
+                    let (folder, created) = plain_folder(
+                        crate::plain::find_or_create_child_folder(drive, &container.id, last),
+                    )?;
+                    if !created {
+                        note(&format!(
+                            "joining the existing Drive folder {}",
+                            drive.describe_folder(&folder)
+                        ));
+                    }
+                    folder
                 }
                 _ => drive
                     .resolve_folder_path(&parent, &path, true)

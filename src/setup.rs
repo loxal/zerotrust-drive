@@ -81,7 +81,8 @@ pub(crate) struct SetupArgs {
     #[arg(long)]
     no_autostart: bool,
 
-    /// Accept the shown plan without asking; required without a terminal
+    /// Accept the shown plan, including joining an existing plain Drive
+    /// folder, without asking; required without a terminal
     #[arg(long)]
     yes: bool,
 }
@@ -189,6 +190,7 @@ fn setup(args: SetupArgs) -> Result<Vec<String>, String> {
         client_file: args.client_file.clone(),
         device_code: args.device_code,
         no_browser: args.no_browser,
+        yes: args.yes,
         passphrase: passphrase
             .as_ref()
             .map(|(passphrase, _)| passphrase.clone()),

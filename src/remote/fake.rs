@@ -109,6 +109,8 @@ pub(crate) struct FakeFile {
     /// Change sequence number of the last change, rendered as
     /// `modifiedTime`.
     pub(crate) modified: u64,
+    /// Change sequence number of the creation, rendered as `createdTime`.
+    pub(crate) created: u64,
 }
 
 struct Session {
@@ -276,6 +278,15 @@ impl State {
             "trashed": self.effectively_trashed(file),
             "version": file.version.to_string(),
             "modifiedTime": modified_time(file.modified),
+            "createdTime": modified_time(file.created),
+            // Real Drive reports the signed-in owner of a My Drive item this way.
+            "owners": [{
+                "kind": "drive#user",
+                "displayName": "Tester",
+                "emailAddress": "tester@example.com",
+                "me": true,
+                "permissionId": "04918276354104731905",
+            }],
         });
         if !file.app_properties.is_empty() {
             value["appProperties"] = json!(file.app_properties);
@@ -449,6 +460,7 @@ impl State {
             trashed: false,
             version: 1,
             modified: seq,
+            created: seq,
         };
         let mut body = self.file_json(&file);
         if self.omit_checksums
@@ -529,6 +541,7 @@ impl FakeDrive {
                 trashed: false,
                 version: 1,
                 modified: 0,
+                created: 0,
             },
         );
         state.next_change = 1;
