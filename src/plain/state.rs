@@ -15,7 +15,11 @@ use super::local::{Kind, Stat};
 use crate::remote::{ensure_private_dir, read_private_file, write_private_file};
 
 pub(crate) const STATE_FORMAT: &str = "zerotrust-drive-plain-state";
-pub(crate) const STATE_VERSION: u32 = 1;
+/// Version 2 (0.19.0) adds mirror names, the root id, parked and excluded
+/// items. Version 1 states load unchanged and are written back as 2, which
+/// an older zdrive refuses rather than dropping what it cannot keep.
+pub(crate) const STATE_VERSION: u32 = 2;
+const OLDEST_STATE_VERSION: u32 = 1;
 const MAX_STATE_BYTES: u64 = 1 << 30;
 
 fn is_false(value: &bool) -> bool {
@@ -43,9 +47,30 @@ pub(crate) struct Entry {
     pub(crate) version: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) modified: Option<String>,
+    /// The Drive name, when a mirror keeps the item under another local
+    /// name (a duplicate or a name that cannot be a local one).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) remote_name: Option<String>,
+}
+
+/// An item Drive refuses this account a step on: tried again after `until`
+/// (Unix seconds), with the pause doubling per refusal.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Parked {
+    pub(crate) until: i64,
+    pub(crate) refusals: u32,
+    /// Drive's version of the item when it was first seen parked: a newer
+    /// one (new sharing settings, new content) releases it early.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) version: Option<String>,
 }
 
 impl Entry {
+    /// The item's name on Drive, given its local name.
+    pub(crate) fn drive_name<'a>(&'a self, local_name: &'a str) -> &'a str {
+        self.remote_name.as_deref().unwrap_or(local_name)
+    }
+
     /// Whether the local item still is exactly what was synced.
     pub(crate) fn unchanged(&self, stat: &Stat) -> bool {
         if self.dir {
@@ -108,10 +133,26 @@ pub(crate) struct State {
     /// folder brings children the feed does not repeat.
     #[serde(default)]
     pub(crate) relist: BTreeSet<String>,
+    /// The id written to the local folder's `.zdrive-root-id`: a folder
+    /// without it (or with another) may not be the one that was synced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) root_id: Option<String>,
+    /// Drive ids set aside after Drive refused a step on them.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) parked: BTreeMap<String, Parked>,
+    /// Mirror only: Drive folders holding a zerotrust-drive store, found by
+    /// their `zdrive-remote.json` rather than a marker this client may not
+    /// see. Nothing below them is synced.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub(crate) excluded: BTreeSet<String>,
     #[serde(skip)]
     by_id: HashMap<String, String>,
     #[serde(skip)]
     path: PathBuf,
+    /// Digest of the bytes last read or written, so an unchanged state is
+    /// not rewritten every cycle.
+    #[serde(skip)]
+    saved: std::cell::Cell<Option<u64>>,
 }
 
 #[cfg(test)]
@@ -228,6 +269,30 @@ impl State {
         }
     }
 
+    /// Number of indexed items.
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether Drive item `id` is set aside at `now`.
+    pub(crate) fn is_parked(&self, id: &str, now: i64) -> bool {
+        self.parked.get(id).is_some_and(|parked| parked.until > now)
+    }
+
+    /// Sets `id` aside after Drive refused it a step: an hour after the
+    /// first refusal, doubling up to a day. `version` is Drive's version of
+    /// the item when known; a later one releases it early.
+    pub(crate) fn park(&mut self, id: &str, now: i64, version: Option<&String>) {
+        const HOUR: i64 = 3600;
+        let parked = self.parked.entry(id.to_string()).or_default();
+        if let Some(version) = version {
+            parked.version = Some(version.clone());
+        }
+        parked.refusals = parked.refusals.saturating_add(1);
+        let pause = (HOUR << (parked.refusals - 1).min(5)).min(24 * HOUR);
+        parked.until = now + pause;
+    }
+
     pub(crate) fn save(&self) -> Result<(), String> {
         #[cfg(test)]
         {
@@ -241,8 +306,22 @@ impl State {
         }
         let bytes = serde_json::to_vec(self)
             .map_err(|error| format!("cannot encode the sync state: {error}"))?;
-        write_private_file(&self.path, &bytes).map_err(|error| error.to_string())
+        let digest = digest(&bytes);
+        if self.saved.get() == Some(digest) {
+            return Ok(());
+        }
+        write_private_file(&self.path, &bytes).map_err(|error| error.to_string())?;
+        self.saved.set(Some(digest));
+        Ok(())
     }
+}
+
+/// Change detection only: an unequal digest means "write", never trust.
+fn digest(bytes: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    hasher.finish()
 }
 
 /// The lock file next to the state file.
@@ -288,8 +367,12 @@ pub(crate) fn open(options: &PlainOptions) -> Result<(State, File), String> {
             pending: BTreeMap::new(),
             retry: BTreeSet::new(),
             relist: BTreeSet::new(),
+            root_id: None,
+            parked: BTreeMap::new(),
+            excluded: BTreeSet::new(),
             by_id: HashMap::new(),
             path: options.state_file.clone(),
+            saved: std::cell::Cell::new(None),
         };
         return Ok((state, lock));
     };
@@ -299,14 +382,18 @@ pub(crate) fn open(options: &PlainOptions) -> Result<(State, File), String> {
             options.state_file.display()
         )
     })?;
-    if state.format != STATE_FORMAT || state.version != STATE_VERSION {
+    if state.format != STATE_FORMAT
+        || !(OLDEST_STATE_VERSION..=STATE_VERSION).contains(&state.version)
+    {
         return Err(format!(
-            "{} has format {} version {}, but this zdrive reads {STATE_FORMAT} version {STATE_VERSION}",
+            "{} has format {} version {}, but this zdrive reads {STATE_FORMAT} versions {OLDEST_STATE_VERSION} to {STATE_VERSION}",
             options.state_file.display(),
             state.format,
             state.version
         ));
     }
+    let upgraded = state.version != STATE_VERSION;
+    state.version = STATE_VERSION;
     let start_over = format!(
         "remove {} to bind it from scratch",
         options.state_file.display()
@@ -334,6 +421,9 @@ pub(crate) fn open(options: &PlainOptions) -> Result<(State, File), String> {
         ));
     }
     state.path = options.state_file.clone();
+    if !upgraded {
+        state.saved.set(Some(digest(&bytes)));
+    }
     state.by_id = state
         .entries
         .iter()

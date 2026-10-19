@@ -8,15 +8,28 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use super::local::{self, Scan, Stat, Trash};
+use super::prefetch::Prefetch;
 use super::state::{self, Entry, State};
-use super::{CycleReport, PlainOptions, check_marker};
+use super::{CycleReport, PlainOptions, Progress, check_marker};
 use crate::refusal::{Class, Failure};
 use crate::remote::RemoteError;
-use crate::remote::gdrive::{DriveFile, GoogleDrive};
+use crate::remote::gdrive::{DriveFile, GoogleDrive, MY_DRIVE};
 
 const SAVE_EVERY_OPS: u32 = 200;
 const SAVE_EVERY: Duration = Duration::from_secs(15);
+/// Rewriting a large index every 15 s would cost more than the work it
+/// protects; above this many items it is saved at most once a minute.
+const LARGE_INDEX: usize = 10_000;
+const SAVE_EVERY_LARGE: Duration = Duration::from_secs(60);
 const MAX_BACKOFF: Duration = Duration::from_secs(300);
+/// How long a cycle keeps working after a stop request before it saves
+/// what it did and ends: a first sync can run for hours, and a service
+/// manager stops waiting long before.
+const STOP_GRACE: Duration = Duration::from_secs(20);
+/// Parked items not refused again for this long are forgotten.
+const PARKED_RETENTION: i64 = 7 * 24 * 3600;
+/// Pause between progress reports of a long cycle.
+const PROGRESS_EVERY: Duration = Duration::from_secs(10);
 
 /// Why a cycle ended early. Work done before it is kept in the state; the
 /// changes position is not advanced, so the next cycle repeats the rest.
@@ -26,12 +39,18 @@ pub(super) enum Fatal {
     Transient(String),
     /// The Drive folder cannot be synced: gone, in the bin or not marked.
     Refused(String),
+    /// A stop request outlasted [`STOP_GRACE`]; the work done is saved.
+    Stopped,
 }
 
 impl Fatal {
     fn message(self) -> String {
         match self {
             Self::Transient(message) | Self::Refused(message) => message,
+            Self::Stopped => {
+                "stopped before the cycle finished; the next sync continues where it ended"
+                    .to_string()
+            }
         }
     }
 }
@@ -87,8 +106,21 @@ pub(super) struct Cycle<'a> {
     pub(super) retry: BTreeSet<String>,
     /// Whether phase A changed the local folder, so phase B rescans.
     pub(super) mutated: bool,
+    /// The local file system ran short of space: further downloads wait.
+    pub(super) disk_short: bool,
+    /// Why Drive deletions are held this cycle regardless of their number:
+    /// the local folder may not be the one that was synced.
+    pub(super) unbound: Option<String>,
+    /// Unix seconds at the start of the cycle, for parked items.
+    pub(super) now: i64,
+    /// Downloads staged ahead of their install, during a mirror's pass.
+    pub(super) prefetch: Option<Prefetch>,
+    /// New files and bytes the pull set out to download, for progress.
+    pub(super) planned: (u64, u64),
+    stop: &'a dyn Fn() -> bool,
     ops: u32,
     saved: Instant,
+    reported: Instant,
 }
 
 impl<'a> Cycle<'a> {
@@ -102,6 +134,57 @@ impl<'a> Cycle<'a> {
         Ok(())
     }
 
+    /// [`fail`](Self::fail) for a step on Drive item `id`: retried next
+    /// cycle, or parked for hours when Drive refuses this account the step,
+    /// which retrying every few seconds could not change.
+    pub(super) fn fail_item(
+        &mut self,
+        what: &str,
+        id: &str,
+        error: RemoteError,
+    ) -> Result<(), Fatal> {
+        self.fail_versioned(what, id, None, error)
+    }
+
+    /// [`fail_item`](Self::fail_item) for a step on `file` as last read.
+    pub(super) fn fail_on(
+        &mut self,
+        what: &str,
+        file: &DriveFile,
+        error: RemoteError,
+    ) -> Result<(), Fatal> {
+        self.fail_versioned(what, &file.id, file.version.as_ref(), error)
+    }
+
+    fn fail_versioned(
+        &mut self,
+        what: &str,
+        id: &str,
+        version: Option<&String>,
+        error: RemoteError,
+    ) -> Result<(), Fatal> {
+        let denied = matches!(error, RemoteError::Denied(_));
+        self.fail(what, error)?;
+        if denied {
+            self.park(id, version);
+        } else {
+            self.retry.insert(id.to_string());
+        }
+        Ok(())
+    }
+
+    /// Sets `id` aside: Drive refuses this account a step on it. A version
+    /// newer than `version` releases it.
+    pub(super) fn park(&mut self, id: &str, version: Option<&String>) {
+        self.state.park(id, self.now, version);
+        self.retry.remove(id);
+        self.report.parked += 1;
+    }
+
+    pub(super) fn parked(&self, id: &str) -> bool {
+        self.state.is_parked(id, self.now)
+    }
+
     pub(super) fn save(&mut self) -> Result<(), Fatal> {
         self.ops = 0;
         self.saved = Instant::now();
@@ -110,11 +193,33 @@ impl<'a> Cycle<'a> {
             .map_err(|error| Fatal::Transient(format!("cannot save the sync state: {error}")))
     }
 
-    /// Saves now and then during long cycles, so a crash repeats little.
+    /// Saves now and then during long cycles, so a crash repeats little,
+    /// and ends the cycle once a stop request outlasted its grace.
     pub(super) fn tick(&mut self) -> Result<(), Fatal> {
         self.ops += 1;
-        if self.ops >= SAVE_EVERY_OPS || self.saved.elapsed() >= SAVE_EVERY {
+        let every = if self.state.len() > LARGE_INDEX {
+            SAVE_EVERY_LARGE
+        } else {
+            SAVE_EVERY
+        };
+        if self.ops >= SAVE_EVERY_OPS || self.saved.elapsed() >= every {
             self.save()?;
+        }
+        if let Some(progress) = self.options.progress
+            && self.reported.elapsed() >= PROGRESS_EVERY
+        {
+            self.reported = Instant::now();
+            progress(&Progress {
+                downloaded: self.report.downloaded,
+                download_bytes: self.report.download_bytes,
+                uploaded: self.report.uploaded,
+                upload_bytes: self.report.upload_bytes,
+                planned: self.planned.0,
+                planned_bytes: self.planned.1,
+            });
+        }
+        if (self.stop)() {
+            return Err(Fatal::Stopped);
         }
         Ok(())
     }
@@ -125,6 +230,43 @@ impl<'a> Cycle<'a> {
         self.unindexed
             .get(&entry.inode)
             .is_some_and(|stat| entry.same_item(stat))
+    }
+
+    /// Checks by its `.zdrive-root-id` that the local folder is the one the
+    /// index was bound to; a folder replaced by another file system with
+    /// the same root inode, or restored without that file, is not. The file
+    /// is (re)written while that is safe: for a new index, while nothing
+    /// indexed is missing, for the index of a zdrive before 0.19 while some
+    /// indexed item is present, and on an explicit `--allow-deletions`.
+    /// Otherwise Drive deletions are held for this cycle.
+    fn bind_root(&mut self, scan: &Scan) -> Result<(), Fatal> {
+        let read = local::read_root_id(self.root)
+            .map_err(|error| Fatal::Transient(format!("read {}: {error}", local::ROOT_ID_FILE)))?;
+        if read.is_some() && read == self.state.root_id {
+            return Ok(());
+        }
+        let entries = self.state.entries();
+        let missing = entries
+            .keys()
+            .any(|rel| scan.readable(rel) && !scan.items.contains_key(rel.as_str()));
+        let present = entries
+            .keys()
+            .any(|rel| scan.items.contains_key(rel.as_str()));
+        let safe = entries.is_empty()
+            || !missing
+            || (self.state.root_id.is_none() && present)
+            || self.options.allow_deletions.is_some();
+        if !safe {
+            self.unbound = Some(match read {
+                None => format!("it has no {}", local::ROOT_ID_FILE),
+                Some(_) => format!("its {} belongs to another sync", local::ROOT_ID_FILE),
+            });
+            return Ok(());
+        }
+        let id = local::write_root_id(self.root)
+            .map_err(|error| Fatal::Transient(format!("write {}: {error}", local::ROOT_ID_FILE)))?;
+        self.state.root_id = Some(id);
+        self.save()
     }
 
     fn adopt_scan(&mut self, scan: &Scan) {
@@ -157,7 +299,19 @@ impl<'a> Cycle<'a> {
             },
             None => (self.list_tree(&mut latest)?, true),
         };
-        let retry: Vec<String> = self.state.retry.iter().cloned().collect();
+        // Parked items whose pause ended are read again like retries.
+        let now = self.now;
+        self.state
+            .parked
+            .retain(|_, parked| parked.until + PARKED_RETENTION > now);
+        let due: Vec<String> = self
+            .state
+            .parked
+            .iter()
+            .filter(|(_, parked)| parked.until <= now)
+            .map(|(id, _)| id.clone())
+            .collect();
+        let retry: Vec<String> = self.state.retry.iter().cloned().chain(due).collect();
         for id in retry {
             if latest.contains(&id) {
                 continue;
@@ -213,6 +367,21 @@ impl<'a> Cycle<'a> {
             .changes_start_token()
             .map_err(|error| transient("read the Drive changes position", error))?;
         let mut listed = HashSet::new();
+        if self.options.mirror {
+            // One flat listing instead of a request per folder: a whole My
+            // Drive in about one request per thousand items. Items outside
+            // My Drive resolve as outside when they are placed.
+            let everything = self
+                .drive
+                .list_everything()
+                .map_err(|error| transient("list My Drive", error))?;
+            for item in everything {
+                listed.insert(item.id.clone());
+                latest.put(item.id.clone(), Some(item));
+            }
+            self.forget_unlisted(&listed, latest);
+            return Ok(token);
+        }
         let mut queue = vec![self.state.folder_id.clone()];
         while let Some(parent) = queue.pop() {
             let children = self
@@ -230,6 +399,12 @@ impl<'a> Cycle<'a> {
                 latest.put(child.id.clone(), Some(child));
             }
         }
+        self.forget_unlisted(&listed, latest);
+        Ok(token)
+    }
+
+    /// A listing is complete: anything indexed but not listed is removed.
+    fn forget_unlisted(&self, listed: &HashSet<String>, latest: &mut Latest) {
         let gone: Vec<String> = self
             .state
             .entries()
@@ -240,7 +415,6 @@ impl<'a> Cycle<'a> {
         for id in gone {
             latest.put(id, None);
         }
-        Ok(token)
     }
 
     /// Puts what this cycle learned into the state after a fatal error, so
@@ -279,11 +453,19 @@ impl<'a> Session<'a> {
         })
     }
 
-    fn cycle(&mut self, drive: &GoogleDrive) -> Result<CycleReport, Fatal> {
+    fn cycle(
+        &mut self,
+        drive: &GoogleDrive,
+        stop: &dyn Fn() -> bool,
+    ) -> Result<CycleReport, Fatal> {
         let started = Instant::now();
         let options = self.options;
         let root = options.local_dir.as_path();
-        verify_folder(drive, &options.folder_id)?;
+        if options.mirror {
+            verify_my_drive(drive, &options.folder_id)?;
+        } else {
+            verify_folder(drive, &options.folder_id)?;
+        }
         crate::remote::ensure_private_dir(&options.trash_dir)
             .map_err(|error| Fatal::Transient(error.to_string()))?;
         let mut report = CycleReport::default();
@@ -311,8 +493,15 @@ impl<'a> Session<'a> {
             unindexed: HashMap::new(),
             retry: BTreeSet::new(),
             mutated: false,
+            disk_short: false,
+            unbound: None,
+            now,
+            prefetch: None,
+            planned: (0, 0),
+            stop,
             ops: 0,
             saved: Instant::now(),
+            reported: Instant::now(),
         };
         if !scan.debris.is_empty() {
             let errors = local::recover_debris(root, &scan.debris, &mut cycle.trash);
@@ -320,6 +509,9 @@ impl<'a> Session<'a> {
             scan = local::scan(root, excluded).map_err(Fatal::Transient)?;
         }
         cycle.report.scan = scan_started.elapsed();
+        if let Err(fatal) = cycle.bind_root(&scan) {
+            return Err(cycle.abort(fatal));
+        }
         cycle.adopt_scan(&scan);
         let remote_started = Instant::now();
         let (latest, token, bootstrap) = match cycle.fetch_delta() {
@@ -353,6 +545,24 @@ impl<'a> Session<'a> {
     }
 }
 
+/// Refuses a mirror whose folder is not this account's My Drive, or that
+/// lost the full Drive access a mirror needs.
+fn verify_my_drive(drive: &GoogleDrive, id: &str) -> Result<(), Fatal> {
+    let root = drive.get(MY_DRIVE).map_err(|error| match error {
+        RemoteError::NotFound(_) => Fatal::Refused(
+            "My Drive is not visible to zdrive: a mirror needs full Drive access; run `zdrive remote auth --mirror` again".to_string(),
+        ),
+        other => Fatal::Transient(format!("read My Drive: {other}")),
+    })?;
+    if root.id != id {
+        return Err(Fatal::Refused(format!(
+            "this mirror belongs to the My Drive {id}, but the signed-in account's My Drive is {}; sign in with the account the mirror was set up with",
+            root.id
+        )));
+    }
+    Ok(())
+}
+
 /// Refuses a Drive folder that is gone, in the bin or not marked for plain
 /// sync.
 fn verify_folder(drive: &GoogleDrive, id: &str) -> Result<(), Fatal> {
@@ -378,7 +588,7 @@ pub(crate) fn sync_once(
     options: &PlainOptions,
 ) -> Result<CycleReport, String> {
     let mut session = Session::open(options)?;
-    session.cycle(drive).map_err(Fatal::message)
+    session.cycle(drive, &|| false).map_err(Fatal::message)
 }
 
 /// Loops: a cycle now, then every `interval`, until `stop()` returns true;
@@ -396,17 +606,48 @@ pub(crate) fn watch(
     stop: &dyn Fn() -> bool,
     on_cycle: &mut dyn FnMut(&Result<CycleReport, String>),
 ) -> Result<(), Failure> {
+    watch_with_grace(drive, options, interval, STOP_GRACE, stop, on_cycle)
+}
+
+/// [`watch`] with how long a running cycle may go on after `stop()`
+/// first returned true.
+pub(super) fn watch_with_grace(
+    drive: &GoogleDrive,
+    options: &PlainOptions,
+    interval: Duration,
+    grace: Duration,
+    stop: &dyn Fn() -> bool,
+    on_cycle: &mut dyn FnMut(&Result<CycleReport, String>),
+) -> Result<(), Failure> {
     let mut session = Session::open(options)?;
     let mut failures = 0u32;
     let mut synced = false;
+    // A cycle that is still running when the stop request comes finishes
+    // within STOP_GRACE; the final cycle gets what is left of it.
+    let requested: std::cell::Cell<Option<Instant>> = std::cell::Cell::new(None);
+    let overdue = || {
+        if !stop() {
+            return false;
+        }
+        let since = requested.get().unwrap_or_else(|| {
+            let now = Instant::now();
+            requested.set(Some(now));
+            now
+        });
+        since.elapsed() >= grace
+    };
     loop {
-        let result = session.cycle(drive);
+        let result = session.cycle(drive, &overdue);
         if !synced && let Err(Fatal::Refused(message)) = &result {
             let message = message.clone();
             on_cycle(&Err(message.clone()));
             return Err(Failure::refused(Class::DriveFolder, message));
         }
         synced |= result.is_ok();
+        if matches!(result, Err(Fatal::Stopped)) {
+            on_cycle(&result.map_err(Fatal::message));
+            return Ok(());
+        }
         let result = result.map_err(Fatal::message);
         failures = if result.is_ok() {
             0
@@ -418,7 +659,7 @@ pub(crate) fn watch(
             break;
         }
     }
-    let result = session.cycle(drive).map_err(Fatal::message);
+    let result = session.cycle(drive, &overdue).map_err(Fatal::message);
     on_cycle(&result);
     Ok(())
 }

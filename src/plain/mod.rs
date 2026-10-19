@@ -24,16 +24,33 @@
 //!   are not UTF-8 are skipped and counted; `.DS_Store`, `._*` and zdrive's
 //!   own `.zdrive-*` names are ignored on both sides.
 //!
+//! - A cycle moves nothing to the Drive bin when it would bin more than 50
+//!   synced items that are also more than a tenth of the index, when every
+//!   one of ten or more synced items is missing, or when the local folder
+//!   lost its `.zdrive-root-id`: an emptied, replaced or unmounted folder
+//!   must not empty Drive. `allow_deletions` releases one reviewed batch.
+//! - A Drive folder is binned in one step only while everything below it is
+//!   synced and unchanged; otherwise its synced contents are binned one by
+//!   one and the folder stays.
+//!
 //! Names are compared as the exact bytes the OS reports (see [`local`]).
 //! Under the default `drive.file` scope zdrive only sees files it created
 //! itself, so files added through the Drive web UI do not sync down; with
-//! the full `drive` scope they do.
+//! the full `drive` scope they do. A mirror (`PlainOptions::mirror`) syncs
+//! all of My Drive under that scope and never renames anything on Drive:
+//! duplicate and unrepresentable Drive names get local names of their own,
+//! remembered in the index, and zdrive's own folders are left out.
 
 pub(crate) mod cli;
 #[cfg(test)]
 mod crash_tests;
 mod engine;
+#[cfg(test)]
+mod guard_tests;
 mod local;
+#[cfg(test)]
+mod mirror_tests;
+mod prefetch;
 mod pull;
 mod push;
 mod state;
@@ -70,6 +87,28 @@ pub(crate) struct PlainOptions {
     pub host: String,
     /// Files modified more recently than this are left for a later cycle.
     pub stable_age: Duration,
+    /// A mirror of all of My Drive: `folder_id` is My Drive's real id, Drive
+    /// names that cannot be local names are mapped instead of skipped, and
+    /// nothing is ever renamed on Drive to resolve a name clash.
+    pub mirror: bool,
+    /// Drive deletions this run may apply although the mass-deletion guard
+    /// holds them (`zdrive sync --allow-deletions N`); a service never sets
+    /// it.
+    pub allow_deletions: Option<u64>,
+    /// Called every few seconds while a long cycle runs.
+    pub progress: Option<fn(&Progress)>,
+}
+
+/// What a running cycle has done so far.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Progress {
+    pub downloaded: u64,
+    pub download_bytes: u64,
+    pub uploaded: u64,
+    pub upload_bytes: u64,
+    /// New files, and their bytes, this cycle set out to download.
+    pub planned: u64,
+    pub planned_bytes: u64,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -95,6 +134,16 @@ pub(crate) struct CycleReport {
     /// Local items that are not regular files or folders, and Drive items
     /// without content (Google Docs and the like).
     pub skipped_special: u64,
+    /// Indexed items missing locally whose deletion on Drive was held back
+    /// by the mass-deletion guard, and why; nothing was moved to the bin.
+    pub held_deletions: u64,
+    pub held_reason: Option<String>,
+    /// Items set aside because Drive refuses this account the step (not
+    /// the owner, no download or edit right); retried hours later.
+    pub parked: u64,
+    /// Drive folders left in place after their synced contents were binned,
+    /// because they hold items zdrive does not sync.
+    pub kept_folders: u64,
     /// Per-item problems, retried next cycle. Human-readable and may name
     /// relative paths: for the user, not for telemetry.
     pub errors: Vec<String>,

@@ -34,6 +34,7 @@ fn crash_child() {
         state_file,
         trash_dir,
         resumable,
+        mirror,
     ] = fields[..]
     else {
         panic!("malformed child spec {spec:?}");
@@ -56,6 +57,9 @@ fn crash_child() {
         trash_dir: trash_dir.into(),
         host: "child".to_string(),
         stable_age: Duration::ZERO,
+        mirror: mirror == "1",
+        allow_deletions: None,
+        progress: None,
     };
     let result = sync_once(&drive, &options);
     eprintln!("the crash child was never held and finished with {result:?}");
@@ -78,6 +82,7 @@ fn kill_at(env: &Env, replica: &Replica, resumable: bool, hold: Hold) {
         path(&replica.options.state_file),
         path(&replica.options.trash_dir),
         if resumable { "1" } else { "0" }.to_string(),
+        if replica.options.mirror { "1" } else { "0" }.to_string(),
     ]
     .join("\n");
     let mut child = Command::new(std::env::current_exe().expect("test binary"))
@@ -275,4 +280,27 @@ fn killed_while_applying_remote_changes_the_next_cycle_finishes() {
     // The cycle on b is killed while downloading the second new version.
     kill_at(&env, &b, false, hold(Op::Media, ".txt", 1, false));
     recover(&env, &b, &a.tree());
+}
+
+#[test]
+fn a_mirror_killed_between_duplicates_converges_without_renames() {
+    let env = Env::mirror();
+    env.fake
+        .insert(crate::remote::fake::ROOT_ID, "dup.txt", None, b"one");
+    env.fake
+        .insert(crate::remote::fake::ROOT_ID, "dup.txt", None, b"two");
+    let replica = env.mirror_replica("kill-mirror");
+    // Killed while the second of the two is downloading.
+    kill_at(&env, &replica, false, hold(Op::Media, "dup.txt", 1, false));
+    settle(&replica, &env.drive);
+    let local = replica.tree();
+    let mut contents: Vec<Vec<u8>> = local.values().flatten().cloned().collect();
+    contents.sort();
+    assert_eq!(
+        local.keys().cloned().collect::<Vec<_>>(),
+        ["dup (2).txt", "dup.txt"]
+    );
+    assert_eq!(contents, [b"one".to_vec(), b"two".to_vec()]);
+    assert_eq!(replica.debris(), Vec::<String>::new());
+    assert_eq!(env.fake.count(Op::Patch), 0, "nothing renamed on Drive");
 }

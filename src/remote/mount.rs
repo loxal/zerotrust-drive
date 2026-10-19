@@ -820,6 +820,7 @@ impl Worker {
             RemoteError::Network(_)
             | RemoteError::Quota(_)
             | RemoteError::Protocol(_)
+            | RemoteError::Denied(_)
             | RemoteError::Local(_) => Step::Retry(error),
             // Also raised for a colliding file id: only a remote that moved
             // past this replica blocks writes.

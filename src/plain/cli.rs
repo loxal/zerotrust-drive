@@ -6,7 +6,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use super::{CycleReport, DEFAULT_STABLE_AGE, PlainOptions};
+use super::{CycleReport, DEFAULT_STABLE_AGE, PlainOptions, Progress};
 use crate::RunOptions;
 use crate::refusal::{self, Class, Failure};
 use crate::remote::cli as remote_cli;
@@ -47,6 +47,12 @@ pub(crate) struct SyncArgs {
     )]
     pub(crate) interval: u64,
 
+    /// Move up to N items that are missing locally to the Drive bin,
+    /// although the mass-deletion guard holds them back: after checking
+    /// that they were deleted on purpose. One cycle, not with --watch
+    #[arg(long, value_name = "N", conflicts_with = "watch")]
+    pub(crate) allow_deletions: Option<u64>,
+
     #[command(flatten)]
     pub(crate) run: RunOptions,
 }
@@ -76,23 +82,30 @@ fn sync(args: &SyncArgs) -> Result<usize, Failure> {
     let paths = Paths::from_env().map_err(|error| error.to_string())?;
     let name = RemoteName::parse(&args.remote)
         .map_err(|error| Failure::refused(Class::Remote, error.to_string()))?;
-    let (drive, options, config) = open(&paths, &name, &args.dir)?;
+    let (drive, mut options, config) = open(&paths, &name, &args.dir)?;
+    options.allow_deletions = args.allow_deletions;
     remote_cli::note(&format!(
         "plain sync: {} <-> {} (Google can read these files)",
         options.local_dir.display(),
         config.folder_hint
     ));
+    let rerun = format!(
+        "zdrive sync --remote {} --dir {}",
+        name.as_str(),
+        crate::service::shell_path(&options.local_dir)
+    );
 
     if !args.watch {
         let result = super::sync_once(&drive, &options);
         record(&result);
         let report = result.map_err(Failure::from)?;
-        print_report(&report);
-        return Ok(report.errors.len());
+        print_report(&report, &rerun);
+        return Ok(report.errors.len() + usize::from(report.held_deletions > 0));
     }
 
     let mut ready = false;
     let mut last_errors = 0;
+    let mut last_held = 0;
     let service_mode = args.run.service;
     super::watch_until_signalled(
         &drive,
@@ -104,13 +117,17 @@ fn sync(args: &SyncArgs) -> Result<usize, Failure> {
                 Ok(report) => {
                     // Quiet cycles every few seconds would only grow the
                     // log; repeated failures of the same items as well.
-                    if report.changed() || report.errors.len() != last_errors {
-                        print_report(report);
+                    if report.changed()
+                        || report.errors.len() != last_errors
+                        || report.held_deletions != last_held
+                    {
+                        print_report(report, &rerun);
                     }
                     last_errors = report.errors.len();
+                    last_held = report.held_deletions;
                 }
                 Err(message) => {
-                    eprintln!("zerotrust-drive: sync cycle failed, retrying: {message}");
+                    eprintln!("zerotrust-drive: sync cycle did not finish: {message}");
                 }
             }
             if service_mode {
@@ -167,6 +184,16 @@ pub(crate) fn initial_sync(
     record(&result);
     let report = result?;
     let mut lines = vec![summary(&report)];
+    if let Some(held) = held_warning(
+        &report,
+        &format!(
+            "zdrive sync --remote {} --dir {}",
+            name.as_str(),
+            crate::service::shell_path(dir)
+        ),
+    ) {
+        lines.push(held);
+    }
     if !report.errors.is_empty() {
         lines.push(format!(
             "{} item(s) were not synced; the next sync retries them:",
@@ -230,6 +257,9 @@ pub(crate) fn options(
         trash_dir: trash_dir(paths, name),
         host: short_host_name(),
         stable_age: DEFAULT_STABLE_AGE,
+        mirror: false,
+        allow_deletions: None,
+        progress: Some(show_progress),
     }
 }
 
@@ -305,6 +335,9 @@ fn record(result: &Result<CycleReport, String>) {
         ("plain.folders_created", report.folders_created),
         ("plain.skipped_unstable", report.skipped_unstable),
         ("plain.skipped_special", report.skipped_special),
+        ("plain.held_deletions", report.held_deletions),
+        ("plain.parked", report.parked),
+        ("plain.kept_folders", report.kept_folders),
         ("plain.item_errors", report.errors.len() as u64),
     ] {
         if value > 0 {
@@ -331,6 +364,8 @@ fn record(result: &Result<CycleReport, String>) {
             ("conflicts", Field::U64(report.conflicts)),
             ("skipped_unstable", Field::U64(report.skipped_unstable)),
             ("skipped_special", Field::U64(report.skipped_special)),
+            ("held_deletions", Field::U64(report.held_deletions)),
+            ("parked", Field::U64(report.parked)),
             ("errors", Field::U64(report.errors.len() as u64)),
             ("scan_ms", Field::U64(millis(report.scan))),
             ("remote_ms", Field::U64(millis(report.remote))),
@@ -364,6 +399,11 @@ fn summary(report: &CycleReport) -> String {
         (report.folders_created, "folders created"),
         (report.skipped_unstable, "still changing, left for later"),
         (report.skipped_special, "skipped (not a regular file)"),
+        (report.parked, "set aside (Drive refuses this account)"),
+        (
+            report.kept_folders,
+            "Drive folders kept for items zdrive does not sync",
+        ),
     ] {
         if count > 0 {
             parts.push(format!("{count} {label}"));
@@ -377,8 +417,52 @@ fn summary(report: &CycleReport) -> String {
     )
 }
 
-fn print_report(report: &CycleReport) {
+/// A long cycle's progress, on stderr and to the service manager.
+fn show_progress(progress: &Progress) {
+    let mut line = if progress.planned > 0 {
+        format!(
+            "syncing: {} of {} files downloaded ({} of {})",
+            progress.downloaded,
+            progress.planned,
+            remote_cli::size(progress.download_bytes),
+            remote_cli::size(progress.planned_bytes)
+        )
+    } else {
+        format!(
+            "syncing: {} downloaded ({})",
+            progress.downloaded,
+            remote_cli::size(progress.download_bytes)
+        )
+    };
+    if progress.uploaded > 0 {
+        line.push_str(&format!(
+            ", {} uploaded ({})",
+            progress.uploaded,
+            remote_cli::size(progress.upload_bytes)
+        ));
+    }
+    eprintln!("zerotrust-drive: {line}");
+    let _ = service::notify::status(&line);
+}
+
+/// Why missing items were not binned on Drive, and the command that bins
+/// them after a review.
+fn held_warning(report: &CycleReport, rerun: &str) -> Option<String> {
+    (report.held_deletions > 0).then(|| {
+        format!(
+            "{} item(s) missing locally were NOT moved to the Drive bin: {}. Restore them, or if you deleted them on purpose, run: {rerun} --allow-deletions {}",
+            report.held_deletions,
+            report.held_reason.as_deref().unwrap_or("too many at once"),
+            report.held_deletions
+        )
+    })
+}
+
+fn print_report(report: &CycleReport, rerun: &str) {
     println!("{}", summary(report));
+    if let Some(held) = held_warning(report, rerun) {
+        eprintln!("zerotrust-drive: warning: {held}");
+    }
     for error in &report.errors {
         eprintln!("zerotrust-drive: warning: {error}");
     }
@@ -386,6 +470,11 @@ fn print_report(report: &CycleReport) {
 
 fn status_line(result: &Result<CycleReport, String>) -> String {
     match result {
+        Ok(report) if report.held_deletions > 0 => one_line(&format!(
+            "{}; {} deletion(s) held for review, see the log",
+            summary(report),
+            report.held_deletions
+        )),
         Ok(report) if report.errors.is_empty() => one_line(&summary(report)),
         Ok(report) => one_line(&format!(
             "{}; {} item(s) failed",

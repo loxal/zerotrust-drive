@@ -18,6 +18,24 @@ use crate::remote::hex;
 
 /// Ids reserved per `generateIds` request (Drive's maximum).
 const ID_BATCH: usize = 1000;
+/// Above this many missing synced items at once (that are also more than a
+/// tenth of the index), Drive deletions are held for review.
+const MASS_DELETION: u64 = 50;
+/// With at least this many synced items, losing all of them at once is
+/// held as well.
+const ALL_GONE_MIN: u64 = 10;
+/// Drive items inspected below a folder before binning it in one step.
+const SUBTREE_CHECK_LIMIT: usize = 10_000;
+
+/// What became of a local deletion on Drive.
+enum Trashed {
+    Done,
+    /// Not now: changed on Drive, refused, or not checkable; retried.
+    Refused,
+    /// A folder whose Drive copy holds items zdrive does not sync: its
+    /// synced contents are binned one by one and the folder stays.
+    Partial,
+}
 
 fn md5_hex(file: &DriveFile) -> Option<String> {
     file.md5().map(|md5| hex(&md5))
@@ -123,9 +141,19 @@ impl Cycle<'_> {
                 }
                 // A file became a folder or the other way round.
                 missing.remove(rel);
-                if !self.trash_remote(rel, &entry)? {
-                    blocked.push(rel.clone());
-                    continue;
+                match self.trash_remote(rel, &entry)? {
+                    Trashed::Done => {}
+                    Trashed::Refused => {
+                        blocked.push(rel.clone());
+                        continue;
+                    }
+                    Trashed::Partial => {
+                        self.report.errors.push(format!(
+                            "{rel}: its Drive folder holds items zdrive does not sync, so it is not replaced on Drive"
+                        ));
+                        blocked.push(rel.clone());
+                        continue;
+                    }
                 }
             }
             let (parent_rel, name) = split_rel(rel);
@@ -143,7 +171,11 @@ impl Cycle<'_> {
                 blocked.push(rel.clone());
             }
         }
+        if self.hold_deletions(&missing) {
+            return Ok(());
+        }
         let mut refused: Vec<String> = Vec::new();
+        let mut partial: Vec<String> = Vec::new();
         for rel in missing {
             if refused.iter().any(|top| within(&rel, top)) {
                 continue;
@@ -154,15 +186,60 @@ impl Cycle<'_> {
             if !matches!(local::lstat(&self.root.join(&rel)), Ok(None)) {
                 continue;
             }
-            if !self.trash_remote(&rel, &entry)? {
-                refused.push(rel);
+            match self.trash_remote(&rel, &entry)? {
+                Trashed::Done => {}
+                Trashed::Refused => refused.push(rel),
+                Trashed::Partial => partial.push(rel),
+            }
+        }
+        // Deepest first: a kept folder is forgotten once nothing synced is
+        // left below it; Drive keeps it with what zdrive does not sync.
+        for rel in partial.iter().rev() {
+            if self.state.below(rel).is_empty() {
+                self.state.remove(rel);
+                self.report.kept_folders += 1;
             }
         }
         Ok(())
     }
 
+    /// Whether to hold this cycle's Drive deletions for review: more than
+    /// [`MASS_DELETION`] items that are also more than a tenth of the
+    /// index, every one of at least [`ALL_GONE_MIN`] items, or any number
+    /// while the local folder may not be the one that was synced. An
+    /// emptied, replaced or unmounted folder must not empty Drive.
+    fn hold_deletions(&mut self, missing: &BTreeSet<String>) -> bool {
+        let count = missing.len() as u64;
+        if count == 0 {
+            return false;
+        }
+        let total = self.state.len() as u64;
+        let reason = if let Some(unbound) = &self.unbound {
+            format!("the local folder may not be the one that was synced: {unbound}")
+        } else if total >= ALL_GONE_MIN && count == total {
+            "every synced item is missing, as when the folder was emptied, replaced or is an unmounted mount point".to_string()
+        } else if count > MASS_DELETION && count * 10 > total {
+            format!("{count} of {total} synced items are missing at once")
+        } else {
+            return false;
+        };
+        if self
+            .options
+            .allow_deletions
+            .is_some_and(|allowed| count <= allowed)
+        {
+            return false;
+        }
+        self.report.held_deletions = count;
+        self.report.held_reason = Some(reason);
+        true
+    }
+
     /// Uploads new content of the indexed file at `rel`.
     fn push_content(&mut self, rel: &str, entry: &Entry, stat: &Stat) -> Result<(), Fatal> {
+        if self.parked(&entry.id) {
+            return Ok(());
+        }
         if stat.recent(self.options.stable_age) {
             self.report.skipped_unstable += 1;
             return Ok(());
@@ -195,14 +272,20 @@ impl Cycle<'_> {
                 return Ok(());
             }
             Err(error) => {
-                self.fail(&format!("read the Drive copy of {rel}"), error)?;
-                self.retry.insert(entry.id.clone());
+                self.fail_item(&format!("read the Drive copy of {rel}"), &entry.id, error)?;
                 return Ok(());
             }
         };
         if remote.trashed || md5_hex(&remote) != entry.md5 {
             // Changed on Drive too: next cycle's phase A keeps both.
             self.retry.insert(entry.id.clone());
+            return Ok(());
+        }
+        if !remote.can_edit() {
+            self.report.errors.push(format!(
+                "{rel} changed here, but this account may not change it on Drive; the edit stays on this computer"
+            ));
+            self.park(&entry.id, remote.version.as_ref());
             return Ok(());
         }
         match self.drive.update_content(&entry.id, &path) {
@@ -223,10 +306,7 @@ impl Cycle<'_> {
                     self.report.errors.push(format!("upload {rel}: {message}"));
                 }
             }
-            Err(error) => {
-                self.fail(&format!("upload {rel}"), error)?;
-                self.retry.insert(entry.id.clone());
-            }
+            Err(error) => self.fail_on(&format!("upload {rel}"), &remote, error)?,
         }
         self.tick()
     }
@@ -255,26 +335,33 @@ impl Cycle<'_> {
             }
             Err(error) => {
                 forget(missing);
-                self.fail(&format!("read the Drive copy of {old}"), error)?;
-                self.retry.insert(entry.id.clone());
+                self.fail_item(&format!("read the Drive copy of {old}"), &entry.id, error)?;
                 return Ok(true);
             }
         };
         let current = remote.parents.first().map(String::as_str);
         let add = (current != Some(parent_id)).then_some(parent_id);
         let remove = if add.is_some() { current } else { None };
-        let new_name = (remote.name != name).then_some(name);
+        // Moved without a new local name: the Drive name stays, even where
+        // a mirror keeps the item under another local name.
+        let (_, old_name) = split_rel(old);
+        let drive_name = if old_name == name {
+            entry.drive_name(name).to_string()
+        } else {
+            name.to_string()
+        };
+        let new_name = (remote.name != drive_name).then_some(drive_name.as_str());
         if (add.is_some() || new_name.is_some())
             && let Err(error) = self.drive.update_metadata(&entry.id, new_name, add, remove)
         {
             forget(missing);
-            self.fail(&format!("move {old} to {rel} on Drive"), error)?;
-            self.retry.insert(entry.id.clone());
+            self.fail_on(&format!("move {old} to {rel} on Drive"), &remote, error)?;
             return Ok(true);
         }
         self.state.rename_tree(old, rel);
         if let Some(moved) = self.state.entry_mut(rel) {
             moved.inode = stat.inode;
+            moved.remote_name = (drive_name != name).then_some(drive_name);
         }
         forget(missing);
         self.report.moved += 1;
@@ -422,44 +509,95 @@ impl Cycle<'_> {
     /// Moves the Drive copy of the item indexed at `rel`, which is gone
     /// locally, to the Drive bin. False (retried next cycle) when Drive
     /// changed it since: an edit or move there wins over the deletion.
-    fn trash_remote(&mut self, rel: &str, entry: &Entry) -> Result<bool, Fatal> {
+    fn trash_remote(&mut self, rel: &str, entry: &Entry) -> Result<Trashed, Fatal> {
+        if self.parked(&entry.id) {
+            return Ok(Trashed::Refused);
+        }
         let remote = match self.drive.get(&entry.id) {
             Ok(remote) => remote,
             Err(RemoteError::NotFound(_)) => {
                 self.state.remove_tree(rel);
-                return Ok(true);
+                return Ok(Trashed::Done);
             }
             Err(error) => {
-                self.fail(&format!("read the Drive copy of {rel}"), error)?;
-                self.retry.insert(entry.id.clone());
-                return Ok(false);
+                self.fail_item(&format!("read the Drive copy of {rel}"), &entry.id, error)?;
+                return Ok(Trashed::Refused);
             }
         };
         if remote.trashed {
             self.state.remove_tree(rel);
-            return Ok(true);
+            return Ok(Trashed::Done);
         }
         let (parent_rel, name) = split_rel(rel);
-        let same_place = remote.name == name
+        let same_place = remote.name == entry.drive_name(name)
             && remote.parents.first().map(String::as_str)
                 == self.state.dir_id(parent_rel).as_deref();
         if !same_place || (!entry.dir && md5_hex(&remote) != entry.md5) {
             self.retry.insert(entry.id.clone());
-            return Ok(false);
+            return Ok(Trashed::Refused);
+        }
+        if !remote.can_trash() {
+            self.report.errors.push(format!(
+                "{rel} was deleted here, but this account may not move it to the Drive bin; remove it in Drive"
+            ));
+            self.park(&entry.id, remote.version.as_ref());
+            return Ok(Trashed::Refused);
+        }
+        if entry.dir {
+            match self.synced_below(&entry.id, rel)? {
+                Some(true) => {}
+                Some(false) => return Ok(Trashed::Partial),
+                None => return Ok(Trashed::Refused),
+            }
         }
         match self.drive.trash(&entry.id) {
             Ok(_) | Err(RemoteError::NotFound(_)) => {
                 self.state.remove_tree(rel);
                 self.report.remote_trashed += 1;
                 self.tick()?;
-                Ok(true)
+                Ok(Trashed::Done)
             }
             Err(error) => {
-                self.fail(&format!("move {rel} to the Drive bin"), error)?;
-                self.retry.insert(entry.id.clone());
-                Ok(false)
+                self.fail_on(&format!("move {rel} to the Drive bin"), &remote, error)?;
+                Ok(Trashed::Refused)
             }
         }
+    }
+
+    /// Whether everything below the Drive folder `id`, indexed at `rel`, is
+    /// synced and unchanged, so that binning the folder bins nothing else:
+    /// no Google Docs, shortcuts, unsynced names or items added on Drive
+    /// meanwhile. `None` when it cannot be checked now.
+    fn synced_below(&mut self, id: &str, rel: &str) -> Result<Option<bool>, Fatal> {
+        let mut queue = vec![id.to_string()];
+        let mut seen = 0usize;
+        while let Some(folder) = queue.pop() {
+            let children = match self.drive.list(&folder, false) {
+                Ok(children) => children,
+                Err(error) => {
+                    self.fail_item(&format!("list the Drive folder {rel}"), id, error)?;
+                    return Ok(None);
+                }
+            };
+            for child in children {
+                seen += 1;
+                let synced = seen <= SUBTREE_CHECK_LIMIT
+                    && self.state.path_of(&child.id).is_some_and(|path| {
+                        within(path, rel)
+                            && self.state.entry(path).is_some_and(|entry| {
+                                entry.dir == child.is_folder()
+                                    && (entry.dir || md5_hex(&child) == entry.md5)
+                            })
+                    });
+                if !synced {
+                    return Ok(Some(false));
+                }
+                if child.is_folder() {
+                    queue.push(child.id);
+                }
+            }
+        }
+        Ok(Some(true))
     }
 }
 

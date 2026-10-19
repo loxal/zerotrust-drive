@@ -35,17 +35,31 @@ pub(crate) const MARKER_KEY: &str = "zdrive";
 pub(crate) const STORE_MARKER: &str = "store-v1";
 /// [`MARKER_KEY`] value of a plain-mode sync folder.
 pub(crate) const PLAIN_MARKER: &str = "plain-v1";
-const FILE_FIELDS: &str =
-    "id,name,size,md5Checksum,mimeType,parents,appProperties,trashed,modifiedTime,version";
-const LIST_FIELDS: &str = "nextPageToken,files(id,name,size,md5Checksum,mimeType,parents,appProperties,modifiedTime,version)";
+const FILE_FIELDS: &str = "id,name,size,md5Checksum,mimeType,parents,appProperties,trashed,modifiedTime,version,capabilities(canEdit,canTrash,canDownload)";
+const LIST_FIELDS: &str = "nextPageToken,files(id,name,size,md5Checksum,mimeType,parents,appProperties,modifiedTime,version,capabilities(canEdit,canTrash,canDownload))";
 /// Marked folders also report who owns them and since when, so a join or
 /// a refusal can tell them apart.
 const MARKED_FIELDS: &str = "nextPageToken,files(id,name,mimeType,parents,appProperties,modifiedTime,version,createdTime,owners(displayName,emailAddress,me))";
+/// 403 reasons that refuse one item to this account: its owner or sharing
+/// settings forbid the step, or Drive blocks downloading it. A scope that
+/// is too narrow (`insufficientPermissions`) is a configuration problem
+/// instead and stays a protocol error.
+const ITEM_DENIALS: &[&str] = &[
+    "insufficientFilePermissions",
+    "insufficientParentPermissions",
+    "appNotAuthorizedToFile",
+    "cannotDownloadFile",
+    "cannotDownloadAbusiveFile",
+    "downloadQuotaExceeded",
+    "cannotModifyViewersCanCopyContent",
+    "cannotMoveTrashedItemOutOfTrash",
+    "domainPolicy",
+];
 /// Items counted at a folder's top level before reporting "more than".
 pub(crate) const ITEM_COUNT_CAP: usize = 1000;
 /// Marked folders described in full when several refuse a join.
 const DESCRIBED_FOLDERS: usize = 10;
-const CHANGE_FIELDS: &str = "nextPageToken,newStartPageToken,changes(changeType,fileId,removed,file(id,name,size,md5Checksum,mimeType,parents,appProperties,trashed,modifiedTime,version))";
+const CHANGE_FIELDS: &str = "nextPageToken,newStartPageToken,changes(changeType,fileId,removed,file(id,name,size,md5Checksum,mimeType,parents,appProperties,trashed,modifiedTime,version,capabilities(canEdit,canTrash,canDownload)))";
 /// Longest page token accepted from the changes feed.
 const MAX_PAGE_TOKEN: usize = 1024;
 /// Files up to this size are created in one multipart request.
@@ -188,6 +202,22 @@ pub(crate) struct DriveFile {
     /// items in a shared drive.
     #[serde(default)]
     pub(crate) owners: Vec<Owner>,
+    /// What the signed-in account may do with the item; absent when not
+    /// asked, which allows everything.
+    #[serde(default)]
+    pub(crate) capabilities: Option<Capabilities>,
+}
+
+/// The subset of Drive's per-item capabilities that sync consults.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct Capabilities {
+    #[serde(default)]
+    pub(crate) can_edit: Option<bool>,
+    #[serde(default)]
+    pub(crate) can_trash: Option<bool>,
+    #[serde(default)]
+    pub(crate) can_download: Option<bool>,
 }
 
 /// An owner of a Drive item.
@@ -228,7 +258,29 @@ impl DriveFile {
             version: None,
             created_time: None,
             owners: Vec::new(),
+            capabilities: None,
         }
+    }
+
+    /// Whether the account may change the content; true when not reported.
+    pub(crate) fn can_edit(&self) -> bool {
+        self.capabilities
+            .and_then(|caps| caps.can_edit)
+            .unwrap_or(true)
+    }
+
+    /// Whether the account may move the item to the bin.
+    pub(crate) fn can_trash(&self) -> bool {
+        self.capabilities
+            .and_then(|caps| caps.can_trash)
+            .unwrap_or(true)
+    }
+
+    /// Whether the account may download the content.
+    pub(crate) fn can_download(&self) -> bool {
+        self.capabilities
+            .and_then(|caps| caps.can_download)
+            .unwrap_or(true)
     }
 
     pub(crate) fn size(&self) -> Option<u64> {
@@ -573,6 +625,7 @@ fn classify(op: &str, result: Result<Response<Body>, ureq::Error>) -> Outcome {
             Outcome::Fail(RemoteError::Quota(detail))
         }
         403 if has(&["dailyLimitExceeded"]) => Outcome::Fail(RemoteError::Quota(detail)),
+        403 if has(ITEM_DENIALS) => Outcome::Fail(RemoteError::Denied(detail)),
         404 | 410 => Outcome::Fail(RemoteError::NotFound(detail)),
         409 => Outcome::Fail(RemoteError::Conflict(detail)),
         408 => Outcome::Retry(detail, after, "timeout"),
@@ -1043,12 +1096,30 @@ impl GoogleDrive {
         )
     }
 
+    /// Every non-trashed item the account can see outside shared drives:
+    /// all of My Drive plus what others shared, about one request per
+    /// thousand items. Callers place items by their `parents`.
+    pub(crate) fn list_everything(&self) -> Result<Vec<DriveFile>, RemoteError> {
+        self.query_pages("list everything", "trashed = false", LIST_FIELDS, false)
+    }
+
     fn query_all(
         &self,
         op: &'static str,
         query: &str,
         fields: &str,
     ) -> Result<Vec<DriveFile>, RemoteError> {
+        self.query_pages(op, query, fields, true)
+    }
+
+    fn query_pages(
+        &self,
+        op: &'static str,
+        query: &str,
+        fields: &str,
+        all_drives: bool,
+    ) -> Result<Vec<DriveFile>, RemoteError> {
+        let all_drives = if all_drives { "true" } else { "false" };
         let url = self.url("/drive/v3/files");
         let mut files = Vec::new();
         let mut page_token: Option<String> = None;
@@ -1061,7 +1132,7 @@ impl GoogleDrive {
                     .query("fields", fields)
                     .query("pageSize", "1000")
                     .query("supportsAllDrives", "true")
-                    .query("includeItemsFromAllDrives", "true");
+                    .query("includeItemsFromAllDrives", all_drives);
                 if let Some(token) = page_token.as_deref() {
                     request = request.query("pageToken", token);
                 }
@@ -1674,7 +1745,15 @@ impl GoogleDrive {
             let mut reader = result.into_body().into_reader().take(size - have);
             let copied = copy_counting(&mut reader, &mut output);
             have += copied.0;
-            if let Some(error) = copied.1 {
+            if let Some(CopyFailure::Write(error)) = copied.1 {
+                // A full disk or another local failure: retrying the
+                // transfer cannot help, and it is not a network problem.
+                return Err(RemoteError::Local(format!(
+                    "write the download of {}: {error}",
+                    file.name
+                )));
+            }
+            if let Some(CopyFailure::Read(error)) = copied.1 {
                 if copied.0 == 0 {
                     failures += 1;
                     if failures >= self.policy.attempts {
@@ -2058,7 +2137,15 @@ fn multipart_body(metadata: &[u8], bytes: &[u8]) -> (Vec<u8>, String) {
     (body, format!("multipart/related; boundary={boundary}"))
 }
 
-fn copy_counting(reader: &mut dyn Read, writer: &mut File) -> (u64, Option<std::io::Error>) {
+/// Which side of a copy failed.
+enum CopyFailure {
+    /// Reading the response body: the connection.
+    Read(std::io::Error),
+    /// Writing the local file: the disk.
+    Write(std::io::Error),
+}
+
+fn copy_counting(reader: &mut dyn Read, writer: &mut File) -> (u64, Option<CopyFailure>) {
     let mut buffer = vec![0u8; 1 << 20];
     let mut total = 0u64;
     loop {
@@ -2066,12 +2153,12 @@ fn copy_counting(reader: &mut dyn Read, writer: &mut File) -> (u64, Option<std::
             Ok(0) => return (total, None),
             Ok(read) => {
                 if let Err(error) = writer.write_all(&buffer[..read]) {
-                    return (total, Some(error));
+                    return (total, Some(CopyFailure::Write(error)));
                 }
                 total += read as u64;
             }
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(error) => return (total, Some(error)),
+            Err(error) => return (total, Some(CopyFailure::Read(error))),
         }
     }
 }
@@ -2571,6 +2658,43 @@ mod tests {
         assert!(!dest.exists());
         fake.fault(Op::Media, Fault::TruncateBody(10));
         assert_eq!(drive.read_range(&id, 5, 100).unwrap(), bytes[5..105]);
+    }
+
+    #[test]
+    fn an_item_drive_refuses_is_denied_and_never_retried() {
+        let fake = FakeDrive::start();
+        let id = fake.insert(ROOT_ID, "theirs", None, b"theirs");
+        let drive = fake.client();
+        fake.set_capabilities(&id, false, false, false);
+        let file = drive.get(&id).unwrap();
+        assert!(!file.can_edit() && !file.can_trash() && !file.can_download());
+        let dir = crate::remote::TestDir::new("denied");
+        let result = drive.download_to(&file, &dir.path().join("theirs"));
+        assert!(matches!(result, Err(RemoteError::Denied(_))), "{result:?}");
+        assert!(matches!(drive.trash(&id), Err(RemoteError::Denied(_))));
+        assert_eq!((fake.count(Op::Media), fake.count(Op::Patch)), (1, 1));
+        // Items that report nothing allow everything.
+        let mine = drive
+            .get(&fake.insert(ROOT_ID, "mine", None, b"mine"))
+            .unwrap();
+        let bare = DriveFile {
+            capabilities: None,
+            ..mine
+        };
+        assert!(bare.can_edit() && bare.can_trash() && bare.can_download());
+    }
+
+    /// `/dev/full` answers every write with ENOSPC.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_full_disk_fails_a_download_locally_at_once() {
+        let fake = FakeDrive::start();
+        let id = fake.insert(ROOT_ID, "pack", None, &pattern(4096));
+        let drive = fake.client();
+        let file = drive.get(&id).unwrap();
+        let result = drive.download_to(&file, Path::new("/dev/full"));
+        assert!(matches!(result, Err(RemoteError::Local(_))), "{result:?}");
+        assert_eq!(fake.count(Op::Media), 1, "a full disk is not retried");
     }
 
     #[test]

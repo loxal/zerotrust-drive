@@ -16,19 +16,23 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::engine::{Cycle, Fatal};
 use super::local::{self, ASIDE_PREFIX, Kind, Stat, TEMP_PREFIX, join_rel, split_rel};
+use super::prefetch::{Prefetch, Staged};
 use super::state::Entry;
-use crate::remote::gdrive::DriveFile;
+use crate::remote::format::MARKER_NAME;
+use crate::remote::gdrive::{DriveFile, MARKER_KEY, PLAIN_MARKER, STORE_MARKER};
 use crate::remote::{hex, md5_file};
 
 /// Deepest folder chain followed upwards on Drive.
 const MAX_DEPTH: usize = 256;
+/// Free space a download leaves on the local file system.
+const DOWNLOAD_RESERVE: u64 = 1 << 30;
 /// Google Docs, Sheets, shortcuts and the like: no content to download.
 const NATIVE_PREFIX: &str = "application/vnd.google-apps.";
 
 static SERIAL: AtomicU64 = AtomicU64::new(0);
 
 /// A unique name for zdrive's own working files in this process.
-fn serial() -> String {
+pub(super) fn serial() -> String {
     format!(
         "{}.{}",
         std::process::id(),
@@ -109,6 +113,32 @@ impl Cycle<'_> {
         let mut gone: Vec<String> = Vec::new();
         let mut upserts = Vec::new();
         for (id, file) in &overlay {
+            // A parked item is released once Drive reports a new version.
+            if let (Some(parked), Some(file)) = (self.state.parked.get_mut(id), file) {
+                match &parked.version {
+                    None => parked.version = file.version.clone(),
+                    Some(version) if Some(version) != file.version.as_ref() => {
+                        self.state.parked.remove(id);
+                    }
+                    Some(_) => {}
+                }
+            }
+        }
+        if self.options.mirror {
+            // A folder holding a zerotrust-drive store is left out, even
+            // where its marker is invisible to this OAuth client.
+            for file in overlay.values().flatten() {
+                if file.name == MARKER_NAME
+                    && !file.is_folder()
+                    && let Some(parent) = file.parents.first()
+                    && self.state.excluded.insert(parent.clone())
+                    && let Some(rel) = self.state.path_of(parent)
+                {
+                    gone.push(rel.to_string());
+                }
+            }
+        }
+        for (id, file) in &overlay {
             let known = self.state.path_of(id).map(str::to_string);
             let Some(file) = file else {
                 gone.extend(known);
@@ -148,7 +178,35 @@ impl Cycle<'_> {
         for rel in gone {
             self.remove_gone(&rel, &keep, &mut gone_dirs)?;
         }
-        self.settle(upserts, &overlay, bootstrap)?;
+        // New files to download, in the order settle installs them.
+        let mut fresh: Vec<&Upsert> = upserts
+            .iter()
+            .filter(|up| {
+                !up.known
+                    && !up.file.is_folder()
+                    && up.file.can_download()
+                    && !self.parked(&up.file.id)
+            })
+            .collect();
+        fresh.sort_by(|a, b| a.key().cmp(&b.key()));
+        self.planned = (
+            fresh.len() as u64,
+            fresh.iter().map(|up| up.file.size().unwrap_or(0)).sum(),
+        );
+        if self.options.mirror && fresh.len() > 1 {
+            let queue: Vec<DriveFile> = fresh.iter().map(|up| up.file.clone()).collect();
+            let (drive, root) = (self.drive, self.root);
+            std::thread::scope(|scope| {
+                self.prefetch = Some(Prefetch::start(scope, drive, root, queue));
+                let settled = self.settle(upserts, &overlay, bootstrap);
+                if let Some(prefetch) = self.prefetch.take() {
+                    prefetch.finish();
+                }
+                settled
+            })?;
+        } else {
+            self.settle(upserts, &overlay, bootstrap)?;
+        }
         gone_dirs.sort_by(|a, b| depth(b).cmp(&depth(a)).then_with(|| b.cmp(a)));
         for rel in gone_dirs {
             self.remove_gone_dir(&rel);
@@ -165,30 +223,38 @@ impl Cycle<'_> {
         overlay: &HashMap<String, Option<DriveFile>>,
         settled: Option<&HashSet<String>>,
     ) -> Place {
-        let mut names: Vec<&str> = Vec::new();
+        let mut names: Vec<String> = Vec::new();
         let mut current = file;
         for _ in 0..MAX_DEPTH {
             if current.trashed {
                 return Place::Outside;
             }
-            if local::ignored(&current.name) {
+            if local::ignored(&current.name) || self.excluded(current) {
                 return Place::Ignored;
             }
-            if !local::valid_name(&current.name) {
+            let Some(name) = self.local_segment(current) else {
                 return Place::Invalid {
                     own: names.is_empty(),
                 };
-            }
-            names.push(&current.name);
+            };
+            names.push(name);
             let Some(parent) = current.parents.first() else {
                 return Place::Outside;
             };
             let from_index = |dir: String| {
-                let below = names.iter().rev().copied().collect::<Vec<_>>().join("/");
+                let below = names
+                    .iter()
+                    .rev()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .join("/");
                 Place::Inside(join_rel(&dir, &below))
             };
             if *parent == self.state.folder_id {
                 return from_index(String::new());
+            }
+            if self.state.excluded.contains(parent) {
+                return Place::Ignored;
             }
             if settled.is_some_and(|done| done.contains(parent))
                 && let Some(dir) = self.state.dir_path(parent)
@@ -207,6 +273,42 @@ impl Cycle<'_> {
             }
         }
         Place::Outside
+    }
+
+    /// Mirror only: a folder holding a zerotrust-drive store or plain sync,
+    /// by its marker or by a `zdrive-remote.json` inside it.
+    fn excluded(&self, file: &DriveFile) -> bool {
+        self.options.mirror
+            && file.is_folder()
+            && (matches!(
+                file.app_properties.get(MARKER_KEY).map(String::as_str),
+                Some(STORE_MARKER | PLAIN_MARKER)
+            ) || self.state.excluded.contains(&file.id))
+    }
+
+    /// The local name of `file`, `None` when it cannot have one. An indexed
+    /// item keeps its local name while its Drive name is unchanged; a
+    /// mirror maps any other Drive name that cannot be a local name.
+    fn local_segment(&self, file: &DriveFile) -> Option<String> {
+        if !self.options.mirror {
+            return local::valid_name(&file.name).then(|| file.name.clone());
+        }
+        if let Some(rel) = self.state.path_of(&file.id)
+            && let Some(entry) = self.state.entry(rel)
+        {
+            let (_, name) = split_rel(rel);
+            if entry.drive_name(name) == file.name {
+                return Some(name.to_string());
+            }
+        }
+        local::mirror_name(&file.name)
+    }
+
+    /// The Drive name an index entry at `rel` records for `file`: only a
+    /// mirror keeps an item under another local name.
+    fn remote_name_for(&self, rel: &str, file: &DriveFile) -> Option<String> {
+        let (_, name) = split_rel(rel);
+        (self.options.mirror && name != file.name).then(|| file.name.clone())
     }
 
     /// The indexed item at `rel` left the synced folder on Drive. A folder
@@ -527,8 +629,13 @@ impl Cycle<'_> {
                     Moved::Occupied if !force => return Ok(Step::Defer),
                     Moved::Occupied => {
                         let (parent_rel, name) = split_rel(rel);
-                        let Some(target) = self.free_conflict_name(parent_rel, name, entry.dir)
-                        else {
+                        let mirror = self.options.mirror;
+                        let target = if mirror {
+                            self.free_duplicate_name(parent_rel, name, entry.dir)
+                        } else {
+                            self.free_conflict_name(parent_rel, name, entry.dir)
+                        };
+                        let Some(target) = target else {
                             self.report
                                 .errors
                                 .push(format!("no free conflict name next to {rel}"));
@@ -536,17 +643,21 @@ impl Cycle<'_> {
                             return Ok(Step::Done);
                         };
                         let (_, new_name) = split_rel(&target);
-                        if let Err(error) =
-                            self.drive
-                                .update_metadata(&file.id, Some(new_name), None, None)
+                        // A mirror never renames on Drive; the local name
+                        // alone keeps the two apart.
+                        if !mirror
+                            && let Err(error) =
+                                self.drive
+                                    .update_metadata(&file.id, Some(new_name), None, None)
                         {
-                            self.fail(&format!("rename {rel} on Drive"), error)?;
-                            self.retry.insert(file.id.clone());
+                            self.fail_item(&format!("rename {rel} on Drive"), &file.id, error)?;
                             return Ok(Step::Done);
                         }
                         match self.move_local(old, &target) {
                             Moved::Done => {
-                                self.report.conflicts += 1;
+                                if !mirror {
+                                    self.report.conflicts += 1;
+                                }
                                 at = target;
                             }
                             _ => {
@@ -563,9 +674,11 @@ impl Cycle<'_> {
             }
         }
         if !content_changed {
+            let remote_name = self.remote_name_for(&at, file);
             if let Some(entry) = self.state.entry_mut(&at) {
                 entry.version = file.version.clone();
                 entry.modified = file.modified_time.clone();
+                entry.remote_name = remote_name;
             }
             return Ok(Step::Done);
         }
@@ -618,6 +731,8 @@ impl Cycle<'_> {
                     entry.set_stat(&stat);
                     self.state.insert(at, entry.clone());
                     self.download(file, at, Target::Replace(entry))
+                } else if self.options.mirror {
+                    self.keep_local_edit(file, at)
                 } else {
                     self.remote_conflict(file, at, false)
                 }
@@ -654,6 +769,7 @@ impl Cycle<'_> {
                 size: file.size().unwrap_or(0),
                 version: file.version.clone(),
                 modified: file.modified_time.clone(),
+                remote_name: self.remote_name_for(rel, file),
                 ..Entry::default()
             };
             if entry.dir
@@ -696,6 +812,9 @@ impl Cycle<'_> {
                     Ok(Some(local)) if Some(&local) == md5_hex(file).as_ref() => {
                         self.link_file(rel, file, &stat);
                     }
+                    // In a mirror the remote item goes apart and the local
+                    // file stays: it may be another Drive item of the same
+                    // name, downloaded before an interruption.
                     Ok(Some(_)) => self.remote_conflict(file, rel, bootstrap)?,
                     Ok(None) => {
                         self.report.skipped_unstable += 1;
@@ -723,6 +842,9 @@ impl Cycle<'_> {
         rel: &str,
         bootstrap: bool,
     ) -> Result<(), Fatal> {
+        if self.options.mirror {
+            return self.place_apart(file, rel, bootstrap);
+        }
         let folder = file.is_folder();
         let (parent_rel, name) = split_rel(rel);
         let Some(target) = self.free_conflict_name(parent_rel, name, folder) else {
@@ -739,8 +861,7 @@ impl Cycle<'_> {
         {
             Ok(renamed) => renamed,
             Err(error) => {
-                self.fail(&format!("rename the Drive copy of {rel}"), error)?;
-                self.retry.insert(file.id.clone());
+                self.fail_item(&format!("rename the Drive copy of {rel}"), &file.id, error)?;
                 return Ok(());
             }
         };
@@ -773,38 +894,151 @@ impl Cycle<'_> {
         Ok(())
     }
 
+    /// Mirror only: the remote item keeps its Drive name and takes the
+    /// first free local `name (n)` next to `rel`, which another item holds.
+    fn place_apart(&mut self, file: &DriveFile, rel: &str, bootstrap: bool) -> Result<(), Fatal> {
+        let folder = file.is_folder();
+        let (parent_rel, name) = split_rel(rel);
+        let Some(target) = self.free_duplicate_name(parent_rel, name, folder) else {
+            self.report
+                .errors
+                .push(format!("no free local name next to {rel}"));
+            self.retry.insert(file.id.clone());
+            return Ok(());
+        };
+        if let Some(old) = self.state.path_of(&file.id).map(str::to_string) {
+            self.state.remove(&old);
+        }
+        if !folder {
+            return self.download(file, &target, Target::Absent);
+        }
+        match self.ensure_dir(&target) {
+            Ok(stat) => {
+                self.report.folders_created += 1;
+                self.index_dir(&target, file, &stat, bootstrap);
+            }
+            Err(error) => {
+                self.report
+                    .errors
+                    .push(format!("cannot create the folder {target}: {error}"));
+                self.retry.insert(file.id.clone());
+            }
+        }
+        Ok(())
+    }
+
+    /// Mirror only: a local edit at `at` that clashes with a new Drive
+    /// version moves aside under a conflict name, from where it is uploaded
+    /// as a new file; the Drive file keeps its name and arrives at `at`.
+    fn keep_local_edit(&mut self, file: &DriveFile, at: &str) -> Result<(), Fatal> {
+        let (parent_rel, name) = split_rel(at);
+        let Some(kept) = self.free_conflict_name(parent_rel, name, false) else {
+            self.report
+                .errors
+                .push(format!("no free conflict name next to {at}"));
+            self.retry.insert(file.id.clone());
+            return Ok(());
+        };
+        if let Err(error) = local::rename_noreplace(&self.root.join(at), &self.root.join(&kept)) {
+            self.report.errors.push(format!(
+                "cannot keep the local edit of {at} as {kept}: {error}"
+            ));
+            self.retry.insert(file.id.clone());
+            return Ok(());
+        }
+        self.sync_parent(at);
+        self.mutated = true;
+        self.present.remove(at);
+        self.present.insert(kept);
+        self.report.conflicts += 1;
+        self.download(file, at, Target::Absent)
+    }
+
     /// Downloads `file` next to `rel`, verifies it and moves it into place.
     fn download(&mut self, file: &DriveFile, rel: &str, target: Target) -> Result<(), Fatal> {
+        if self.parked(&file.id) {
+            return Ok(());
+        }
+        if !file.can_download() {
+            self.report.errors.push(format!(
+                "{rel} is not downloaded: its owner does not allow this account to download it"
+            ));
+            self.park(&file.id, file.version.as_ref());
+            return Ok(());
+        }
+        let staged = match self.prefetch.as_mut() {
+            Some(prefetch) => {
+                prefetch.top_up(self.root);
+                prefetch.take(file)
+            }
+            None => None,
+        };
+        let size = file.size().unwrap_or(0);
+        if staged.is_none() && self.disk_short {
+            self.retry.insert(file.id.clone());
+            return Ok(());
+        }
+        // A staged download already holds its space.
+        if staged.is_none()
+            && let Ok(free) = local::free_bytes(self.root)
+            && free < size.saturating_add(DOWNLOAD_RESERVE)
+        {
+            self.disk_short = true;
+            self.report.errors.push(format!(
+                "not enough free space to download {rel} ({size} bytes, {free} free, {DOWNLOAD_RESERVE} kept free); downloads resume once space is freed"
+            ));
+            self.retry.insert(file.id.clone());
+            return Ok(());
+        }
         let (parent_rel, _) = split_rel(rel);
         if let Err(error) = self.ensure_dir(parent_rel) {
+            if let Some(staged) = staged {
+                self.remove_temp(&staged.temp);
+            }
             self.report
                 .errors
                 .push(format!("cannot create the folder of {rel}: {error}"));
             self.retry.insert(file.id.clone());
             return Ok(());
         }
-        let temp = self
-            .root
-            .join(join_rel(parent_rel, &format!("{TEMP_PREFIX}{}", serial())));
-        let created = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o666)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&temp);
-        if let Err(error) = created {
-            self.report
-                .errors
-                .push(format!("cannot create a download file for {rel}: {error}"));
-            self.retry.insert(file.id.clone());
-            return Ok(());
-        }
-        if let Err(error) = self.drive.download_to(file, &temp) {
-            self.remove_temp(&temp);
-            self.fail(&format!("download {rel}"), error)?;
-            self.retry.insert(file.id.clone());
-            return Ok(());
-        }
+        let temp = match staged {
+            Some(Staged {
+                temp,
+                result: Ok(()),
+            }) => temp,
+            Some(Staged {
+                temp,
+                result: Err(error),
+            }) => {
+                self.remove_temp(&temp);
+                self.fail_on(&format!("download {rel}"), file, error)?;
+                return Ok(());
+            }
+            None => {
+                let temp = self
+                    .root
+                    .join(join_rel(parent_rel, &format!("{TEMP_PREFIX}{}", serial())));
+                let created = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o666)
+                    .custom_flags(libc::O_NOFOLLOW)
+                    .open(&temp);
+                if let Err(error) = created {
+                    self.report
+                        .errors
+                        .push(format!("cannot create a download file for {rel}: {error}"));
+                    self.retry.insert(file.id.clone());
+                    return Ok(());
+                }
+                if let Err(error) = self.drive.download_to(file, &temp) {
+                    self.remove_temp(&temp);
+                    self.fail_on(&format!("download {rel}"), file, error)?;
+                    return Ok(());
+                }
+                temp
+            }
+        };
         let placed = match target {
             Target::Absent => self.put_absent(&temp, rel),
             Target::Replace(entry) => self.put_replace(&temp, rel, &entry),
@@ -833,15 +1067,15 @@ impl Cycle<'_> {
         self.present.insert(placed.clone());
         if placed != rel {
             // Its name was taken meanwhile: Drive gets the conflict name
-            // too, so both replicas agree.
+            // too, so both replicas agree. A mirror keeps the Drive name.
             self.report.conflicts += 1;
             let (_, new_name) = split_rel(&placed);
-            if let Err(error) = self
-                .drive
-                .update_metadata(&file.id, Some(new_name), None, None)
+            if !self.options.mirror
+                && let Err(error) = self
+                    .drive
+                    .update_metadata(&file.id, Some(new_name), None, None)
             {
-                self.fail(&format!("rename the Drive copy of {rel}"), error)?;
-                self.retry.insert(file.id.clone());
+                self.fail_item(&format!("rename the Drive copy of {rel}"), &file.id, error)?;
             }
         }
         Ok(())
@@ -1069,6 +1303,18 @@ impl Cycle<'_> {
         })
     }
 
+    /// The first `name (n)` next to `rel` that nothing uses, for a mirror's
+    /// duplicate Drive names.
+    fn free_duplicate_name(&self, parent_rel: &str, name: &str, dir: bool) -> Option<String> {
+        (2..=1000).find_map(|n| {
+            let candidate = join_rel(parent_rel, &local::duplicate_name(name, dir, n));
+            let free = self.state.entry(&candidate).is_none()
+                && !self.present.contains(&candidate)
+                && matches!(local::lstat(&self.root.join(&candidate)), Ok(None));
+            free.then_some(candidate)
+        })
+    }
+
     /// Creates the folder `rel` and any missing parents, refusing to pass
     /// through anything but real folders (a symlink in particular).
     pub(super) fn ensure_dir(&mut self, rel: &str) -> io::Result<Stat> {
@@ -1102,6 +1348,7 @@ impl Cycle<'_> {
     }
 
     fn index_dir(&mut self, rel: &str, file: &DriveFile, stat: &Stat, bootstrap: bool) {
+        let remote_name = self.remote_name_for(rel, file);
         self.state.insert(
             rel,
             Entry {
@@ -1110,6 +1357,7 @@ impl Cycle<'_> {
                 inode: stat.inode,
                 version: file.version.clone(),
                 modified: file.modified_time.clone(),
+                remote_name,
                 ..Entry::default()
             },
         );
@@ -1129,6 +1377,7 @@ impl Cycle<'_> {
             md5: md5_hex(file),
             version: file.version.clone(),
             modified: file.modified_time.clone(),
+            remote_name: self.remote_name_for(rel, file),
             ..Entry::default()
         };
         if let Some(stat) = stat.filter(|stat| stat.kind == Kind::File) {

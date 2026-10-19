@@ -44,6 +44,9 @@ pub(crate) enum RemoteError {
     Network(String),
     /// The provider answered outside the expected protocol.
     Protocol(String),
+    /// The account may not do this to the item (HTTP 403 for a reason
+    /// other than throttling or quota): retrying soon cannot succeed.
+    Denied(String),
     /// A local filesystem or store failure.
     Local(String),
 }
@@ -59,6 +62,7 @@ impl fmt::Display for RemoteError {
             Self::Diverged(message) => write!(formatter, "replicas diverged: {message}"),
             Self::Network(message) => write!(formatter, "remote unavailable: {message}"),
             Self::Protocol(message) => write!(formatter, "remote protocol error: {message}"),
+            Self::Denied(message) => write!(formatter, "remote access denied: {message}"),
             Self::Local(message) => write!(formatter, "local store error: {message}"),
         }
     }

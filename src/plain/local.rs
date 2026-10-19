@@ -28,6 +28,11 @@ pub(crate) const ASIDE_PREFIX: &str = ".zdrive-old-";
 pub(crate) const FALLBACK_TRASH: &str = ".zdrive-trash";
 pub(crate) const TRASH_RETENTION: Duration = Duration::from_secs(30 * 24 * 3600);
 pub(crate) const NAME_MAX: usize = 255;
+/// The file in the local folder that binds it to its index; ignored by
+/// sync through [`OWN_PREFIX`].
+pub(crate) const ROOT_ID_FILE: &str = ".zdrive-root-id";
+/// Longest `.zdrive-root-id` content read back.
+const MAX_ROOT_ID: u64 = 128;
 
 /// Names neither side syncs: Finder metadata, AppleDouble files and
 /// zdrive's own working files.
@@ -43,6 +48,96 @@ pub(crate) fn valid_name(name: &str) -> bool {
         && !name.contains('/')
         && !name.contains('\0')
         && name.len() <= NAME_MAX
+}
+
+/// The local name a mirror gives a Drive name that cannot be one as it
+/// is: `/` becomes U+FF0F `／` (as rclone maps it), `.` and `..` become
+/// `．` and `．．` (U+FF0E), a NUL is dropped, and a name longer than a
+/// file name may be is shortened, keeping its extension, with a hash of the
+/// whole name so that two long names stay apart. `None` when nothing is
+/// left.
+pub(crate) fn mirror_name(name: &str) -> Option<String> {
+    if valid_name(name) {
+        return Some(name.to_string());
+    }
+    let mapped = match name {
+        "." => "\u{FF0E}".to_string(),
+        ".." => "\u{FF0E}\u{FF0E}".to_string(),
+        _ => name.replace('/', "\u{FF0F}").replace('\0', ""),
+    };
+    if mapped.is_empty() {
+        return None;
+    }
+    if mapped.len() <= NAME_MAX {
+        return Some(mapped);
+    }
+    let hash = crate::remote::hex(&crate::remote::md5_bytes(name.as_bytes()));
+    let tag = format!("~{}", &hash[..8]);
+    let (stem, ext) = split_ext(&mapped, false);
+    let stem = truncate_to(stem, NAME_MAX - tag.len() - ext.len());
+    Some(format!("{stem}{tag}{ext}"))
+}
+
+/// `name (n).ext`: the local name of the n-th Drive item sharing a name in
+/// one folder, as a mirror keeps duplicates apart.
+pub(crate) fn duplicate_name(name: &str, dir: bool, n: u32) -> String {
+    tagged_name(name, dir, &n.to_string())
+}
+
+/// Bytes an unprivileged process may still write on `path`'s file system.
+pub(crate) fn free_bytes(path: &Path) -> io::Result<u64> {
+    let path = cstring(path)?;
+    // SAFETY: an all-zero statvfs is a valid value to be overwritten.
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `path` is NUL-terminated and `stat` a valid out pointer.
+    if unsafe { libc::statvfs(path.as_ptr(), &mut stat) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    #[allow(clippy::useless_conversion)]
+    Ok(u64::from(stat.f_bavail).saturating_mul(u64::from(stat.f_frsize)))
+}
+
+/// The id in `root`'s [`ROOT_ID_FILE`]; `None` when there is none.
+pub(crate) fn read_root_id(root: &Path) -> io::Result<Option<String>> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(root.join(ROOT_ID_FILE));
+    let file = match file {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if !file.metadata()?.is_file() {
+        return Ok(None);
+    }
+    let mut text = String::new();
+    file.take(MAX_ROOT_ID).read_to_string(&mut text)?;
+    Ok(Some(text.trim().to_string()))
+}
+
+/// Writes a fresh random id to `root`'s [`ROOT_ID_FILE`], durably, and
+/// returns it. Never follows a symbolic link in its place.
+pub(crate) fn write_root_id(root: &Path) -> io::Result<String> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut random = [0u8; 16];
+    crate::crypto::fill_random(&mut random);
+    let id = crate::remote::hex(&random);
+    let path = root.join(ROOT_ID_FILE);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o644)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path)?;
+    file.write_all(format!("{id}\n").as_bytes())?;
+    file.sync_all()?;
+    fsync_dir(root)?;
+    Ok(id)
 }
 
 /// The parent of a relative path ("" at the top) and its last component.

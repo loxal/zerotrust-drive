@@ -24,6 +24,9 @@ pub(crate) const ROOT_ID: &str = "root";
 /// never the alias.
 pub(crate) const ROOT_REAL_ID: &str = "0AFakeMyDriveRootFolder";
 
+/// Mime type prefix of folders and of Google's own document types.
+const GOOGLE_APPS_PREFIX: &str = "application/vnd.google-apps.";
+
 /// The real id behind Drive's `root` alias; any other id is itself.
 fn resolve(id: &str) -> &str {
     if id == ROOT_ID { ROOT_REAL_ID } else { id }
@@ -111,6 +114,11 @@ pub(crate) struct FakeFile {
     pub(crate) modified: u64,
     /// Change sequence number of the creation, rendered as `createdTime`.
     pub(crate) created: u64,
+    /// Reported as `capabilities` and enforced: a refused step answers 403
+    /// as Drive does.
+    pub(crate) can_edit: bool,
+    pub(crate) can_trash: bool,
+    pub(crate) can_download: bool,
 }
 
 struct Session {
@@ -288,10 +296,17 @@ impl State {
                 "permissionId": "04918276354104731905",
             }],
         });
+        value["capabilities"] = json!({
+            "canEdit": file.can_edit,
+            "canTrash": file.can_trash,
+            "canDownload": file.can_download,
+        });
         if !file.app_properties.is_empty() {
             value["appProperties"] = json!(file.app_properties);
         }
-        if file.mime != FOLDER_MIME {
+        // Google Docs, Sheets, shortcuts and the like have no content, so
+        // Drive reports neither size nor md5 for them.
+        if !file.mime.starts_with(GOOGLE_APPS_PREFIX) {
             value["size"] = json!(file.content.len().to_string());
             value["md5Checksum"] = json!(hex(&md5_bytes(&file.content)));
         }
@@ -461,6 +476,9 @@ impl State {
             version: 1,
             modified: seq,
             created: seq,
+            can_edit: true,
+            can_trash: true,
+            can_download: true,
         };
         let mut body = self.file_json(&file);
         if self.omit_checksums
@@ -542,6 +560,9 @@ impl FakeDrive {
                 version: 1,
                 modified: 0,
                 created: 0,
+                can_edit: true,
+                can_trash: false,
+                can_download: false,
             },
         );
         state.next_change = 1;
@@ -716,6 +737,27 @@ impl FakeDrive {
         let reply = state.create(&metadata, content.to_vec());
         assert_eq!(reply.status, 200, "fake insert failed");
         id
+    }
+
+    /// What the signed-in account may do with item `id`, as its owner or
+    /// sharing settings decide.
+    pub(crate) fn set_capabilities(&self, id: &str, edit: bool, trash: bool, download: bool) {
+        let mut state = self.lock();
+        let file = state.files.get_mut(id).expect("file exists");
+        (file.can_edit, file.can_trash, file.can_download) = (edit, trash, download);
+    }
+
+    /// Takes item `id` out of every folder, as an item someone shared with
+    /// the user that is not in their My Drive.
+    pub(crate) fn detach(&self, id: &str) {
+        let mut state = self.lock();
+        state
+            .files
+            .get_mut(id)
+            .expect("file exists")
+            .parents
+            .clear();
+        state.log_change(id);
     }
 
     /// Replaces stored bytes in place, as storage corruption would.
@@ -1422,26 +1464,38 @@ fn handle(
                     .collect();
                 return Reply::json(200, &json!({ "files": matches }));
             }
-            let Some((parent, rest)) = query
-                .strip_prefix('\'')
-                .and_then(|rest| rest.split_once("' in parents and trashed = false"))
-            else {
-                return Reply::error(400, "invalidQuery", "unsupported query");
+            let matches: Vec<Value> = if query == "trashed = false" {
+                // Everything visible, as a full-scope flat listing; My Drive
+                // itself is not an item of it.
+                state
+                    .files
+                    .values()
+                    .filter(|file| file.id != ROOT_REAL_ID)
+                    .filter(|file| !state.effectively_trashed(file))
+                    .map(|file| state.file_json(file))
+                    .collect()
+            } else {
+                let Some((parent, rest)) = query
+                    .strip_prefix('\'')
+                    .and_then(|rest| rest.split_once("' in parents and trashed = false"))
+                else {
+                    return Reply::error(400, "invalidQuery", "unsupported query");
+                };
+                let parent = resolve(parent);
+                let folders_only = match rest {
+                    "" => false,
+                    filter if filter == format!(" and mimeType = '{FOLDER_MIME}'") => true,
+                    _ => return Reply::error(400, "invalidQuery", "unsupported query"),
+                };
+                state
+                    .files
+                    .values()
+                    .filter(|file| file.parents.iter().any(|candidate| candidate == parent))
+                    .filter(|file| !folders_only || file.mime == FOLDER_MIME)
+                    .filter(|file| !state.effectively_trashed(file))
+                    .map(|file| state.file_json(file))
+                    .collect()
             };
-            let parent = resolve(parent);
-            let folders_only = match rest {
-                "" => false,
-                filter if filter == format!(" and mimeType = '{FOLDER_MIME}'") => true,
-                _ => return Reply::error(400, "invalidQuery", "unsupported query"),
-            };
-            let matches: Vec<Value> = state
-                .files
-                .values()
-                .filter(|file| file.parents.iter().any(|candidate| candidate == parent))
-                .filter(|file| !folders_only || file.mime == FOLDER_MIME)
-                .filter(|file| !state.effectively_trashed(file))
-                .map(|file| state.file_json(file))
-                .collect();
             let requested: usize = request
                 .query
                 .get("pageSize")
@@ -1469,6 +1523,11 @@ fn handle(
             };
             match op {
                 Op::Get => Reply::json(200, &state.file_json(&file)),
+                Op::Media if !file.can_download => Reply::error(
+                    403,
+                    "cannotDownloadFile",
+                    "The user does not have permission to download this file.",
+                ),
                 Op::Media => match request.headers.get("range") {
                     None => Reply {
                         status: 200,
@@ -1491,6 +1550,14 @@ fn handle(
                     let Ok(patch) = serde_json::from_slice::<Value>(&request.body) else {
                         return Reply::error(400, "parseError", "bad json");
                     };
+                    let trashing = patch.get("trashed").and_then(Value::as_bool) == Some(true);
+                    if (trashing && !file.can_trash) || (!trashing && !file.can_edit) {
+                        return Reply::error(
+                            403,
+                            "insufficientFilePermissions",
+                            "The user does not have sufficient permissions for this file.",
+                        );
+                    }
                     state.patch_metadata(
                         &file.id,
                         &patch,
@@ -1536,6 +1603,13 @@ fn handle(
             let Some(id) = target.filter(|id| state.files.contains_key(*id)) else {
                 return Reply::error(404, "notFound", "File not found.");
             };
+            if !state.files[id].can_edit {
+                return Reply::error(
+                    403,
+                    "insufficientFilePermissions",
+                    "The user does not have sufficient permissions for this file.",
+                );
+            }
             let Some(size) = request
                 .headers
                 .get("x-upload-content-length")
@@ -1552,6 +1626,13 @@ fn handle(
             let Some(id) = target else {
                 return Reply::error(404, "notFound", "File not found.");
             };
+            if state.files.get(id).is_some_and(|file| !file.can_edit) {
+                return Reply::error(
+                    403,
+                    "insufficientFilePermissions",
+                    "The user does not have sufficient permissions for this file.",
+                );
+            }
             match multipart(request) {
                 Some((metadata, content)) => state.replace_content(id, &metadata, content),
                 None => Reply::error(400, "badContent", "malformed multipart body"),

@@ -12,7 +12,7 @@ use super::local;
 use super::state;
 use super::*;
 use crate::remote::TestDir;
-use crate::remote::fake::{FakeDrive, Fault, Hold, Op, ROOT_ID};
+use crate::remote::fake::{FakeDrive, Fault, Hold, Op, ROOT_ID, ROOT_REAL_ID};
 use crate::remote::gdrive::FOLDER_MIME;
 
 /// Relative path => content, `None` for a folder.
@@ -36,6 +36,9 @@ impl Replica {
             trash_dir: base.join("data").join("trash"),
             host: "testhost.example".to_string(),
             stable_age: Duration::ZERO,
+            mirror: false,
+            allow_deletions: None,
+            progress: None,
         };
         Self { _dir: dir, options }
     }
@@ -98,7 +101,8 @@ impl Replica {
     pub(super) fn debris(&self) -> Vec<String> {
         let mut found = Vec::new();
         walk(self.root(), "", &mut |rel, name, _| {
-            if name.starts_with(local::OWN_PREFIX) {
+            // The root id binds the folder to its index; it is not debris.
+            if name.starts_with(local::OWN_PREFIX) && rel != local::ROOT_ID_FILE {
                 found.push(rel.to_string());
             }
         });
@@ -268,8 +272,26 @@ impl Env {
         }
     }
 
+    /// A fake Drive whose whole My Drive a mirror replica syncs.
+    pub(super) fn mirror() -> Self {
+        let fake = FakeDrive::start();
+        let drive = fake.client();
+        Self {
+            fake,
+            drive,
+            folder: ROOT_REAL_ID.to_string(),
+        }
+    }
+
     pub(super) fn replica(&self, label: &str) -> Replica {
         Replica::new(&self.folder, label)
+    }
+
+    /// A replica mirroring My Drive; see [`Env::mirror`].
+    pub(super) fn mirror_replica(&self, label: &str) -> Replica {
+        let mut replica = Replica::new(&self.folder, label);
+        replica.options.mirror = true;
+        replica
     }
 
     pub(super) fn remote(&self) -> Tree {

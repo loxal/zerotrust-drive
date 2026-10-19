@@ -804,6 +804,7 @@ fn clone_error(error: &RemoteError) -> RemoteError {
         RemoteError::Diverged(message) => RemoteError::Diverged(message.clone()),
         RemoteError::Network(message) => RemoteError::Network(message.clone()),
         RemoteError::Protocol(message) => RemoteError::Protocol(message.clone()),
+        RemoteError::Denied(message) => RemoteError::Denied(message.clone()),
         RemoteError::Local(message) => RemoteError::Local(message.clone()),
     }
 }
@@ -970,6 +971,7 @@ fn error_kind(error: &RemoteError) -> &'static str {
         RemoteError::Diverged(_) => "diverged",
         RemoteError::Network(_) => "network",
         RemoteError::Protocol(_) => "protocol",
+        RemoteError::Denied(_) => "denied",
         RemoteError::Local(_) => "local",
     }
 }
