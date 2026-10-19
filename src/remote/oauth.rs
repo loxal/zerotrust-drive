@@ -86,7 +86,8 @@ fn is_token_text(text: &str) -> bool {
 /// are not in the source tree. An installed application cannot keep a
 /// client secret confidential (Google's own definition), so a secret
 /// extracted from the binary grants nothing beyond what the client already
-/// allows: a user's own consent to the files zdrive creates.
+/// allows: a user's own consent to the files zdrive creates, or, for a
+/// mirror, to their whole Drive.
 const BUNDLED_DESKTOP: (Option<&str>, Option<&str>) = (
     option_env!("ZDRIVE_GOOGLE_DESKTOP_CLIENT_ID"),
     option_env!("ZDRIVE_GOOGLE_DESKTOP_CLIENT_SECRET"),

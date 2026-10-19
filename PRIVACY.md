@@ -2,7 +2,7 @@
 
 # ZeroTrust Drive privacy policy
 
-Last updated: 2026-10-18
+Last updated: 2026-10-19
 
 ZeroTrust Drive (`zdrive`) is open-source software that runs entirely on
 your own computer. Its developer operates no server for it and receives no
@@ -12,7 +12,8 @@ telemetry.
 ## Google user data
 
 zdrive uses the Google Drive API only to keep a copy of your drive in your
-own Google Drive.
+own Google Drive, or, in mirror mode, to keep a copy of your My Drive on
+your computer.
 
 **What zdrive accesses.**
 
@@ -20,6 +21,13 @@ own Google Drive.
   `https://www.googleapis.com/auth/drive.file` scope. It can see and change
   only the files and folders that zdrive itself created. The rest of your
   Drive stays invisible to it.
+- Only in mirror mode (`zdrive setup --mirror`), which you have to select
+  explicitly, the bundled client requests the full
+  `https://www.googleapis.com/auth/drive` scope. zdrive then reads every
+  file in your My Drive to keep a copy on your computer, and changes, moves
+  or moves to the Drive trash a file in My Drive when you change, move or
+  delete its copy there. Items that others shared with you but that are not
+  in your My Drive stay untouched.
 - With a bring-your-own client that you create in your own Google Cloud
   project, zdrive requests the full `https://www.googleapis.com/auth/drive`
   scope that you granted to your own client. That data is handled exactly as
@@ -30,16 +38,17 @@ own Google Drive.
   remote configuration as the sign-in hint for a later re-authorization.
 
 **How zdrive uses it.** zdrive creates its folder, uploads, downloads,
-lists changes, and moves to the Drive trash the files it manages. It does
-nothing else with your Google data.
+lists changes, and moves to the Drive trash the files it manages (in mirror
+mode: the files of your My Drive). It does nothing else with your Google
+data.
 
 - In encrypted mode, the default, every file is encrypted on your computer
   before upload. Google stores ciphertext and never receives your
   passphrase, a key, a file name or plaintext content. It does see the
   number and sizes of encrypted packs and when they were uploaded.
-- In plain mode, which you have to select explicitly, files are uploaded
-  unencrypted, keep their names and are readable by Google and in the Drive
-  web interface.
+- In plain mode and mirror mode, which you have to select explicitly, files
+  are uploaded unencrypted, keep their names and are readable by Google and
+  in the Drive web interface.
 
 **Where it is stored.** Everything stays on your computer:
 
@@ -68,7 +77,10 @@ including the Limited Use requirements.
 - Revoke zdrive's access at any time at https://myaccount.google.com/permissions.
 - Delete the local configuration in `~/.config/zerotrust-drive/remotes/` to
   remove the stored token.
-- Delete the zdrive folder in Google Drive to remove the uploaded copy.
+- Delete the zdrive folder in Google Drive to remove the uploaded copy. In
+  mirror mode the files are your own My Drive: removing the remote with
+  `zdrive remote remove` stops syncing and leaves Drive and the local copy
+  as they are.
 
 ## Local telemetry and metrics
 

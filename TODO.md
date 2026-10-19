@@ -2,7 +2,26 @@
 
 * Google brand verification of the bundled "ZeroTrust Drive" OAuth client: unverified, the consent
   screen may show a generic name and the privacy link stays hidden. Needs a domain-verified
-  homepage and privacy page (github.com cannot be verified by us).
+  homepage and privacy page (github.com cannot be verified by us). Since 0.19.0 a mirror requests
+  the restricted full `drive` scope through the bundled desktop client: until restricted-scope
+  verification (including an annual CASA security assessment) the consent shows the
+  unverified-app warning and at most 100 accounts can grant it. The scope is not yet listed on the
+  project's Data Access page, which verification requires; the sign-in works without it.
+* Mirror and plain uploads run one at a time: about 1-2 s per small file in the 0.19.0 live test
+  (13 files in 26.7 s), dominated by Drive's per-create latency. Upload a few files at once, like
+  the mirror's four download workers, keeping the reserved-id create protocol.
+* Plain and mirror cycles rescan the whole local folder every 15 s; use inotify (and FSEvents on
+  macOS) to find local changes, with a periodic full scan as the backstop.
+* The plain index is one JSON file rewritten whole (now only when it changed): for a mirror of
+  100k items about 25 MB per save. Move to an append-only or keyed store if large mirrors appear.
+* Plain mode restarts an interrupted large upload from the beginning; persist its resumable
+  session as encrypted mode does.
+* Mirror: Google Docs, Sheets and shortcuts stay on Drive only. Offer link files (as Drive for
+  desktop's `.gdoc`) or an opt-in export.
+* A Drive folder kept because it held items zdrive does not sync is forgotten locally; a later
+  full relisting (an expired changes token) brings it back as an empty local folder.
+* `zdrive doctor` does not show held deletions; only the sync's log and service status do.
+  Persist the count in the plain state and report it.
 * Rerun the telemetry overhead benchmark (README "Telemetry > Overhead") on a quiet host: on a
   shared host at load 11-15 the 0.18.0 result was inconclusive against the declared 3% (`standard`)
   and 5% (`full`) margins. Same arms, workloads and pairing; more repeats if the spread stays wide.

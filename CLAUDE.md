@@ -53,7 +53,7 @@ environment or prompts on `/dev/tty`.
 | `src/service/` | `zdrive service install\|uninstall\|status\|list\|run`: LaunchAgent plist / systemd user unit, passphrase custody (systemd-creds or 0600 file), sd_notify, stale-mount recovery |
 | `src/refusal.rs` | Permanent start failures of a service: durable record, exit 78 (systemd `RestartPreventExitStatus`) or 0 (launchd), shown by `service status` and `doctor` |
 | `src/fskit/` | macFUSE FSKit backend (`--fuse-backend auto\|kext\|fskit`): libfuse 2.9 channel relayed to a socket pair that fuser serves |
-| `src/plain/` | Opt-in plain two-way sync (`zdrive sync`, no FUSE): `engine` (cycle, watch, backoff), `pull` (changes feed, safe downloads, conflicts), `push` (scan, uploads, moves, Drive bin), `local` (ignore rules, conflict names, local trash), `state` (locked index bound to folder and Drive id), `cli` |
+| `src/plain/` | Opt-in plain two-way sync (`zdrive sync`, no FUSE), and the mirror of all of My Drive (`setup --mirror`, full scope): `engine` (cycle, watch, backoff, root id, stop grace, parking), `pull` (changes feed, safe downloads, conflicts, mirror names and exclusions), `prefetch` (parallel mirror downloads), `push` (scan, uploads, moves, mass-deletion guard, Drive bin), `local` (ignore rules, conflict and mirror names, local trash), `state` (versioned locked index bound to folder, Drive id and `.zdrive-root-id`), `cli` |
 | `src/telemetry/` | Local-only JSONL telemetry (`off`/`standard`/`full`): FUSE op histograms, snapshots, events, retention and caps, `zdrive telemetry status\|report\|export\|level\|purge` |
 | `src/fs.rs` | FUSE filesystem + encrypted directory index (InodeEntry tree) |
 | `src/crypto.rs` | Argon2id KDF + XChaCha20-Poly1305 encrypt/decrypt (+ retained v0 legacy readers for migration) |
@@ -66,7 +66,7 @@ environment or prompts on `/dev/tty`.
 | `src/remote/mod.rs` | Native Drive API replication of v2 stores: typed `RemoteError`, private config/state file helpers |
 | `src/remote/cli.rs` | `zdrive remote auth\|push\|pull\|status\|verify`; never falls back to the demo passphrase |
 | `src/remote/remove.rs` | `zdrive remote remove`: forget a remote on this computer, optional `--revoke` (ends the grant for every install of the account) |
-| `src/remote/oauth.rs` | Installed-app OAuth: loopback redirect, PKCE S256, `state` check, `--no-browser` paste-back, device flow, bundled `drive.file` clients (build-time `ZDRIVE_GOOGLE_*` env) or BYO full scope, token refresh with the issuing client |
+| `src/remote/oauth.rs` | Installed-app OAuth: loopback redirect, PKCE S256, `state` check, `--no-browser` paste-back, device flow, bundled `drive.file` clients (build-time `ZDRIVE_GOOGLE_*` env; full scope only for a mirror, never through the device flow) or BYO full scope, token refresh with the issuing client |
 | `src/remote/config.rs` | `~/.config/zerotrust-drive/remotes/<name>.json`; refresh token sealed under an Argon2id key from the store passphrase |
 | `src/remote/gdrive.rs` | Blocking `ureq` Drive v3 client: GCRA pacer, jittered backoff, pre-generated ids, resumable uploads, md5 checks |
 | `src/remote/format.rs` | Remote layout: marker, `_kdf.json` copy, append-only `packs/*.zpk`, `roots/*.zr`, `leases/` |

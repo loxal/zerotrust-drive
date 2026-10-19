@@ -84,6 +84,10 @@ installation without printing any secret.
 Drive folder of plain files that Google, and anyone with access to the account, can read; see
 [Plain mode](#plain-mode). Encrypted storage stays the default.
 
+**Your Google Drive on Linux.** Google offers no Drive app for Linux. `zdrive setup --mirror`
+keeps all of My Drive as ordinary files in `~/GoogleDrive`, in both directions, as Drive for
+desktop's "Mirror files" does; see [Mirror My Drive](#mirror-my-drive).
+
 **Telemetry is on by default and never leaves your computer.** zdrive records local diagnostics
 that help find performance and reliability problems; `zdrive telemetry off` turns them off. See
 [Telemetry](#telemetry) and [PRIVACY.md](PRIVACY.md).
@@ -95,11 +99,11 @@ For a new store on Google Drive, prefer [native Google Drive API sync](#native-g
 desktop does not guarantee, and it also runs on Linux. The folder-sync guidance below applies when
 a desktop client replicates the encrypted folder.
 
-API mode is already a mirror: every computer keeps a complete local replica and Drive keeps a
-complete copy, with nothing streamed on demand. A Computers folder of Drive for desktop is no
-better target: it backs up one computer and does not sync down to another, Drive for desktop has
-no Linux client, and the bundled `drive.file` client cannot write into a folder Drive for desktop
-created. In the [benchmark](#benchmark), a store in such a synced folder also took 1.1 to 39 times
+API mode already keeps a complete copy on every side: every computer keeps a complete local
+replica and Drive keeps a complete copy, with nothing streamed on demand. A Computers folder of
+Drive for desktop is no better target: it backs up one computer and does not sync down to
+another, Drive for desktop has no Linux client, and the bundled `drive.file` client cannot write
+into a folder Drive for desktop created. In the [benchmark](#benchmark), a store in such a synced folder also took 1.1 to 39 times
 as long to reach Drive and exposed incomplete generations.
 
 For folder sync, the primary recommended beta backing target is a dedicated folder in Google Drive `My Drive`, with Google
@@ -341,7 +345,8 @@ named remote:
 
 - Release builds carry zdrive's own Google OAuth client, listed as "ZeroTrust Drive", with the
   `drive.file` scope: zdrive sees only the files and folders it created itself, from any computer
-  that uses this client, and never the rest of your Drive. It creates the folder "ZeroTrust Drive"
+  that uses this client, and never the rest of your Drive. Only a
+  [mirror of My Drive](#mirror-my-drive) asks for full Drive access. It creates the folder "ZeroTrust Drive"
   in My Drive (`--folder-name NAME` chooses another name) or joins the one an earlier
   installation created. Before joining, it prints that folder's name, id, creation time, owner
   and the number of items at its top level; when several such folders exist it refuses and lists
@@ -352,7 +357,9 @@ named remote:
 - On a desktop the command opens the browser (`open` on macOS, `xdg-open` on Linux) and receives
   Google's answer on a loopback address, with PKCE and a `state` check. Over SSH, and on Linux
   without a graphical session, it prints a short code instead: open https://www.google.com/device
-  on any phone or computer, enter the code and sign in. `--device-code` selects this flow
+  on any phone or computer, enter the code and sign in. (Google's device sign-in cannot grant full
+  Drive access, so a mirror prints an address to open instead and reads back the address the
+  browser ends up at.) `--device-code` selects this flow
   anywhere. `--account` is suggested to Google, and a sign-in with another account is refused.
 - The prompt asks for the store passphrase: it seals the refresh token with XChaCha20-Poly1305
   under an Argon2id key in `~/.config/zerotrust-drive/remotes/gdrive.json` (mode `0600`). Remote
@@ -364,13 +371,17 @@ password, such as mail clients, while the Drive API accepts only OAuth. The one-
 after it, zdrive refreshes its access on its own.
 
 Google has not yet verified the "ZeroTrust Drive" brand, so its consent screen shows no link to the
-privacy policy; the policy is [PRIVACY.md](PRIVACY.md). Sign-in and access work the same.
+privacy policy; the policy is [PRIVACY.md](PRIVACY.md). Sign-in and access work the same. A mirror's
+full Drive access is a restricted scope: until Google has verified the app for it, the sign-in
+first shows "Google hasn't verified this app" (choose Advanced, then Go to ZeroTrust Drive), and
+at most 100 Google accounts can grant it.
 
 #### Bring your own OAuth client
 
 A build from source contains no Google client (release builds receive it at build time), and a
 remote in a folder that zdrive did not create, such as a Computers folder of Drive for desktop,
-needs the full `drive` scope. Both use your own client:
+needs the full `drive` scope (a mirror of My Drive gets it through the bundled client). Both use
+your own client:
 
 1. In the Google Cloud console, create a project and enable the Google Drive API.
 2. Configure the OAuth consent screen as **External** and **publish it to production**. An app
@@ -564,7 +575,7 @@ Limits:
 
 - With the bundled sign-in (`drive.file`), zdrive sees only the files zdrive itself created, on
   any computer. Files added through the Drive web interface or another app do not sync down;
-  with your own OAuth client (full `drive` scope) they do. Google Docs, Sheets and other
+  with your own OAuth client (full `drive` scope) or in a [mirror](#mirror-my-drive) they do. Google Docs, Sheets and other
   Google-native documents never sync, since they have no file content.
 - Concurrent writers resolve through conflict copies, not locks. When both sides rename the same
   item, the local name wins.
@@ -577,6 +588,64 @@ Limits:
 
 On macOS, if you already run Drive for desktop and only need plain files backed up, adding the
 folder there (Computers) works without zdrive.
+
+A sync never empties Drive because the local folder was emptied. A cycle moves nothing to the
+Drive bin when it would bin more than 50 synced items that are also more than a tenth of all synced
+items, when every one of ten or more synced items is missing, or when the folder lost the
+`.zdrive-root-id` file that binds it to its index (a folder replaced by another file system, or
+restored without it). The missing items stay on Drive, and the warning names the command that
+applies the deletions after you checked them: `zdrive sync --remote NAME --dir DIR
+--allow-deletions N`. A service never applies them by itself. A Drive folder is moved to the bin in
+one step only while everything in it is synced; otherwise its synced contents go one by one and
+the folder stays, so Google Docs or files zdrive never saw are not binned along with it. A file
+whose owner does not allow you to download, change or delete it is set aside for an hour (doubling
+up to a day) instead of being tried again every cycle, until it changes on Drive.
+
+### Mirror My Drive
+
+Google offers no Drive app for Linux. A mirror keeps all of your My Drive as ordinary files in a
+local folder and syncs both ways, as Drive for desktop does with "Mirror files": every file is a
+complete local copy, nothing is streamed on demand, and changes on either side reach the other.
+**The files are not encrypted** - they are your existing Drive files, which Google can read. On
+Ubuntu:
+
+    sudo apt install ./zerotrust-drive_0.19.0_amd64.deb      # or _arm64.deb
+    zdrive setup --mirror --account you@gmail.com
+
+Setup explains the plan and asks before it changes anything. It signs in with full Drive access:
+Google first warns that "ZeroTrust Drive" is not verified yet; choose Advanced, then Go to
+ZeroTrust Drive, and allow access to your Google Drive files. Then it shows what My Drive holds -
+files, bytes, and the Google Docs that stay on Drive - against the free space, and asks before the
+first download. The folder `~/GoogleDrive` (`--dir DIR` chooses another) must be empty, so that
+nothing already in it is uploaded into My Drive by mistake. With auto-start (the default) the
+service downloads in the background and keeps syncing from then on; follow it with
+`zdrive service status mirror` or `journalctl --user -u zerotrust-drive@mirror -f`. On a server
+without a browser, setup prints an address to open on any computer; after the approval, paste the
+address the browser ends up at (it starts with `http://127.0.0.1`, and may show an error page).
+
+Without setup, the same takes two steps:
+
+    zdrive remote auth --remote mirror --mirror --account you@gmail.com
+    zdrive sync --remote mirror --dir ~/GoogleDrive --watch
+
+A mirror follows the rules of [Plain mode](#plain-mode), including its local trash, conflict copies
+and deletion guard, with these differences:
+
+- Nothing is renamed on Drive. Two Drive files with the same name in one folder become
+  `name.ext` and `name (2).ext` locally; a Drive name that cannot be a file name keeps its Drive
+  name and gets a local one (`/` becomes `／`, too long a name is shortened with a short hash).
+  zdrive remembers the Drive name, so edits, moves and deletions reach the right file. Renaming a
+  file locally renames it on Drive.
+- When a file changed on both sides, the Drive version keeps the name, and the local version
+  becomes `name (conflict YYYY-MM-DD HHMMSS host).ext`, uploaded as a new Drive file.
+- Google Docs, Sheets, Slides, forms and shortcuts have no file to download; they stay on Drive
+  only. Files others shared with you that you did not add to My Drive are left out, and so are
+  shared drives and zdrive's own encrypted and plain folders.
+- The first listing asks for the contents of up to 50 folders at once, and up to four files
+  download at the same time. Uploads go one at a time, about one to two seconds per small file.
+
+`zdrive remote remove mirror` stops the mirror on this computer and keeps both the local files and
+My Drive as they are.
 
 ### Auto-start
 
@@ -746,14 +815,14 @@ Ubuntu 22.04 and newer, and other distributions with glibc 2.34 or newer. On Deb
 download the `.deb` from the [releases page](https://github.com/loxal/zerotrust-drive/releases)
 and install it with apt, which also pulls in `fuse3`:
 
-    sudo apt install ./zerotrust-drive_0.18.0_amd64.deb    # or zerotrust-drive_0.18.0_arm64.deb
+    sudo apt install ./zerotrust-drive_0.19.0_amd64.deb    # or zerotrust-drive_0.19.0_arm64.deb
     zdrive --version
 
 On other distributions, install `fuse3` with the package manager (it provides `fusermount3`,
 which mounts the drive for a regular user) and unpack the tarball instead:
 
-    tar -xzf zdrive-0.18.0-linux-x86_64.tar.gz             # or zdrive-0.18.0-linux-aarch64.tar.gz
-    sudo install -m 0755 zdrive-0.18.0-linux-x86_64/zdrive /usr/local/bin/zdrive
+    tar -xzf zdrive-0.19.0-linux-x86_64.tar.gz             # or zdrive-0.19.0-linux-aarch64.tar.gz
+    sudo install -m 0755 zdrive-0.19.0-linux-x86_64/zdrive /usr/local/bin/zdrive
 
 Each release also lists `SHA256SUMS`; check the downloads with
 `sha256sum --check --ignore-missing SHA256SUMS`. Building from source (see
