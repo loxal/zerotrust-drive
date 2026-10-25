@@ -5,8 +5,9 @@
   homepage and privacy page (github.com cannot be verified by us). Since 0.19.0 a mirror requests
   the restricted full `drive` scope through the bundled desktop client: until restricted-scope
   verification (including an annual CASA security assessment) the consent shows the
-  unverified-app warning and at most 100 accounts can grant it. The scope is not yet listed on the
-  project's Data Access page, which verification requires; the sign-in works without it.
+  unverified-app warning and at most 100 accounts can grant it. The operator confirmed that the
+  full `drive` scope is listed on the project's Data Access page and the app is In production;
+  brand and restricted-scope verification remain pending.
 * Mirror and plain uploads run one at a time: about 1-2 s per small file in the 0.19.0 live test
   (13 files in 26.7 s), dominated by Drive's per-create latency. Upload a few files at once, like
   the mirror's four download workers, keeping the reserved-id create protocol.
