@@ -89,3 +89,30 @@ environment or prompts on `/dev/tty`.
 - CI: GitHub Actions
 - Passphrase precedence: `ZEROTRUST_PASSPHRASE`, `$CREDENTIALS_DIRECTORY/zdrive-passphrase`, `--passphrase-file` (owner-only), `--passphrase`, then a no-echo terminal prompt (confirmed for a new store); without a terminal the demo fallback applies and a new store refuses it
 - Rotation needs `--rekey` (or `--new-passphrase` / `--continue-rekey`); the new passphrase comes from `ZEROTRUST_NEW_PASSPHRASE`, `--new-passphrase`, or a confirmed prompt
+
+## Finish with reconciled Git state
+
+Synced copy of the global agent instructions' "Finish with reconciled Git
+state" (Lifub `agent/prompts/agent-instructions.md`); update every copy in the
+same change set.
+
+Before concluding a task, apply the gist of Lifub's
+`agent/public.skills/finalize-finish-address-open-topics-issues.skill.md`
+unless that is beyond reasonable: finish the worthwhile open topics the task
+left, and leave its Git state reconciled. In every repository the task
+touched, inventory the registered worktrees, local branches, stashes and
+uncommitted changes. Integrate each completed, authorized unit against the
+current upstream, commit and push it under that repository's rules, and prove
+its hosted CI where the repository requires it. Remove a clean worktree or a
+merged branch once its head is on the upstream and its useful evidence is
+preserved, with `git worktree remove` and `git branch -d`, never their forcing
+variants. Give every other remnant an owner and a disposition instead of
+forcing it: another session's active work, an unknown owner, a stash, a
+missing authorization or an uncertain operation stays intact and is reported
+with its exact prerequisite. It is beyond reasonable to take over or delete
+foreign work, to pop, drop, reset or force-push merely to empty the
+inventory, to retry an uncertain operation, to pre-empt a decision that
+belongs to the operator, or to spend effort out of proportion to the task.
+Under `/Users/alex/my/src/fastly`, corporate working hours and each
+repository's branch and pull-request route govern every commit and push;
+outside the window, report the prepared change as pending.
