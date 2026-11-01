@@ -609,7 +609,7 @@ complete local copy, nothing is streamed on demand, and changes on either side r
 **The files are not encrypted** - they are your existing Drive files, which Google can read. On
 Ubuntu:
 
-    sudo apt install ./zerotrust-drive_0.19.0_amd64.deb      # or _arm64.deb
+    sudo apt install ./zerotrust-drive_0.20.1_amd64.deb      # or _arm64.deb
     zdrive setup --mirror --account you@gmail.com
 
 Setup explains the plan and asks before it changes anything. It signs in with full Drive access:
@@ -815,14 +815,14 @@ Ubuntu 22.04 and newer, and other distributions with glibc 2.34 or newer. On Deb
 download the `.deb` from the [releases page](https://github.com/loxal/zerotrust-drive/releases)
 and install it with apt, which also pulls in `fuse3`:
 
-    sudo apt install ./zerotrust-drive_0.19.0_amd64.deb    # or zerotrust-drive_0.19.0_arm64.deb
+    sudo apt install ./zerotrust-drive_0.20.1_amd64.deb    # or zerotrust-drive_0.20.1_arm64.deb
     zdrive --version
 
 On other distributions, install `fuse3` with the package manager (it provides `fusermount3`,
 which mounts the drive for a regular user) and unpack the tarball instead:
 
-    tar -xzf zdrive-0.19.0-linux-x86_64.tar.gz             # or zdrive-0.19.0-linux-aarch64.tar.gz
-    sudo install -m 0755 zdrive-0.19.0-linux-x86_64/zdrive /usr/local/bin/zdrive
+    tar -xzf zdrive-0.20.1-linux-x86_64.tar.gz             # or zdrive-0.20.1-linux-aarch64.tar.gz
+    sudo install -m 0755 zdrive-0.20.1-linux-x86_64/zdrive /usr/local/bin/zdrive
 
 Each release also lists `SHA256SUMS`; check the downloads with
 `sha256sum --check --ignore-missing SHA256SUMS`. Building from source (see
