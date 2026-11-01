@@ -686,17 +686,19 @@ mod tests {
         /// Wait until at least `count` replies were sent; return them all.
         fn sent(&self, count: usize) -> Vec<Vec<Vec<u8>>> {
             let sent = self.sent.lock().unwrap();
-            let (sent, timeout) = self
+            let (sent, _) = self
                 .sent_changed
                 .wait_timeout_while(sent, WAIT, |sent| sent.len() < count)
                 .unwrap();
+            let replies = sent.clone();
+            drop(sent);
             assert!(
-                !timeout.timed_out(),
+                replies.len() >= count,
                 "only {} replies: {:?}",
-                sent.len(),
-                *sent
+                replies.len(),
+                replies
             );
-            sent.clone()
+            replies
         }
 
         fn wait_for_unmounts(&self, count: usize) -> Vec<bool> {
@@ -713,6 +715,15 @@ mod tests {
     }
 
     struct FakeChannel(Arc<Fake>);
+
+    /// End the fake channel before the bridge is dropped during unwinding.
+    struct EndChannelOnDrop(Arc<Fake>);
+
+    impl Drop for EndChannelOnDrop {
+        fn drop(&mut self) {
+            self.0.push(None);
+        }
+    }
 
     impl KernelChannel for FakeChannel {
         fn buffer_size(&self) -> usize {
@@ -892,6 +903,7 @@ mod tests {
     #[test]
     fn requests_the_socket_cannot_carry_fail_with_eio() {
         let (fake, mut bridge, fuser_end) = started();
+        let _end_channel = EndChannelOnDrop(Arc::clone(&fake));
         let limit = bridge.limit();
 
         fake.push(Some(read_request(OPCODE_READ, 9, limit + 1)));
@@ -902,9 +914,35 @@ mod tests {
         fake.push(Some(readdirplus.clone()));
         assert_eq!(fuser_reads(&fuser_end, WAIT).unwrap(), readdirplus);
 
-        // Larger than any datagram: the forward itself fails.
-        let body = vec![1u8; bridge.shared.capacity * 2 + HEADROOM];
-        fake.push(Some(request(OPCODE_WRITE, 11, &body)));
+        // The receive buffer can be smaller than the actual send limit.
+        // Read the sender's raw bound: Linux already doubles SO_SNDBUF.
+        let socket = bridge.shared.socket.as_raw_fd();
+        let mut send_buffer: libc::c_int = 0;
+        let mut option_len = std::mem::size_of_val(&send_buffer) as libc::socklen_t;
+        // SAFETY: socket is open; send_buffer and option_len are live outputs.
+        let rc = unsafe {
+            libc::getsockopt(
+                socket,
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                (&mut send_buffer as *mut libc::c_int).cast(),
+                &mut option_len,
+            )
+        };
+        assert_eq!(rc, 0, "SO_SNDBUF: {}", io::Error::last_os_error());
+        let size = usize::try_from(send_buffer)
+            .unwrap()
+            .checked_add(HEADROOM)
+            .unwrap();
+        let oversized = request(OPCODE_WRITE, 11, &vec![1u8; size]);
+        assert_eq!(
+            send_datagram(socket, &oversized, libc::MSG_DONTWAIT)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EMSGSIZE),
+            "the test request must be too large for the actual sender"
+        );
+        fake.push(Some(oversized));
         assert_eq!(answer_of(&fake.sent(2)[1]), (11, -libc::EIO));
 
         fake.push(None);

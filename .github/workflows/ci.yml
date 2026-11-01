@@ -19,6 +19,16 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libfuse3-dev fuse3
       - name: Run tests
         run: cargo test --locked
+      - name: Exercise FSKit bridge regression
+        run: |
+          set -euo pipefail
+          test_name='fskit::bridge::tests::requests_the_socket_cannot_carry_fail_with_eio'
+          test_inventory="$(cargo test --locked --bin zerotrust-drive -- --list)"
+          printf '%s\n' "$test_inventory" | awk -v expected="$test_name: test" '$0 == expected { found += 1 } END { exit(found == 1 ? 0 : 1) }'
+          cargo test --locked --bin zerotrust-drive 'fskit::bridge::tests::'
+          for attempt in $(seq 1 20); do
+            cargo test --locked --bin zerotrust-drive "$test_name" -- --exact
+          done
       - name: Verify exact live FUSE test inventory
         run: |
           test_inventory="$(cargo test --locked --test live_fuse -- --list)"
@@ -101,8 +111,9 @@ jobs:
         run: brew install macfuse
       - name: Verify exact macOS inventory and run storage/presenter probes
         run: |
-          test_inventory="$(cargo test --locked -- --list)"
+          test_inventory="$(cargo test --locked --bin zerotrust-drive -- --list)"
           for test_name in \
+            'fskit::bridge::tests::requests_the_socket_cannot_carry_fail_with_eio' \
             'storage::tests::macos_native_shim_coordinates_local_exact_paths' \
             'storage::tests::native_cloud_errors_keep_machine_readable_io_kinds' \
             'macos_integration_tests::ns_file_presenter_probe_observes_exact_descriptor_rooted_move' \
@@ -115,6 +126,14 @@ jobs:
           cargo test --locked 'storage::tests::macos_native_shim_coordinates_local_exact_paths' -- --exact --nocapture
           cargo test --locked 'storage::tests::native_cloud_errors_keep_machine_readable_io_kinds' -- --exact --nocapture
           cargo test --locked 'macos_integration_tests::' -- --test-threads=1 --nocapture
+      - name: Exercise FSKit bridge regression
+        run: |
+          set -euo pipefail
+          test_name='fskit::bridge::tests::requests_the_socket_cannot_carry_fail_with_eio'
+          cargo test --locked --bin zerotrust-drive 'fskit::bridge::tests::'
+          for attempt in $(seq 1 20); do
+            cargo test --locked --bin zerotrust-drive "$test_name" -- --exact
+          done
       - name: Run real SIGKILL durability matrix on APFS
         env:
           ZDRIVE_RUN_PROCESS_CRASH_TESTS: "1"
