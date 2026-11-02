@@ -97,7 +97,7 @@ state" (Lifub `agent/prompts/agent-instructions.md`); update every copy in the
 same change set.
 
 Before concluding a task, apply the gist of Lifub's
-`agent/public.skills/finalize-finish-address-open-topics-issues.skill.md`
+`agent/public.skills/finalize-finish-closeout-address-open-topics-issues.skill.md`
 unless that is beyond reasonable: finish the worthwhile open topics the task
 left, and leave its Git state reconciled. In every repository the task
 touched, inventory the registered worktrees, local branches, stashes and
