@@ -100,19 +100,34 @@ Before concluding a task, apply the gist of Lifub's
 `agent/public.skills/finalize-finish-closeout-address-open-topics-issues.skill.md`
 unless that is beyond reasonable: finish the worthwhile open topics the task
 left, and leave its Git state reconciled. In every repository the task
-touched, inventory the registered worktrees, local branches, stashes and
+touched, inventory the registered worktrees, local and remote branches, stashes and
 uncommitted changes. Integrate each completed, authorized unit against the
 current upstream, commit and push it under that repository's rules, and prove
-its hosted CI where the repository requires it. Remove a clean worktree or a
-merged branch once its head is on the upstream and its useful evidence is
-preserved, with `git worktree remove` and `git branch -d`, never their forcing
-variants. Give every other remnant an owner and a disposition instead of
-forcing it: another session's active work, an unknown owner, a stash, a
-missing authorization or an uncertain operation stays intact and is reported
-with its exact prerequisite. It is beyond reasonable to take over or delete
-foreign work, to pop, drop, reset or force-push merely to empty the
-inventory, to retry an uncertain operation, to pre-empt a decision that
-belongs to the operator, or to spend effort out of proportion to the task.
+its hosted CI where the repository requires it.
+
+Actively remove every eligible obsolete, superseded, legacy or merged branch
+and worktree in the authorized scope, whichever session made it. Perform
+eligible cleanup instead of merely listing candidates. Names, age, clean
+status and candidate reports alone do not prove obsolescence. Apply the
+finalize workflow's ownership, activity, exact-tip integration or release,
+verification, custody and consumer checks immediately before each removal.
+Inspect ignored files, live working directories and process holders, holds,
+and installed-binary source dependencies. Patch equivalence alone does not
+release unmerged work: preserve its exact tip and require the replacement
+comparison and owner release that workflow specifies. Remote deletion also
+requires publication authority and revalidation of the reviewed remote tip.
+
+Preserve canonical checkouts, protected, release and preservation refs, and
+active, dirty, held, unverified or still-consumed work. Retire disposable
+evidence only through its archive, restore-verification and retirement guards.
+Use normal `git worktree remove` and `git branch -d` for eligible integrated
+work; use the finalize workflow's guarded exact-tip deletion for a released
+ref. Never force-delete work, rewrite history or reset merely to empty an
+inventory. Give every retained remnant an owner and a disposition with its
+exact prerequisite. A stash or an uncertain operation stays intact until its
+outcome or owner release is established. It is beyond reasonable to take over
+active foreign work, retry an uncertain mutation, pre-empt an operator
+decision, or spend effort out of proportion to the task.
 Under `/Users/alex/my/src/fastly`, corporate working hours and each
 repository's branch and pull-request route govern every commit and push;
 outside the window, report the prepared change as pending.
